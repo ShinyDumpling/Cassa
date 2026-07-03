@@ -33,10 +33,12 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 import io
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any
 
+import requests
 from tqcenter import tq
 
 
@@ -105,6 +107,10 @@ LIMIT_DOWN_THRESHOLD = -9.5
 SH_CODE_PREFIXES = ("5", "6", "9")
 SZ_CODE_PREFIXES = ("0", "1", "2", "3")
 BJ_CODE_PREFIXES = ("920", "4", "8")
+LLM_API_KEY_ENV_NAME = "CASSA_LLM_API_KEY"
+LLM_BASE_URL_ENV_NAME = "CASSA_LLM_BASE_URL"
+LLM_MODEL_ENV_NAME = "CASSA_LLM_MODEL"
+DEFAULT_LLM_TIMEOUT_SECONDS = 60
 
 
 # ============================================================================
@@ -131,6 +137,16 @@ class SectorCode:
     internal_code: str
     market_suffix: str
     tdx_code: str
+
+
+@dataclass(frozen=True)
+class LlmConfig:
+    """统一描述项目内部使用的 LLM 接入配置。"""
+
+    api_key: str
+    base_url: str
+    model: str
+    timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
 
 
 # ============================================================================
@@ -346,6 +362,57 @@ class TdxClient:
         )
 
 
+class OpenAiCompatibleLlmClient:
+    """封装 OpenAI 兼容格式的文本生成调用。"""
+
+    def __init__(self, config: LlmConfig) -> None:
+        """
+        创建一个可复用的 LLM 客户端。
+
+        Args:
+            config: 已校验完成的 LLM 配置对象。
+        """
+        self.config = config
+
+    def chat(
+        self,
+        user_prompt: str,
+        system_prompt: str = "",
+        temperature: float = 0.2,
+    ) -> dict[str, Any]:
+        """
+        发起一次 OpenAI 兼容格式的聊天请求。
+
+        Args:
+            user_prompt: 用户提示词。
+            system_prompt: 可选的系统提示词。
+            temperature: 生成温度。
+
+        Returns:
+            模型原始返回 JSON。
+        """
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+
+        response = requests.post(
+            url=f"{self.config.base_url.rstrip('/')}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.config.model,
+                "messages": messages,
+                "temperature": temperature,
+            },
+            timeout=self.config.timeout_seconds,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
 # ============================================================================
 # 第五层：基础工具层
 # 这一层放无状态的小工具函数，主要做目录准备、代码标准化、类型规整。
@@ -361,6 +428,94 @@ def ensure_project_dirs() -> None:
     """
     for path in (TMP_DIR, RESULT_DIR, DATA_DIR, CONTEXT_DIR):
         path.mkdir(parents=True, exist_ok=True)
+
+
+def mask_secret(secret_value: str) -> str:
+    """
+    对敏感字符串做脱敏展示。
+
+    Args:
+        secret_value: 原始敏感字符串。
+
+    Returns:
+        只保留前后少量字符的脱敏结果。
+    """
+    if not secret_value:
+        return ""
+    if len(secret_value) <= 8:
+        return "*" * len(secret_value)
+    return f"{secret_value[:4]}***{secret_value[-4:]}"
+
+
+def get_env_value(env_name: str) -> str:
+    """
+    读取环境变量，并在 Windows 下兼容读取用户级持久化环境变量。
+
+    Args:
+        env_name: 环境变量名。
+
+    Returns:
+        读取到的环境变量值；如果不存在则返回空字符串。
+    """
+    current_value = os.getenv(env_name, "").strip()
+    if current_value:
+        return current_value
+
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Environment",
+        ) as registry_key:
+            registry_value, _ = winreg.QueryValueEx(registry_key, env_name)
+            return str(registry_value).strip()
+    except Exception:
+        return ""
+
+
+def load_llm_config_from_env() -> LlmConfig:
+    """
+    从环境变量中加载 LLM 配置。
+
+    Returns:
+        已完成基础校验的 LLM 配置对象。
+
+    Raises:
+        RuntimeError: 当环境变量缺失时抛出。
+    """
+    api_key = get_env_value(LLM_API_KEY_ENV_NAME)
+    base_url = get_env_value(LLM_BASE_URL_ENV_NAME)
+    model = get_env_value(LLM_MODEL_ENV_NAME)
+
+    missing_env_names = [
+        env_name
+        for env_name, env_value in (
+            (LLM_API_KEY_ENV_NAME, api_key),
+            (LLM_BASE_URL_ENV_NAME, base_url),
+            (LLM_MODEL_ENV_NAME, model),
+        )
+        if not env_value
+    ]
+    if missing_env_names:
+        missing_text = "、".join(missing_env_names)
+        raise RuntimeError(f"LLM 环境变量缺失：{missing_text}")
+
+    return LlmConfig(
+        api_key=api_key,
+        base_url=base_url.rstrip("/"),
+        model=model,
+    )
+
+
+def build_llm_client() -> OpenAiCompatibleLlmClient:
+    """
+    基于环境变量构建公共 LLM 客户端。
+
+    Returns:
+        可复用的 OpenAI 兼容格式客户端。
+    """
+    return OpenAiCompatibleLlmClient(load_llm_config_from_env())
 
 
 def strip_stock_code_suffix(raw_code: str) -> str:
@@ -530,6 +685,98 @@ def normalize_scalar(value: Any) -> Any:
         except Exception:
             return value
     return value
+
+
+def extract_llm_text_from_response(response_payload: dict[str, Any]) -> str:
+    """
+    从 OpenAI 兼容响应中提取主文本内容。
+
+    Args:
+        response_payload: 模型原始响应 JSON。
+
+    Returns:
+        提取出的文本内容。
+
+    Raises:
+        RuntimeError: 当响应结构异常时抛出。
+    """
+    try:
+        choices = response_payload["choices"]
+        first_choice = choices[0]
+        message = first_choice["message"]
+        content = message["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("LLM 返回结构异常，无法提取文本内容。") from exc
+
+    if not isinstance(content, str):
+        raise RuntimeError("LLM 返回的文本内容不是字符串。")
+    return content.strip()
+
+
+def call_llm_text(
+    user_prompt: str,
+    system_prompt: str = "",
+    temperature: float = 0.2,
+) -> dict[str, Any]:
+    """
+    通过公共接入层发起一次文本生成调用。
+
+    Args:
+        user_prompt: 用户提示词。
+        system_prompt: 可选的系统提示词。
+        temperature: 生成温度。
+
+    Returns:
+        统一封装后的调用结果。
+    """
+    client = build_llm_client()
+    raw_response = client.chat(
+        user_prompt=user_prompt,
+        system_prompt=system_prompt,
+        temperature=temperature,
+    )
+    return {
+        "model": client.config.model,
+        "base_url": client.config.base_url,
+        "text": extract_llm_text_from_response(raw_response),
+        "raw_response": raw_response,
+    }
+
+
+def try_parse_json_object(text: str) -> dict[str, Any] | None:
+    """
+    尽量从模型返回文本中解析出一个 JSON 对象。
+
+    Args:
+        text: 模型返回的原始文本。
+
+    Returns:
+        解析成功返回字典，否则返回 `None`。
+    """
+    cleaned_text = text.strip()
+    if cleaned_text.startswith("```"):
+        cleaned_text = cleaned_text.removeprefix("```json").removeprefix("```").strip()
+        if cleaned_text.endswith("```"):
+            cleaned_text = cleaned_text[:-3].strip()
+
+    try:
+        parsed = json.loads(cleaned_text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    start_index = cleaned_text.find("{")
+    end_index = cleaned_text.rfind("}")
+    if start_index == -1 or end_index == -1 or end_index <= start_index:
+        return None
+
+    candidate = cleaned_text[start_index:end_index + 1]
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def safe_float(value: Any) -> float | None:
@@ -1181,7 +1428,7 @@ def collect_sector_heat_snapshot(client: TdxClient) -> dict[str, Any]:
     for row in ranked_rows:
         fund_value = fund_map.get(row["代码"])
         row["主力净流入"] = fund_value
-        row["主力净流入亿"] = round(fund_value / 100000000, 2) if fund_value is not None else None
+        row["主力净流入亿"] = round(fund_value / 10000, 2) if fund_value is not None else None
 
     key_blocks = pick_key_blocks(industry_top, concept_top)
     return {
@@ -1549,10 +1796,10 @@ def print_sector_heat_tables(sector_snapshot: dict[str, Any]) -> None:
             )
 
     top_n = BLOCK_RANK_TOP_N
-    _print_block_rank(f">>> 🔥 行业板块热度榜 Top {top_n} (按当日涨幅排序)", sector_snapshot.get("行业热度榜", []))
-    _print_block_rank(f">>> 🚀 概念板块热度榜 Top {top_n} (按当日涨幅排序)", sector_snapshot.get("概念热度榜", []))
-    _print_block_rank(f">>> 📉 行业板块跌幅榜 Bottom {top_n} (按当日涨幅排序)", sector_snapshot.get("行业跌幅榜", []))
-    _print_block_rank(f">>> 📉 概念板块跌幅榜 Bottom {top_n} (按当日涨幅排序)", sector_snapshot.get("概念跌幅榜", []))
+    _print_block_rank(f">>> 行业板块热度榜 Top {top_n} (按当日涨幅排序)", sector_snapshot.get("行业热度榜", []))
+    _print_block_rank(f">>> 概念板块热度榜 Top {top_n} (按当日涨幅排序)", sector_snapshot.get("概念热度榜", []))
+    _print_block_rank(f">>> 行业板块跌幅榜 Bottom {top_n} (按当日涨幅排序)", sector_snapshot.get("行业跌幅榜", []))
+    _print_block_rank(f">>> 概念板块跌幅榜 Bottom {top_n} (按当日涨幅排序)", sector_snapshot.get("概念跌幅榜", []))
 
 
 def print_key_sector_analysis(key_analyses: list[dict[str, Any]]) -> None:
@@ -1586,7 +1833,7 @@ def print_key_sector_analysis(key_analyses: list[dict[str, Any]]) -> None:
         name = analysis.get("名称", "")
 
         parts = [
-            f"🔥 {name}({pure_code})",
+            f"{name}({pure_code})",
             chg_str,
             f"成分股{total}只",
             f"上涨{up}",
@@ -1607,6 +1854,238 @@ def print_key_sector_analysis(key_analyses: list[dict[str, Any]]) -> None:
         else:
             lu_str = "-"
         print(f"     龙头: {leaders}    中军: {middles}    涨停股: {lu_str}")
+
+
+def build_market_llm_payload(
+    market_index_snapshot: dict[str, Any],
+    sector_heat_snapshot: dict[str, Any],
+    key_analyses: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    为大盘模块的 LLM 判断整理一份精简输入载荷。
+
+    Args:
+        market_index_snapshot: 宽基指数快照。
+        sector_heat_snapshot: 板块热度快照。
+        key_analyses: 重点板块成分股验证结果。
+
+    Returns:
+        适合直接序列化后送给模型的结构化输入。
+    """
+    return {
+        "trade_date": market_index_snapshot.get("数据截止", ""),
+        "market_index_snapshot": market_index_snapshot.get("指数列表", []),
+        "sector_heat_snapshot": {
+            "industry_top": sector_heat_snapshot.get("行业热度榜", []),
+            "industry_bottom": sector_heat_snapshot.get("行业跌幅榜", []),
+            "concept_top": sector_heat_snapshot.get("概念热度榜", []),
+            "concept_bottom": sector_heat_snapshot.get("概念跌幅榜", []),
+            "key_blocks": sector_heat_snapshot.get("重点板块", []),
+        },
+        "key_sector_snapshot": key_analyses,
+    }
+
+
+def build_market_llm_prompt(llm_payload: dict[str, Any]) -> str:
+    """
+    生成大盘模块合并版 LLM 判断的完整提示词。
+
+    Args:
+        llm_payload: 已整理好的输入载荷。
+
+    Returns:
+        已经拼接完成、可直接发给模型的完整 prompt。
+    """
+    payload_text = json.dumps(llm_payload, ensure_ascii=False, indent=2)
+    return f"""
+你是一个 A 股大盘与方向预案分析助手。
+
+你的任务：
+1. 先根据宽基指数判断最近市场风格与今天盘面状态。
+2. 再结合行业板块、概念板块、重点板块成分股验证结果，给出次日方向预案。
+3. 你必须只根据输入数据判断，不要编造外部消息、政策或新闻。
+
+硬性规则：
+1. 只允许输出合法 JSON。
+2. 不允许输出 markdown。
+3. 不允许输出代码块标记。
+4. 不允许输出任何 JSON 之外的解释、前言、总结或备注。
+5. 所有字段都必须返回。
+6. 如果某项没有内容，返回空数组 [] 或字符串 "无"。
+7. 如果提到具体板块，必须使用 `中文名(纯代码)` 格式，例如 `半导体(881121)`。
+8. 不允许输出带 `.SH`、`.SZ`、`.BJ` 后缀的代码。
+
+请严格输出如下 JSON：
+{{
+  "market_style": {{
+    "recent_style": "",
+    "style_strength": "",
+    "short_term_continuation": "",
+    "today_state": "",
+    "summary": ""
+  }},
+  "direction_plan": {{
+    "market_structure": "",
+    "mid_term_leaders": [
+      {{
+        "name": "",
+        "reason": "",
+        "evidence": [""]
+      }}
+    ],
+    "short_term_hotspots": [
+      {{
+        "name": "",
+        "reason": "",
+        "evidence": [""]
+      }}
+    ],
+    "next_day_focus": [
+      {{
+        "name": "",
+        "status": "",
+        "bias": "",
+        "reason": "",
+        "confirm_signals": [""],
+        "risk_signals": [""]
+      }}
+    ],
+    "observe_directions": [
+      {{
+        "name": "",
+        "reason": "",
+        "watch_signals": [""]
+      }}
+    ],
+    "avoid_directions": [
+      {{
+        "name": "",
+        "reason": "",
+        "risk_signals": [""]
+      }}
+    ],
+    "conflicts": [
+      {{
+        "topic": "",
+        "detail": ""
+      }}
+    ],
+    "summary": ""
+  }}
+}}
+
+字段取值要求：
+- `market_style.recent_style`：只能从这些值中选：`科技成长`、`小盘题材`、`权重蓝筹`、`大盘普涨`、`混合轮动`、`无明显主线`
+- `market_style.style_strength`：只能从这些值中选：`强`、`中`、`弱`
+- `market_style.short_term_continuation`：只能从这些值中选：`强延续`、`弱延续`、`开始分歧`、`已经走弱`
+- `market_style.today_state`：只能从这些值中选：`强化`、`分歧`、`回撤`、`切换`、`普跌`
+- `direction_plan.market_structure`：只能从这些值中选：`老主线轮动`、`主线切换尝试`、`混合轮动`、`防守主导`
+- `next_day_focus[].status`：只能从这些值中选：`主攻`、`观察`、`分歧`
+- `next_day_focus[].bias`：只能从这些值中选：`进攻`、`防守`、`轮动`、`修复`
+
+判断原则：
+1. 宽基指数主要用于判断风格背景，板块数据主要用于判断方向。
+2. 行业板块更偏中期资金偏好，概念板块更偏短线情绪与题材。
+3. 如果板块涨幅靠前，但成分股上涨家数、涨停家数、龙头结构不配合，要谨慎。
+4. 如果某个板块短线很强，但中期趋势较弱，更倾向认定为轮动或脉冲，不要轻易定义为新主线。
+5. 如果多个信号冲突，必须明确写入 `conflicts`。
+
+原始输入数据如下：
+{payload_text}
+""".strip()
+
+
+def judge_market_with_llm(
+    market_index_snapshot: dict[str, Any],
+    sector_heat_snapshot: dict[str, Any],
+    key_analyses: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    调用公共 LLM 接入层，完成一次合并版大盘判断。
+
+    Args:
+        market_index_snapshot: 宽基指数快照。
+        sector_heat_snapshot: 板块热度快照。
+        key_analyses: 重点板块成分股验证结果。
+
+    Returns:
+        包含输入载荷、完整 prompt、原始响应和解析结果的统一结构。
+    """
+    llm_payload = build_market_llm_payload(
+        market_index_snapshot=market_index_snapshot,
+        sector_heat_snapshot=sector_heat_snapshot,
+        key_analyses=key_analyses,
+    )
+    full_prompt = build_market_llm_prompt(llm_payload)
+    llm_result = call_llm_text(
+        user_prompt=full_prompt,
+        system_prompt="",
+        temperature=0.1,
+    )
+    parsed_result = try_parse_json_object(llm_result["text"])
+    return {
+        "input_payload": llm_payload,
+        "full_prompt": full_prompt,
+        "raw_text": llm_result["text"],
+        "raw_response": llm_result["raw_response"],
+        "parsed_result": parsed_result,
+        "model": llm_result["model"],
+        "base_url": llm_result["base_url"],
+    }
+
+
+def print_market_llm_summary(llm_result: dict[str, Any]) -> None:
+    """
+    把 LLM 结果渲染成适合控制台查看的中文摘要。
+
+    Args:
+        llm_result: `judge_market_with_llm` 的返回结果。
+
+    Returns:
+        无返回值。
+    """
+    parsed_result = llm_result.get("parsed_result")
+    if not isinstance(parsed_result, dict):
+        print("LLM 返回未能解析成合法 JSON。")
+        return
+
+    market_style = parsed_result.get("market_style", {})
+    direction_plan = parsed_result.get("direction_plan", {})
+
+    print(f"最近主风格: {market_style.get('recent_style', '无')}")
+    print(f"风格强度: {market_style.get('style_strength', '无')}")
+    print(f"短线延续: {market_style.get('short_term_continuation', '无')}")
+    print(f"今日状态: {market_style.get('today_state', '无')}")
+    print(f"风格总结: {market_style.get('summary', '无')}")
+    print(f"市场结构: {direction_plan.get('market_structure', '无')}")
+    print(f"方向总结: {direction_plan.get('summary', '无')}")
+
+    def _join_name_list(items: Any) -> str:
+        if not isinstance(items, list) or not items:
+            return "无"
+        names = []
+        for item in items:
+            if isinstance(item, dict):
+                names.append(str(item.get("name", "无")))
+        return "、".join([name for name in names if name]) or "无"
+
+    print(f"中期主线候选: {_join_name_list(direction_plan.get('mid_term_leaders'))}")
+    print(f"短线活跃方向: {_join_name_list(direction_plan.get('short_term_hotspots'))}")
+    print(f"明日优先关注: {_join_name_list(direction_plan.get('next_day_focus'))}")
+    print(f"明日观察方向: {_join_name_list(direction_plan.get('observe_directions'))}")
+    print(f"明日回避方向: {_join_name_list(direction_plan.get('avoid_directions'))}")
+
+    conflicts = direction_plan.get("conflicts", [])
+    if isinstance(conflicts, list) and conflicts:
+        conflict_parts = []
+        for item in conflicts[:3]:
+            if isinstance(item, dict):
+                topic = item.get("topic", "无")
+                detail = item.get("detail", "无")
+                conflict_parts.append(f"{topic}: {detail}")
+        print(f"主要矛盾: {'；'.join(conflict_parts) if conflict_parts else '无'}")
+    else:
+        print("主要矛盾: 无")
 
 
 # ============================================================================
@@ -1635,7 +2114,7 @@ def run_market(args: argparse.Namespace, client: TdxClient) -> None:
     t0 = time.perf_counter()
     market_index_snapshot = collect_market_index_snapshot(client)
     print_market_index_table(market_index_snapshot)
-    print(f"[⏱ 6大宽基指数耗时 {time.perf_counter() - t0:.1f}s]")
+    print(f"[耗时 6大宽基指数 {time.perf_counter() - t0:.1f}s]")
 
     # ── 2. 板块热度榜 + 3. 重点板块成分股验证 ──
     print("\n" + "=" * 72)
@@ -1647,37 +2126,37 @@ def run_market(args: argparse.Namespace, client: TdxClient) -> None:
 
     key_analyses = collect_key_sector_member_snapshot(client, sector_heat_snapshot["重点板块"])
     print_key_sector_analysis(key_analyses)
-    print(f"\n[⏱ 板块热度榜耗时 {time.perf_counter() - t0:.1f}s]")
+    print(f"\n[耗时 板块热度榜 {time.perf_counter() - t0:.1f}s]")
 
-    # ── 4. LLM 判断 (TODO) ──
-    print("\n" + "=" * 72)
-    print(">>> 🤖 LLM 最近市场风格判断")
-    print("=" * 72)
-    print("TODO")
-    print(f"[⏱ LLM风格判断耗时 {time.perf_counter() - t0:.1f}s]")  # placeholder
+    llm_result = None
+    if getattr(args, "no_llm", False):
+        print("\n(已用 --no-llm 跳过 LLM 判断)")
+    else:
+        print("\n" + "=" * 72)
+        print(">>> LLM 市场风格资金意图")
+        print("=" * 72)
+        t0 = time.perf_counter()
+        try:
+            llm_result = judge_market_with_llm(
+                market_index_snapshot=market_index_snapshot,
+                sector_heat_snapshot=sector_heat_snapshot,
+                key_analyses=key_analyses,
+            )
+            print_market_llm_summary(llm_result)
+            if getattr(args, "debug_llm", False):
+                print("\n" + "=" * 72)
+                print(">>> LLM 完整 Prompt")
+                print("=" * 72)
+                print(llm_result["full_prompt"])
+                print("\n" + "=" * 72)
+                print(">>> LLM 原始返回")
+                print("=" * 72)
+                print(llm_result["raw_text"])
+        except Exception as exc:
+            print(f"LLM 判断未执行成功: {exc}")
+        print(f"[耗时 LLM判断 {time.perf_counter() - t0:.1f}s]")
 
-    print("\n" + "=" * 72)
-    print(">>> 🤖 LLM 市场资金意图判断")
-    print("=" * 72)
-    print("TODO")
-
-    print(f"\n[⏱ 总耗时 {time.perf_counter() - t0_total:.1f}s]")
-
-    # ── JSON 模式：额外输出原始数据 ──
-    if getattr(args, "json", False):
-        print("")
-        print_json_output(
-            {
-                "market_index_snapshot": market_index_snapshot,
-                "sector_heat_snapshot": {
-                    key: value
-                    for key, value in sector_heat_snapshot.items()
-                    if key != "板块K线原始数据"
-                },
-                "key_sector_snapshot": key_analyses,
-            }
-        )
-
+    print(f"\n[总耗时 {time.perf_counter() - t0_total:.1f}s]")
 
 def run_tdx_api_snapshot(args: argparse.Namespace, client: TdxClient) -> None:
     """
@@ -1805,6 +2284,51 @@ def run_tdx_api_summary(args: argparse.Namespace, client: TdxClient) -> None:
     )
 
 
+def run_llm_config(args: argparse.Namespace, client: TdxClient) -> None:
+    """
+    执行 `llm config` 子命令，检查当前环境变量配置。
+
+    Args:
+        args: 命令行参数对象。
+        client: 通达信客户端包装器。此命令不会使用该对象。
+
+    Returns:
+        无返回值。
+    """
+    _ = args
+    _ = client
+    config = load_llm_config_from_env()
+    print_json_output(
+        {
+            "api_key_env": LLM_API_KEY_ENV_NAME,
+            "api_key_masked": mask_secret(config.api_key),
+            "base_url": config.base_url,
+            "model": config.model,
+            "timeout_seconds": config.timeout_seconds,
+        }
+    )
+
+
+def run_llm_text(args: argparse.Namespace, client: TdxClient) -> None:
+    """
+    执行 `llm text` 子命令，测试公共文本生成能力。
+
+    Args:
+        args: 命令行参数对象。
+        client: 通达信客户端包装器。此命令不会使用该对象。
+
+    Returns:
+        无返回值。
+    """
+    _ = client
+    result = call_llm_text(
+        user_prompt=args.prompt,
+        system_prompt=args.system,
+        temperature=args.temperature,
+    )
+    print(result["text"])
+
+
 def parse_args() -> argparse.Namespace:
     """
         解析命令行参数。
@@ -1816,11 +2340,24 @@ def parse_args() -> argparse.Namespace:
     module_parsers = parser.add_subparsers(dest="module", required=True)
 
     market_parser = module_parsers.add_parser("market", help="执行大盘模块当前第一版采集主干")
-    market_parser.add_argument("--json", action="store_true", help="以 JSON 格式输出原始数据（默认输出格式化表格）")
+    market_parser.add_argument("--no-llm", action="store_true", help="跳过 market 中的 LLM 判断")
+    market_parser.add_argument("--debug-llm", action="store_true", help="打印传给 LLM 的完整 prompt 和原始返回")
     market_parser.set_defaults(handler=run_market)
 
     tdx_api_parser = module_parsers.add_parser("tdx_api", help="调用通达信 `tqcenter` 接口")
     tdx_api_subparsers = tdx_api_parser.add_subparsers(dest="tdx_action", required=True)
+
+    llm_parser = module_parsers.add_parser("llm", help="调用公共 LLM 接入层")
+    llm_subparsers = llm_parser.add_subparsers(dest="llm_action", required=True)
+
+    llm_config_parser = llm_subparsers.add_parser("config", help="查看当前 LLM 环境变量配置")
+    llm_config_parser.set_defaults(handler=run_llm_config)
+
+    llm_text_parser = llm_subparsers.add_parser("text", help="调用公共文本生成接口")
+    llm_text_parser.add_argument("--prompt", required=True, help="用户提示词")
+    llm_text_parser.add_argument("--system", default="", help="可选系统提示词")
+    llm_text_parser.add_argument("--temperature", type=float, default=0.2, help="生成温度")
+    llm_text_parser.set_defaults(handler=run_llm_text)
 
     summary_parser = tdx_api_subparsers.add_parser("summary", help="组合调用内部所需接口并打印摘要")
     summary_parser.add_argument("--code", required=True, help="单个股票代码，推荐输入纯数字")
