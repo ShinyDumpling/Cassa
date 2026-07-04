@@ -53,6 +53,7 @@ TMP_DIR = PROJECT_ROOT / "tmp"
 RESULT_DIR = PROJECT_ROOT / "result"
 DATA_DIR = PROJECT_ROOT / "data"
 CONTEXT_DIR = PROJECT_ROOT / "context"
+BLOCK_TYPE_MAP_PATH = PROJECT_ROOT / "tdx_block_type_map.json"
 
 SUMMARY_MARKET_DATA_FIELDS = [
     "Open",
@@ -97,7 +98,17 @@ MARKET_INDEX_CONFIGS = [
 ]
 BLOCK_LOOKBACK_BARS = 120
 BLOCK_RANK_TOP_N = 15
+BLOCK_STRATEGY_DISPLAY_LIMIT = 10
 SECTOR_BATCH_SIZE = 120
+BLOCK_TYPE_LABELS = {
+    "industry": "【行业】",
+    "region": "【地域】",
+    "theme": "【概念】",
+    "style": "【风格】",
+    "holding": "【持仓】",
+    "event": "【事件】",
+    "unknown": "【未分类】",
+}
 RANKABLE_BLOCK_TYPES = {"industry", "theme"}
 KEY_BLOCKS_PER_BUCKET = 2
 LEADER_CANDIDATE_COUNT = 3
@@ -516,6 +527,66 @@ def build_llm_client() -> OpenAiCompatibleLlmClient:
         可复用的 OpenAI 兼容格式客户端。
     """
     return OpenAiCompatibleLlmClient(load_llm_config_from_env())
+
+
+def load_block_type_map() -> dict[str, dict[str, Any]]:
+    """
+    读取板块分类映射表。
+
+    Returns:
+        以通达信板块代码为键的分类映射字典。
+
+    Raises:
+        RuntimeError: 当映射文件不存在或 JSON 非法时抛出。
+    """
+    try:
+        with BLOCK_TYPE_MAP_PATH.open("r", encoding="utf-8") as file:
+            loaded = json.load(file)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"板块分类映射文件不存在：{BLOCK_TYPE_MAP_PATH}。"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"板块分类映射文件不是合法 JSON：{BLOCK_TYPE_MAP_PATH}。"
+        ) from exc
+
+    if not isinstance(loaded, dict):
+        raise RuntimeError(f"板块分类映射格式错误：{BLOCK_TYPE_MAP_PATH} 顶层必须是对象。")
+    return loaded
+
+
+def get_block_type(block_code: str, block_type_map: dict[str, dict[str, Any]]) -> str:
+    """
+    优先按本地映射表判断板块类型。
+
+    Args:
+        block_code: 通达信板块代码。
+        block_type_map: 已加载的板块分类映射表。
+
+    Returns:
+        板块类型代码，例如 `industry`、`theme`、`style`。
+    """
+    meta = block_type_map.get(block_code)
+    if not isinstance(meta, dict):
+        return "unknown"
+    raw_type = meta.get("type", "unknown")
+    return raw_type if isinstance(raw_type, str) and raw_type else "unknown"
+
+
+def get_block_type_display(block_code: str, block_type_map: dict[str, dict[str, Any]]) -> str:
+    """
+    获取适合展示的人类可读板块类型标签。
+
+    Args:
+        block_code: 通达信板块代码。
+        block_type_map: 已加载的板块分类映射表。
+
+    Returns:
+        中文类型标签。
+    """
+    type_code = get_block_type(block_code, block_type_map)
+    return BLOCK_TYPE_LABELS.get(type_code, f"【{type_code}】")
 
 
 def strip_stock_code_suffix(raw_code: str) -> str:
@@ -1135,6 +1206,354 @@ def summarize_block_trend(close_series: Any, amount_series: Any) -> dict[str, An
     }
 
 
+def _safe_non_negative(value: Any) -> float:
+    """把缺失值转成 0，便于做排序比较。"""
+    try:
+        if value is None:
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_negative_floor(value: Any, fallback: float = -999.0) -> float:
+    """把缺失值转成很小的负值，便于做倒序排序。"""
+    try:
+        if value is None:
+            return fallback
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def match_continuous_strength_block(row: dict[str, Any]) -> tuple[bool, list[str]]:
+    """识别持续走强、并非单日脉冲的板块。"""
+    change5 = row.get("5日涨幅%")
+    change20 = row.get("20日涨幅%")
+    change60 = row.get("60日涨幅%")
+    drawdown = row.get("距120日新高回撤%")
+    drawdown20 = row.get("近20日最大回撤%")
+    if (
+        change5 is None
+        or change20 is None
+        or change60 is None
+        or change5 <= 0
+        or change20 <= 0
+        or change60 <= 0
+        or not row.get("收盘站上MA20")
+        or not row.get("收盘站上MA60")
+        or row.get("MA20方向") != "向上"
+        or row.get("MA60方向") not in ("向上", "走平")
+        or drawdown is None
+        or drawdown < -15
+        or drawdown20 is None
+        or drawdown20 < -12
+    ):
+        return False, []
+
+    return True, [
+        "5日/20日/60日涨幅均为正",
+        "收盘站上MA20和MA60",
+        "MA20向上，MA60未走坏",
+        f"距120日高点回撤 {drawdown:+.2f}%",
+    ]
+
+
+def match_oversold_rebound_block(row: dict[str, Any]) -> tuple[bool, list[str]]:
+    """识别中期跌深后开始修复的板块。"""
+    change5 = row.get("5日涨幅%")
+    drawdown = row.get("距120日新高回撤%")
+    change60 = row.get("60日涨幅%")
+    change120 = row.get("120日涨幅%")
+    stage = row.get("阶段判断")
+    if (
+        change5 is None
+        or change5 <= 0
+        or drawdown is None
+        or drawdown > -20
+        or change60 is None
+        or change60 > 8
+        or (change120 is not None and change120 > 5)
+        or row.get("MA20方向") not in ("向上", "走平")
+        or stage not in ("反抽修复", "上升回流")
+        or not row.get("收盘站上MA20")
+    ):
+        return False, []
+
+    return True, [
+        f"距120日高点回撤 {drawdown:+.2f}%",
+        f"近5日修复 {change5:+.2f}%",
+        "重新站上MA20，处于修复阶段",
+    ]
+
+
+def match_volume_breakout_block(row: dict[str, Any]) -> tuple[bool, list[str]]:
+    """识别带量启动或带量突破的板块。"""
+    change5 = row.get("5日涨幅%")
+    change20 = row.get("20日涨幅%")
+    drawdown = row.get("距120日新高回撤%")
+    strong_amount_days20 = row.get("近20日放量天数")
+    if (
+        change5 is None
+        or change20 is None
+        or change5 <= 2
+        or change20 <= 0
+        or strong_amount_days20 is None
+        or strong_amount_days20 < 3
+        or not row.get("收盘站上MA20")
+        or row.get("MA20方向") != "向上"
+        or drawdown is None
+        or drawdown < -10
+    ):
+        return False, []
+
+    return True, [
+        f"近5日上涨 {change5:+.2f}%",
+        f"近20日放量天数 {strong_amount_days20} 天",
+        f"距120日高点回撤仅 {drawdown:+.2f}%",
+        "站上MA20且MA20向上",
+    ]
+
+
+def match_shrink_pullback_block(row: dict[str, Any]) -> tuple[bool, list[str]]:
+    """识别趋势未坏、回踩不重的板块。"""
+    change5 = row.get("5日涨幅%")
+    change20 = row.get("20日涨幅%")
+    change60 = row.get("60日涨幅%")
+    drawdown = row.get("距120日新高回撤%")
+    drawdown20 = row.get("近20日最大回撤%")
+    strong_amount_days20 = row.get("近20日放量天数")
+    if (
+        change20 is None
+        or change60 is None
+        or change20 <= 0
+        or change60 <= 0
+        or change5 is None
+        or change5 < -3
+        or not row.get("收盘站上MA60")
+        or row.get("MA20方向") != "向上"
+        or drawdown is None
+        or drawdown > -3
+        or drawdown < -18
+        or drawdown20 is None
+        or drawdown20 < -12
+        or strong_amount_days20 is None
+        or strong_amount_days20 > 4
+    ):
+        return False, []
+
+    return True, [
+        f"20日/60日涨幅分别为 {change20:+.2f}% / {change60:+.2f}%",
+        f"距120日高点回撤 {drawdown:+.2f}%",
+        f"近20日放量天数仅 {strong_amount_days20} 天",
+        "中期趋势仍在，回踩更像整理",
+    ]
+
+
+def match_near_high_block(row: dict[str, Any]) -> tuple[bool, list[str]]:
+    """识别仍处于强势区、接近近120日高点的板块。"""
+    drawdown = row.get("距120日新高回撤%")
+    change20 = row.get("20日涨幅%")
+    change60 = row.get("60日涨幅%")
+    if (
+        drawdown is None
+        or drawdown < -5
+        or change20 is None
+        or change20 <= 0
+        or change60 is None
+        or change60 <= 0
+        or not row.get("收盘站上MA20")
+        or not row.get("收盘站上MA60")
+    ):
+        return False, []
+
+    return True, [
+        f"距120日高点回撤仅 {drawdown:+.2f}%",
+        f"20日/60日涨幅分别为 {change20:+.2f}% / {change60:+.2f}%",
+        "收盘仍站在MA20和MA60之上",
+    ]
+
+
+def match_deep_drawdown_block(row: dict[str, Any]) -> tuple[bool, list[str]]:
+    """识别已经从高位回撤很深的板块。"""
+    drawdown = row.get("距120日新高回撤%")
+    if drawdown is None or drawdown > -25:
+        return False, []
+
+    reasons = [f"距120日高点回撤 {drawdown:+.2f}%"]
+    change5 = row.get("5日涨幅%")
+    if change5 is not None and change5 > 0:
+        reasons.append(f"近5日开始修复 {change5:+.2f}%")
+    else:
+        reasons.append("短线仍未形成明显修复")
+    return True, reasons
+
+
+def match_sustained_active_block(row: dict[str, Any]) -> tuple[bool, list[str]]:
+    """识别最近反复活跃、持续有资金参与的板块。"""
+    active_days10 = row.get("近10日活跃天数")
+    strong_amount_days20 = row.get("近20日放量天数")
+    change20 = row.get("20日涨幅%")
+    if (
+        active_days10 is None
+        or active_days10 < 3
+        or strong_amount_days20 is None
+        or strong_amount_days20 < 2
+        or change20 is None
+        or change20 <= -3
+    ):
+        return False, []
+
+    return True, [
+        f"近10日活跃天数 {active_days10} 天",
+        f"近20日放量天数 {strong_amount_days20} 天",
+        f"20日涨幅 {change20:+.2f}%",
+    ]
+
+
+def match_low_vol_start_block(row: dict[str, Any]) -> tuple[bool, list[str]]:
+    """识别此前不显眼、最近开始低波转强的板块。"""
+    active_days10 = row.get("近10日活跃天数")
+    change5 = row.get("5日涨幅%")
+    change20 = row.get("20日涨幅%")
+    drawdown20 = row.get("近20日最大回撤%")
+    drawdown = row.get("距120日新高回撤%")
+    if (
+        active_days10 is None
+        or active_days10 > 2
+        or change5 is None
+        or change5 <= 0
+        or change20 is None
+        or change20 < -2
+        or not row.get("收盘站上MA20")
+        or row.get("MA20方向") not in ("向上", "走平")
+        or drawdown20 is None
+        or drawdown20 < -8
+        or drawdown is None
+        or drawdown <= -30
+    ):
+        return False, []
+
+    return True, [
+        f"近10日活跃天数仅 {active_days10} 天",
+        f"近5日上涨 {change5:+.2f}%",
+        "站上MA20，趋势开始改善",
+        f"近20日最大回撤 {drawdown20:+.2f}%",
+    ]
+
+
+BLOCK_STRATEGY_DEFINITIONS = [
+    {
+        "name": "连续走强板块",
+        "summary": "5/20/60日涨幅均为正，站上MA20/MA60，MA20向上，且距离120日高点不远。",
+        "matcher": match_continuous_strength_block,
+        "sort_key": lambda row: (
+            _safe_non_negative(row.get("60日涨幅%")),
+            _safe_non_negative(row.get("20日涨幅%")),
+            _safe_negative_floor(row.get("距120日新高回撤%")),
+        ),
+    },
+    {
+        "name": "超跌反弹板块",
+        "summary": "中期跌深后，近5日转强并重新站上MA20，阶段上更接近修复而不是主升。",
+        "matcher": match_oversold_rebound_block,
+        "sort_key": lambda row: (
+            _safe_non_negative(-_safe_negative_floor(row.get("距120日新高回撤%"), 0)),
+            _safe_non_negative(row.get("5日涨幅%")),
+            _safe_negative_floor(row.get("20日涨幅%")),
+        ),
+    },
+    {
+        "name": "放量突破板块",
+        "summary": "近5日明显走强，近20日放量天数较多，站上MA20且接近阶段高位。",
+        "matcher": match_volume_breakout_block,
+        "sort_key": lambda row: (
+            _safe_non_negative(row.get("近20日放量天数")),
+            _safe_non_negative(row.get("20日涨幅%")),
+            _safe_negative_floor(row.get("距120日新高回撤%")),
+        ),
+    },
+    {
+        "name": "缩量回踩板块",
+        "summary": "20/60日趋势仍强，站在MA60之上，回撤可控且近20日放量天数不多。",
+        "matcher": match_shrink_pullback_block,
+        "sort_key": lambda row: (
+            _safe_non_negative(row.get("60日涨幅%")),
+            _safe_negative_floor(row.get("距120日新高回撤%")),
+            -_safe_non_negative(row.get("近20日放量天数")),
+        ),
+    },
+    {
+        "name": "接近新高板块",
+        "summary": "距离120日高点回撤很小，20/60日趋势仍强，收盘保持在MA20和MA60之上。",
+        "matcher": match_near_high_block,
+        "sort_key": lambda row: (
+            _safe_negative_floor(row.get("距120日新高回撤%")),
+            _safe_non_negative(row.get("60日涨幅%")),
+            _safe_non_negative(row.get("20日涨幅%")),
+        ),
+    },
+    {
+        "name": "深度回撤板块",
+        "summary": "相对120日高点已经回撤较深，用来观察哪些板块仍在深坑区或刚开始修复。",
+        "matcher": match_deep_drawdown_block,
+        "sort_key": lambda row: (
+            _safe_non_negative(-_safe_negative_floor(row.get("距120日新高回撤%"), 0)),
+            _safe_negative_floor(row.get("5日涨幅%")),
+        ),
+    },
+    {
+        "name": "持续活跃板块",
+        "summary": "近10日活跃天数和近20日放量天数都较高，说明最近反复有资金参与。",
+        "matcher": match_sustained_active_block,
+        "sort_key": lambda row: (
+            _safe_non_negative(row.get("近10日活跃天数")),
+            _safe_non_negative(row.get("近20日放量天数")),
+            _safe_non_negative(row.get("20日涨幅%")),
+        ),
+    },
+    {
+        "name": "低波启动板块",
+        "summary": "此前不太活跃，但近5日转强、站上MA20，且回撤不大，像低波起势。",
+        "matcher": match_low_vol_start_block,
+        "sort_key": lambda row: (
+            _safe_non_negative(row.get("5日涨幅%")),
+            _safe_negative_floor(row.get("20日涨幅%")),
+            -_safe_non_negative(row.get("近10日活跃天数")),
+        ),
+    },
+]
+
+
+def build_block_strategy_snapshot(sector_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    基于全部板块摘要，筛出多组板块策略结果。
+
+    Args:
+        sector_rows: 全部可排名板块摘要行。
+
+    Returns:
+        各策略的命中列表与命中理由。
+    """
+    strategy_results: dict[str, list[dict[str, Any]]] = {}
+    for strategy in BLOCK_STRATEGY_DEFINITIONS:
+        matched_rows: list[dict[str, Any]] = []
+        for row in sector_rows:
+            matched, reasons = strategy["matcher"](row)
+            if not matched:
+                continue
+            copied_row = dict(row)
+            copied_row["命中理由"] = reasons
+            matched_rows.append(copied_row)
+        matched_rows.sort(key=strategy["sort_key"], reverse=True)
+        strategy_results[strategy["name"]] = matched_rows
+
+    return {
+        "全部板块数": len(sector_rows),
+        "策略结果": strategy_results,
+    }
+
+
 def pick_key_blocks(industry_top: list[dict[str, Any]], concept_top: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     从行业和概念热度榜中挑出少量重点板块，供后续成分股验证。
@@ -1298,6 +1717,7 @@ def collect_sector_heat_snapshot(client: TdxClient) -> dict[str, Any]:
         包含板块基础信息、热度榜和重点板块列表的结构化结果。
     """
     sectors = client.get_sector_list(list_type=1)
+    block_type_map = load_block_type_map()
     sector_codes = [item["Code"] for item in sectors]
     open_data = None
     high_data = None
@@ -1340,10 +1760,7 @@ def collect_sector_heat_snapshot(client: TdxClient) -> dict[str, Any]:
     sector_rows: list[dict[str, Any]] = []
     failed_count = 0
     sector_type_counter: Counter[str] = Counter()
-    type_map = {
-        "88": "theme",
-        "881": "industry",
-    }
+    unknown_type_codes: list[str] = []
 
     for sector in sectors:
         sector_code = sector["Code"]
@@ -1361,19 +1778,17 @@ def collect_sector_heat_snapshot(client: TdxClient) -> dict[str, Any]:
         trend_summary = summarize_block_trend(close_series, amount_series)
 
         internal_code = strip_tdx_suffix(sector_code)
-        if internal_code.startswith("881"):
-            sector_type = "industry"
-        elif internal_code.startswith("880"):
-            sector_type = "theme"
-        else:
-            sector_type = "unknown"
+        sector_type = get_block_type(sector_code, block_type_map)
         sector_type_counter[sector_type] += 1
+        if sector_type == "unknown":
+            unknown_type_codes.append(sector_code)
 
         row = {
             "代码": sector_code,
             "纯代码": internal_code,
             "名称": sector["Name"],
             "类型代码": sector_type,
+            "类型": get_block_type_display(sector_code, block_type_map),
             "当日涨幅%": round(day_change, 2) if day_change is not None else None,
             "成交额": float(amount_series.iloc[-1]),
             "成交额亿": round(amount_yi, 1),
@@ -1436,7 +1851,10 @@ def collect_sector_heat_snapshot(client: TdxClient) -> dict[str, Any]:
         "有效板块数": len(sector_rows),
         "数据不足板块数": failed_count,
         "板块分类统计": dict(sector_type_counter),
+        "未分类板块代码": unknown_type_codes,
         "过滤后板块数": len(filtered_rows),
+        "全部板块摘要": sector_rows,
+        "可排名板块摘要": filtered_rows,
         "行业热度榜": industry_top,
         "概念热度榜": concept_top,
         "行业跌幅榜": industry_bottom,
@@ -1752,6 +2170,7 @@ def print_sector_heat_tables(sector_snapshot: dict[str, Any]) -> None:
     valid = sector_snapshot.get("有效板块数", 0)
     failed = sector_snapshot.get("数据不足板块数", 0)
     type_stats = sector_snapshot.get("板块分类统计", {})
+    unknown_codes = sector_snapshot.get("未分类板块代码", [])
     filtered = sector_snapshot.get("过滤后板块数", 0)
 
     print(f"全部板块总数: {total}")
@@ -1761,6 +2180,8 @@ def print_sector_heat_tables(sector_snapshot: dict[str, Any]) -> None:
     for key in sorted(type_stats.keys()):
         parts.append(f"{key}={type_stats[key]}")
     print(f"板块分类统计: {', '.join(parts)}")
+    if unknown_codes:
+        print(f"未分类板块数: {len(unknown_codes)}")
     print(f"过滤后剩余: {filtered} 个")
 
     top_count = sum(
@@ -1854,6 +2275,65 @@ def print_key_sector_analysis(key_analyses: list[dict[str, Any]]) -> None:
         else:
             lu_str = "-"
         print(f"     龙头: {leaders}    中军: {middles}    涨停股: {lu_str}")
+
+
+def print_block_strategy_tables(strategy_snapshot: dict[str, Any]) -> None:
+    """
+    打印板块筛选策略结果，补充热度榜之外的全市场视角。
+
+    Args:
+        strategy_snapshot: `build_block_strategy_snapshot` 的返回结果。
+
+    Returns:
+        无返回值。
+    """
+    strategy_results = strategy_snapshot.get("策略结果", {})
+    if not isinstance(strategy_results, dict) or not strategy_results:
+        print("(无板块策略结果)")
+        return
+
+    print("\n" + "=" * 72)
+    print(">>> 4. 板块筛选策略")
+    print("=" * 72)
+    print(
+        f"全部可排名板块: {strategy_snapshot.get('全部板块数', 0)} 个，"
+        f"每个策略默认展示前 {BLOCK_STRATEGY_DISPLAY_LIMIT} 个"
+    )
+
+    header = (
+        f"{'排名':<4}{'板块':<26}{'当日%':>8}{'20日%':>8}"
+        f"{'60日%':>8}{'回撤%':>8}{'活跃天':>8}{'放量天':>8}"
+    )
+
+    for strategy_name, rows in strategy_results.items():
+        display_rows = rows[:BLOCK_STRATEGY_DISPLAY_LIMIT]
+        strategy_meta = next(
+            (item for item in BLOCK_STRATEGY_DEFINITIONS if item["name"] == strategy_name),
+            None,
+        )
+        print("\n" + "-" * 72)
+        print(f"{strategy_name}: 命中 {len(rows)} 个")
+        if strategy_meta and strategy_meta.get("summary"):
+            print(f"逻辑: {strategy_meta['summary']}")
+        print("-" * 72)
+        if not display_rows:
+            print("(无命中板块)")
+            continue
+
+        print(header)
+        print("-" * 72)
+        for index, row in enumerate(display_rows, 1):
+            board_name = f"{row.get('名称', '')}({row.get('纯代码', '')})"
+            day_pct = _fmt_pct(row.get("当日涨幅%"), 2)
+            chg20 = _fmt_pct(row.get("20日涨幅%"), 2)
+            chg60 = _fmt_pct(row.get("60日涨幅%"), 2)
+            drawdown = _fmt_pct(row.get("距120日新高回撤%"), 2)
+            active_days = str(row.get("近10日活跃天数", "-"))
+            amount_days = str(row.get("近20日放量天数", "-"))
+            print(
+                f"{index:<4}{board_name:<26}{day_pct:>8}{chg20:>8}"
+                f"{chg60:>8}{drawdown:>8}{active_days:>8}{amount_days:>8}"
+            )
 
 
 def build_market_llm_payload(
@@ -2126,6 +2606,9 @@ def run_market(args: argparse.Namespace, client: TdxClient) -> None:
 
     key_analyses = collect_key_sector_member_snapshot(client, sector_heat_snapshot["重点板块"])
     print_key_sector_analysis(key_analyses)
+
+    strategy_snapshot = build_block_strategy_snapshot(sector_heat_snapshot.get("可排名板块摘要", []))
+    print_block_strategy_tables(strategy_snapshot)
     print(f"\n[耗时 板块热度榜 {time.perf_counter() - t0:.1f}s]")
 
     llm_result = None
