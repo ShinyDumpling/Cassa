@@ -2475,13 +2475,14 @@ def check_trend_reversal(
                 golden_cross_below_zero = True
                 break
 
-    # 条件3：下跌节奏被打破 —— 最近 N 根 K 线的最低价 > 最近的 pivot low
+    # 条件3：下跌节奏被打破 —— 最近 N 根 K 线的最低价不低于背离低点
+    # （不再要求"高于"，只要不再创新低即视为节奏打破）
     rhythm_broken = False
     if divergence_result.get("found"):
         divergence_low_value = divergence_result["latest_price_low"].value
         lookback_start = max(0, total - SCREENER_LOOKBACK_BARS_FOR_BREAK)
         recent_lowest = min(bar.low_price for bar in kline_bars[lookback_start:])
-        rhythm_broken = recent_lowest > divergence_low_value
+        rhythm_broken = recent_lowest >= divergence_low_value
 
     confirmed = dif_above_zero and golden_cross_below_zero and rhythm_broken
 
