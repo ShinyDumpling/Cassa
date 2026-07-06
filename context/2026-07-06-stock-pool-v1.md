@@ -173,3 +173,46 @@
 ## 来源会话
 
 - 当前会话（2026-07-06）
+
+## 实现结论
+
+第一版已在分支 `feat/stock-pool-v1` 完成，实现方式与最初方案有调整：
+
+### 入口
+
+- 通达信自定义板块 `CASSA` 作为股票池入口
+- CLI 命令：`python cassa.py stock_pool sync`
+- 用户在通达信客户端手动把看好的股票加入 CASSA 板块，然后跑 sync 同步
+
+### 存储
+
+- 本地 SQLite：`data/stock_pool.db`
+- 单表 `stock_pool`，`id` 自增主键，`code` 可重复（每次导入都是新行）
+- 字段：`id / code / name / status / reason / create_time / industry / concept`
+- `reason` 第一版统一留空
+
+### 同步规则
+
+- TDX 有、本地无（status=观察）→ INSERT（status=观察，reason 空）
+- 本地 status=观察、TDX 已删除 → UPDATE status=丢弃
+- 两边都有 → 跳过
+- 已丢弃的记录不重新激活（即使 TDX 又加回来也不会恢复，因为只比对 status=观察 的行）
+
+### 与最初方案的差异
+
+1. `code` 不再唯一——允许同 code 重复入池，每次都是新行
+2. `reason` 先空着——第一版不做理由录入
+3. 入口从"手动 add"改为"通达信自定义板块同步"——用户在通达信里管理股票，程序负责同步
+4. 重复入池时不修改历史数据——只看当前 status=观察 的行做比对
+
+### 新增的 TdxClient 方法
+
+- `create_sector(block_code, block_name)`：创建通达信自定义板块（尚未有 CLI 入口）
+
+### 后续待扩展
+
+- `create_sector` 的 CLI 入口（如 `stock_pool init`）
+- 批量入池理由录入
+- 板块池
+- 提醒规则引擎
+- 与 screener / market 模块联动
