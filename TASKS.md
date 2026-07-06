@@ -48,7 +48,11 @@
 | T032 | todo | 输出第一阶段历史信号验证汇总 | 汇总 `total_signal_days`、`total_signals` 以及各窗口的 `valid/up/down/flat/up_rate` | 第一版先验证信号是否更容易上涨，再决定是否进入第二阶段交易回测 |
 | T033 | todo | 设计简单交易策略第一版 | 明确选股后的基础交易规则：什么时候买入、什么时候卖出、止盈止损放哪里、单笔最多赚多少、最多亏多少 | 这是第二阶段交易回测的前置设计，先不要和第一阶段历史信号验证混在一起 |
 | T034 | todo | 设计选股与大盘/板块联动的两条路径 | 同时梳理两条能力：1. 选股结果如何结合板块分析；2. 从大盘/板块出发，如何在板块内继续选股 | 这项会连接当前 `market` 模块与 `screener` 模块，是后续从“全市场出票”走向“结构化出票”的关键 |
-| T035 | doing | 建立股票池管理与监控第一版 | 先只做个股层：股票入池、入池理由、后续监控提醒；后面再扩展到板块层 | 当前最高优先级；第一版先按 `context/2026-07-06-stock-pool-v1.md` 的单表方案执行：`code/name/status/reason/create_time/industry/concept`，其中 `code` 为纯数字，`status` 只含 `观察/丢弃` |
+| T035 | done | 建立股票池管理与监控第一版 | 先只做个股层：股票入池、入池理由、后续监控提醒；后面再扩展到板块层 | 已完成第一版：以通达信自定义板块 CASSA 为入口，`python cassa.py stock_pool sync` 同步到本地 SQLite（`data/stock_pool.db`）；TDX 有 DB 无→INSERT，DB 观察 TDX 无→改丢弃；TdxClient 新增 `create_sector` 方法 |
+| T036 | done | 个股趋势分析层第一版：纯规则计算 | 对齐 DSA 的 StockTrendAnalyzer，纯 Python 重写均线/乖离率/量能/支撑压力/MACD/RSI/综合评分；MACD 复用通达信公式引擎 | 已在分支 `feat/trend-analyzer` 完成；新增 `TrendAnalysisResult` dataclass（约40字段）+ 11个计算/判断函数 + `analyze_stock_trend` 主入口 |
+| T037 | done | 个股报告 CLI 入口与数据采集 | `python cassa.py report --codes` 支持；采集基本信息/当日行情/换手率/基本面/行业概念/资金面 | 已完成；新增 `extract_today_quote` / `collect_stock_info` / `format_trend_result` / `run_report`；接口坑点：BlockType/BlockName 首字母大写、换手率直接用 fHSL |
+| T038 | todo | 接入 LLM 做个股预期判断 | 在现有纯规则事实基础上，拼 prompt 调 LLM，输出预期方向/成立信号/失效信号/关键价位/风险 | 依赖 T022 公共 LLM 接入层已就绪；设计参考 DSA stock_expectation 的输出结构，合并报告+预期为一步 |
+| T039 | todo | 全量接入通达信接口数据 | 把 stock_info / more_info / snapshot 等接口的全量字段都纳入个股报告 | 当前只取了部分字段，很多有价值的数据（如涨停价/跌停价/封单等）未接入 |
 
 ## 待整理 / 收件箱
 
