@@ -225,6 +225,7 @@ class ScreenResult:
     divergence_found: bool
     reversal_confirmed: bool
     band_position_ok: bool
+    divergence_low_date: str
     detail: dict[str, Any]
 
 
@@ -2605,8 +2606,12 @@ def screen_single_stock(
             latest_date=kline_bars[-1].trade_date, latest_dif=macd.dif[-1],
             latest_dea=macd.dea[-1], latest_macd=macd.macd[-1],
             divergence_found=False, reversal_confirmed=False,
-            band_position_ok=False, detail={"divergence": divergence_result},
+            band_position_ok=False, divergence_low_date="", detail={"divergence": divergence_result},
         )
+
+    # 记录创新低的K线日期
+    divergence_low_date = divergence_result.get("latest_price_low", None)
+    divergence_low_date = divergence_low_date.trade_date if divergence_low_date else ""
 
     # 第4步：趋势反转确认
     reversal_result = check_trend_reversal(macd.dif, macd.dea, divergence_result, kline_bars)
@@ -2622,7 +2627,8 @@ def screen_single_stock(
             latest_date=kline_bars[-1].trade_date, latest_dif=macd.dif[-1],
             latest_dea=macd.dea[-1], latest_macd=macd.macd[-1],
             divergence_found=True, reversal_confirmed=False,
-            band_position_ok=False, detail={"divergence": divergence_result, "reversal": reversal_result},
+            band_position_ok=False, divergence_low_date=divergence_low_date,
+            detail={"divergence": divergence_result, "reversal": reversal_result},
         )
 
     # 第5步：波段位置判断（暂时跳过，先观察前两步选出的结果）
@@ -2641,7 +2647,7 @@ def screen_single_stock(
         latest_date=kline_bars[-1].trade_date, latest_dif=macd.dif[-1],
         latest_dea=macd.dea[-1], latest_macd=macd.macd[-1],
         divergence_found=True, reversal_confirmed=True,
-        band_position_ok=band_position_ok,
+        band_position_ok=band_position_ok, divergence_low_date=divergence_low_date,
         detail={"divergence": divergence_result, "reversal": reversal_result, "band": band_result},
     )
 
@@ -3559,7 +3565,8 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
                 code=code, passed=False, fail_reason="K线数据不足",
                 kline_count=0, latest_close=0, latest_date="", latest_dif=0,
                 latest_dea=0, latest_macd=0, divergence_found=False,
-                reversal_confirmed=False, band_position_ok=False, detail={},
+                reversal_confirmed=False, band_position_ok=False,
+                divergence_low_date="", detail={},
             )
             results.append(result)
             if i % 500 == 0:
@@ -3575,7 +3582,8 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
                 kline_count=len(kline_bars), latest_close=kline_bars[-1].close_price,
                 latest_date=kline_bars[-1].trade_date, latest_dif=0,
                 latest_dea=0, latest_macd=0, divergence_found=False,
-                reversal_confirmed=False, band_position_ok=False, detail={},
+                reversal_confirmed=False, band_position_ok=False,
+                divergence_low_date="", detail={},
             )
             results.append(result)
             continue
@@ -3613,6 +3621,7 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
                 "divergence_found": r.divergence_found,
                 "reversal_confirmed": r.reversal_confirmed,
                 "band_position_ok": r.band_position_ok,
+                "divergence_low_date": r.divergence_low_date,
             }
             for r in results
         ],
