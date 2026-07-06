@@ -137,6 +137,7 @@ SCREENER_RECENT_LOW_WINDOW = 10
 SCREENER_CONSOLIDATION_AMPLITUDE_THRESHOLD = 0.08
 SCREENER_KISS_RATIO = 0.3
 SCREENER_HIGH_PULLBACK_THRESHOLD = 0.5
+SCREENER_DIF_KISS_THRESHOLD = 0.5
 SCREENER_LOOKBACK_BARS_FOR_BREAK = 20
 SCREENER_DIF_RECENT_WINDOW = 40
 SCREENER_MACD_BATCH_COUNT = 150
@@ -2521,7 +2522,11 @@ def check_band_position(
     kline_bars: list[KlineBar],
 ) -> dict[str, Any]:
     """
-    判断波段位置：盘整 + 飞吻 + 排除高位回调。
+    判断波段位置：飞吻 + 排除高位回调 + 没有高位死叉。
+
+    飞吻：DIF 在零轴上方且小于绝对小值阈值（贴零轴）。
+    高位回调：DIF 从近期高点的回落幅度超过阈值则排除。
+    高位死叉：DIF 从上方下穿 DEA 且 DIF 仍在较高位置则排除。
 
     Args:
         dif: DIF 序列。
@@ -2532,49 +2537,35 @@ def check_band_position(
         包含是否处于合适波段位置、各项子条件状态的字典。
     """
     total = len(dif)
-    if total < SCREENER_LOOKBACK_BARS_FOR_BREAK:
+    if total < 2:
         return {"ok": False, "reason": "数据不足"}
 
     latest_dif = dif[-1]
 
-    # 条件1：盘整 —— 最近 N 根 K 线振幅小于阈值
-    lookback_start = total - SCREENER_LOOKBACK_BARS_FOR_BREAK
-    recent_bars = kline_bars[lookback_start:]
-    recent_high = max(bar.high_price for bar in recent_bars)
-    recent_low = min(bar.low_price for bar in recent_bars)
-    recent_avg = sum(bar.close_price for bar in recent_bars) / len(recent_bars)
-    amplitude = (recent_high - recent_low) / recent_avg if recent_avg > 0 else 999
-    is_consolidating = amplitude < SCREENER_CONSOLIDATION_AMPLITUDE_THRESHOLD
+    # 条件1：飞吻 —— DIF 在零轴上方且小于绝对阈值
+    is_kiss = 0 < latest_dif < SCREENER_DIF_KISS_THRESHOLD
 
-    # 条件2：飞吻 —— DIF 在零轴上方但贴近零轴
-    recent_dif_max = max(abs(d) for d in dif[-SCREENER_DIF_RECENT_WINDOW:])
-    kiss_upper = recent_dif_max * SCREENER_KISS_RATIO
-    is_kiss = 0 < latest_dif < kiss_upper if kiss_upper > 0 else False
-
-    # 条件3：排除高位回调 —— DIF 从近期高点的回落幅度不超过阈值
+    # 条件2：排除高位回调 —— DIF 从近期高点的回落幅度不超过阈值
     dif_recent_window = dif[-SCREENER_DIF_RECENT_WINDOW:]
     dif_high = max(dif_recent_window)
     pullback_ratio = (dif_high - latest_dif) / dif_high if dif_high > 0 else 0
     not_high_pullback = pullback_ratio < SCREENER_HIGH_PULLBACK_THRESHOLD
 
-    # 条件4：没有出现高位死叉（DIF 从上方下穿 DEA 且 DIF 仍在较高位置）
+    # 条件3：没有出现高位死叉（DIF 从上方下穿 DEA 且 DIF 仍在较高位置）
     no_high_death_cross = True
-    if total >= 2:
-        prev_dif = dif[-2]
-        prev_dea = dea[-2]
-        curr_dif = dif[-1]
-        curr_dea = dea[-1]
-        if prev_dif > prev_dea and curr_dif <= curr_dea and curr_dif > kiss_upper:
-            no_high_death_cross = False
+    prev_dif = dif[-2]
+    prev_dea = dea[-2]
+    curr_dif = dif[-1]
+    curr_dea = dea[-1]
+    if prev_dif > prev_dea and curr_dif <= curr_dea and curr_dif > SCREENER_DIF_KISS_THRESHOLD:
+        no_high_death_cross = False
 
-    ok = is_consolidating and is_kiss and not_high_pullback and no_high_death_cross
+    ok = is_kiss and not_high_pullback and no_high_death_cross
 
     return {
         "ok": ok,
-        "is_consolidating": is_consolidating,
-        "amplitude": amplitude,
         "is_kiss": is_kiss,
-        "kiss_upper": kiss_upper,
+        "latest_dif": latest_dif,
         "not_high_pullback": not_high_pullback,
         "pullback_ratio": pullback_ratio,
         "no_high_death_cross": no_high_death_cross,
@@ -2652,11 +2643,9 @@ def screen_single_stock(
             detail={"divergence": divergence_result, "reversal": reversal_result},
         )
 
-    # 第5步：波段位置判断（暂时跳过，先观察前两步选出的结果）
-    # band_result = check_band_position(macd.dif, macd.dea, kline_bars)
-    # band_position_ok = band_result.get("ok", False)
-    band_position_ok = True
-    band_result = {"ok": True, "reason": "波段位置判断已暂时跳过"}
+    # 第5步：波段位置判断
+    band_result = check_band_position(macd.dif, macd.dea, kline_bars)
+    band_position_ok = band_result.get("ok", False)
 
     if debug:
         print(f"  [{code}] 波段位置: {band_result}")
