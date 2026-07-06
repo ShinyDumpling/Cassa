@@ -2625,9 +2625,11 @@ def screen_single_stock(
             band_position_ok=False, detail={"divergence": divergence_result, "reversal": reversal_result},
         )
 
-    # 第5步：波段位置判断
-    band_result = check_band_position(macd.dif, macd.dea, kline_bars)
-    band_position_ok = band_result.get("ok", False)
+    # 第5步：波段位置判断（暂时跳过，先观察前两步选出的结果）
+    # band_result = check_band_position(macd.dif, macd.dea, kline_bars)
+    # band_position_ok = band_result.get("ok", False)
+    band_position_ok = True
+    band_result = {"ok": True, "reason": "波段位置判断已暂时跳过"}
 
     if debug:
         print(f"  [{code}] 波段位置: {band_result}")
