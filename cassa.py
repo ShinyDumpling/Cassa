@@ -2606,7 +2606,8 @@ def screen_single_stock(
             latest_date=kline_bars[-1].trade_date, latest_dif=macd.dif[-1],
             latest_dea=macd.dea[-1], latest_macd=macd.macd[-1],
             divergence_found=False, reversal_confirmed=False,
-            band_position_ok=False, divergence_low_date="", detail={"divergence": divergence_result},
+            band_position_ok=False, divergence_low_date="",
+            detail={"divergence": divergence_result},
         )
 
     # 记录创新低的K线日期
@@ -3595,6 +3596,22 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
         elif i % 500 == 0:
             print(f"  [{i}/{len(codes)}] 进度...")
         results.append(result)
+
+    # 过滤 ST 股票：对通过的股票查名称，带 ST 的标记为未通过
+    passed_results = [r for r in results if r.passed]
+    if passed_results:
+        print(f"\n>>> 过滤 ST 股票（{len(passed_results)} 只待查）...")
+        for r in passed_results:
+            try:
+                stock_code = normalize_stock_code(r.code)
+                info = client.get_stock_info(stock_code, field_list=["Name"])
+                stock_name = str(info.get("Name", ""))
+                if "ST" in stock_name:
+                    r.passed = False
+                    r.fail_reason = f"ST股票: {stock_name}"
+                    print(f"  {r.code} - {stock_name} - 已过滤")
+            except Exception:
+                pass
 
     # 打印摘要
     print_screener_summary(results)
