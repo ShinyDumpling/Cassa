@@ -31,10 +31,12 @@ import argparse
 from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from datetime import datetime
 import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import time
 from typing import Any
 
@@ -141,6 +143,10 @@ SCREENER_LOOKBACK_BARS_FOR_BREAK = 20
 SCREENER_DIF_RECENT_WINDOW = 40
 SCREENER_MACD_BATCH_COUNT = 150
 SCREENER_MACD_BATCH_CHUNK_SIZE = 500
+
+# ── 股票池常量 ──
+STOCK_POOL_DB_PATH = DATA_DIR / "stock_pool.db"
+STOCK_POOL_SECTOR_CODE = "CASSA"
 
 
 # ============================================================================
@@ -441,6 +447,24 @@ class TdxClient:
             block_code=block_code,
             block_type=block_type,
             list_type=list_type,
+        )
+
+    def create_sector(self, block_code: str, block_name: str) -> dict[str, Any]:
+        """
+        创建通达信自定义板块。
+
+        Args:
+            block_code: 自定义板块简称，例如 `CASSA`。
+            block_name: 自定义板块显示名称，例如 `股票池`。
+
+        Returns:
+            通达信原始返回结果，包含 `ErrorId` 和 `Error` 等字段。
+        """
+        self.initialize()
+        return self._invoke_quietly(
+            tq.create_sector,
+            block_code=block_code,
+            block_name=block_name,
         )
 
     def set_formula_data(
@@ -3659,6 +3683,136 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
     print(f"\n[总耗时 {time.perf_counter() - t0_total:.1f}s]")
 
 
+# ============================================================================
+# 股票池管理层
+# 第一版：以通达信自定义板块 CASSA 为入口，同步到本地 SQLite。
+# ============================================================================
+
+
+def _ensure_stock_pool_db() -> sqlite3.Connection:
+    """初始化股票池数据库，建表并返回连接。
+
+    Returns:
+        已打开的 SQLite 连接对象。
+    """
+    db_path = str(STOCK_POOL_DB_PATH)
+    STOCK_POOL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stock_pool (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            code        TEXT NOT NULL,
+            name        TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT '观察',
+            reason      TEXT NOT NULL DEFAULT '',
+            create_time TEXT NOT NULL,
+            industry    TEXT NOT NULL DEFAULT '',
+            concept     TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def stock_pool_sync_from_tdx(client: TdxClient) -> None:
+    """从通达信自定义板块 CASSA 同步股票到本地股票池。
+
+    同步规则：
+    - 通达信中有、本地没有的：新增入池（status=观察，reason 留空）
+    - 本地 status=观察、通达信中已删除的：更新 status=丢弃
+
+    Args:
+        client: 已初始化的通达信客户端。
+    """
+    print("\n[股票池同步] 从通达信自定义板块 CASSA 同步……\n")
+
+    # 1. 获取通达信 CASSA 板块成分股
+    tdx_stocks = client.get_stock_list_in_sector(
+        STOCK_POOL_SECTOR_CODE,
+        block_type=1,
+        list_type=1,
+    )
+
+    if not tdx_stocks:
+        print("  CASSA 板块为空或获取失败，跳过同步。")
+        return
+
+    # 2. 代码转纯数字
+    tdx_codes: dict[str, str] = {}  # 纯数字代码 -> 名称
+    for item in tdx_stocks:
+        raw_code = item.get("Code", "")
+        name = item.get("Name", "")
+        try:
+            internal_code = to_internal_stock_code(raw_code)
+            tdx_codes[internal_code] = name
+        except ValueError:
+            continue
+
+    print(f"  通达信 CASSA 板块共 {len(tdx_codes)} 只成分股")
+
+    # 3. 连接本地数据库
+    conn = _ensure_stock_pool_db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 4. 读取本地 status=观察 的所有 code
+    existing_rows = conn.execute(
+        "SELECT code FROM stock_pool WHERE status = '观察'"
+    ).fetchall()
+    db_observing_codes = {row[0] for row in existing_rows}
+
+    # 5. 比对：TDX 有、本地无 → INSERT
+    inserted_count = 0
+    for code, name in tdx_codes.items():
+        if code not in db_observing_codes:
+            conn.execute(
+                "INSERT INTO stock_pool (code, name, status, reason, create_time, industry, concept) "
+                "VALUES (?, ?, '观察', '', ?, '', '')",
+                (code, name, now),
+            )
+            inserted_count += 1
+
+    # 6. 比对：本地观察、TDX 无 → UPDATE status=丢弃
+    dropped_count = 0
+    for code in db_observing_codes:
+        if code not in tdx_codes:
+            conn.execute(
+                "UPDATE stock_pool SET status = '丢弃' WHERE code = ? AND status = '观察'",
+                (code,),
+            )
+            dropped_count += 1
+
+    conn.commit()
+    conn.close()
+
+    # 7. 汇总输出
+    print(f"  本次同步完成：新增 {inserted_count} 只，丢弃 {dropped_count} 只")
+
+    # 8. 打印当前观察列表
+    conn = sqlite3.connect(str(STOCK_POOL_DB_PATH))
+    observing = conn.execute(
+        "SELECT code, name, create_time FROM stock_pool WHERE status = '观察' ORDER BY id DESC"
+    ).fetchall()
+    conn.close()
+
+    if observing:
+        print(f"\n  当前观察列表 ({len(observing)} 只)：")
+        for code, name, create_time in observing:
+            print(f"    {code}  {name}  ({create_time})")
+    else:
+        print("\n  当前观察列表为空。")
+
+
+def run_stock_pool_sync(args: argparse.Namespace, client: TdxClient) -> None:
+    """
+    命令行入口：执行股票池同步。
+
+    Args:
+        args: 命令行参数对象（当前不需要额外参数）。
+        client: 已创建的通达信客户端。
+    """
+    stock_pool_sync_from_tdx(client)
+
+
 def parse_args() -> argparse.Namespace:
     """
         解析命令行参数。
@@ -3679,6 +3833,12 @@ def parse_args() -> argparse.Namespace:
     screener_parser.add_argument("--min-kline", type=int, default=SCREENER_MIN_KLINE_COUNT, help=f"最小K线数，默认 {SCREENER_MIN_KLINE_COUNT}")
     screener_parser.add_argument("--debug", action="store_true", help="输出每只股票的详细筛选过程")
     screener_parser.set_defaults(handler=run_screener)
+
+    stock_pool_parser = module_parsers.add_parser("stock_pool", help="股票池管理")
+    stock_pool_subparsers = stock_pool_parser.add_subparsers(dest="stock_pool_action", required=True)
+
+    stock_pool_sync_parser = stock_pool_subparsers.add_parser("sync", help="从通达信 CASSA 自定义板块同步到本地股票池")
+    stock_pool_sync_parser.set_defaults(handler=run_stock_pool_sync)
 
     tdx_api_parser = module_parsers.add_parser("tdx_api", help="调用通达信 `tqcenter` 接口")
     tdx_api_subparsers = tdx_api_parser.add_subparsers(dest="tdx_action", required=True)
