@@ -30,7 +30,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import io
 import json
@@ -148,6 +148,19 @@ SCREENER_MACD_BATCH_CHUNK_SIZE = 500
 STOCK_POOL_DB_PATH = DATA_DIR / "stock_pool.db"
 STOCK_POOL_SECTOR_CODE = "CASSA"
 
+# ── 趋势分析常量 ──
+TREND_MA_PERIODS = [5, 10, 20, 60]
+TREND_RSI_PERIODS = [6, 12, 24]
+TREND_RSI_OVERBOUGHT = 70
+TREND_RSI_OVERSOLD = 30
+TREND_VOLUME_SHRINK_RATIO = 0.7
+TREND_VOLUME_HEAVY_RATIO = 1.5
+TREND_MA_SUPPORT_TOLERANCE = 0.02
+TREND_BIAS_THRESHOLD = 5.0
+TREND_STRONG_BULL_BIAS_RELAX = 1.5
+TREND_STRONG_BULL_STRENGTH_THRESHOLD = 70
+TREND_MIN_KLINE_COUNT = 60
+
 
 # ============================================================================
 # 第三层：数据结构层
@@ -235,6 +248,78 @@ class ScreenResult:
     divergence_low_date: str
     prev_divergence_low_date: str
     detail: dict[str, Any]
+
+
+@dataclass
+class TrendAnalysisResult:
+    """个股趋势分析结果，对齐 DSA 的 StockTrendAnalyzer 输出口径。"""
+
+    code: str
+    # 基本信息
+    name: str = ""
+    industry: str = ""
+    concepts: list[str] = field(default_factory=list)
+    # 趋势
+    trend_status: str = ""
+    ma_alignment: str = ""
+    trend_strength: float = 0.0
+    # 均线
+    ma5: float = 0.0
+    ma10: float = 0.0
+    ma20: float = 0.0
+    ma60: float = 0.0
+    current_price: float = 0.0
+    # 乖离率
+    bias_ma5: float = 0.0
+    bias_ma10: float = 0.0
+    bias_ma20: float = 0.0
+    # 量能
+    volume_status: str = ""
+    volume_ratio_5d: float = 0.0
+    volume_trend: str = ""
+    # 支撑压力
+    support_ma5: bool = False
+    support_ma10: bool = False
+    resistance_levels: list[float] = field(default_factory=list)
+    support_levels: list[float] = field(default_factory=list)
+    # MACD
+    macd_dif: float = 0.0
+    macd_dea: float = 0.0
+    macd_bar: float = 0.0
+    macd_status: str = ""
+    macd_signal: str = ""
+    # RSI
+    rsi_6: float = 0.0
+    rsi_12: float = 0.0
+    rsi_24: float = 0.0
+    rsi_status: str = ""
+    rsi_signal: str = ""
+    # 信号
+    buy_signal: str = ""
+    signal_score: int = 0
+    signal_reasons: list[str] = field(default_factory=list)
+    risk_factors: list[str] = field(default_factory=list)
+    # 当日完整行情
+    today_open: float = 0.0
+    today_high: float = 0.0
+    today_low: float = 0.0
+    yesterday_close: float = 0.0
+    price_change: float = 0.0
+    price_change_pct: float = 0.0
+    amplitude: float = 0.0
+    # 换手率
+    turnover_rate: float = 0.0
+    # 基本面
+    pe_dyna: float = 0.0
+    pe_ttm: float = 0.0
+    pb_mrq: float = 0.0
+    main_business: str = ""
+    # 资金面
+    net_buy_amount: float = 0.0      # 主买净额（万元）
+    main_net_inflow: float = 0.0     # 主力净流入（万元）
+    # TODO: 筹码分布（获利比例/平均成本/集中度）—— 暂无数据源
+    # TODO: 舆情/新闻/公告 —— 暂无数据源
+    # TODO: 考虑把所有通达信接口的数据都接入（stock_info / more_info / snapshot 等全量字段）
 
 
 # ============================================================================
@@ -3813,6 +3898,933 @@ def run_stock_pool_sync(args: argparse.Namespace, client: TdxClient) -> None:
     stock_pool_sync_from_tdx(client)
 
 
+# ============================================================================
+# 个股趋势分析层
+# 对齐 DSA 的 StockTrendAnalyzer 逻辑，纯 Python 重写，不依赖 pandas。
+# MACD 复用通达信公式引擎，其余指标从 K 线自行计算。
+# ============================================================================
+
+
+def calculate_sma(values: list[float], period: int) -> list[float]:
+    """计算简单移动平均线，不足 period 的位置填 0.0。
+
+    Args:
+        values: 数值序列，按时间从早到晚。
+        period: 计算周期。
+
+    Returns:
+        与 values 等长的 SMA 序列。
+    """
+    if len(values) < period:
+        return [0.0] * len(values)
+    result: list[float] = [0.0] * (period - 1)
+    for i in range(period - 1, len(values)):
+        result.append(sum(values[i - period + 1 : i + 1]) / period)
+    return result
+
+
+def calculate_ema(values: list[float], period: int) -> list[float]:
+    """计算指数移动平均线（EMA），与通达信 ewm(adjust=False) 口径一致。
+
+    Args:
+        values: 数值序列。
+        period: 计算周期。
+
+    Returns:
+        与 values 等长的 EMA 序列。
+    """
+    if not values:
+        return []
+    alpha = 2.0 / (period + 1)
+    result: list[float] = [values[0]]
+    for i in range(1, len(values)):
+        result.append(alpha * values[i] + (1 - alpha) * result[-1])
+    return result
+
+
+def calculate_rsi(closes: list[float], period: int) -> list[float]:
+    """计算 RSI 指标（Wilder's EMA / SMMA 口径）。
+
+    Args:
+        closes: 收盘价序列。
+        period: RSI 周期。
+
+    Returns:
+        与 closes 等长的 RSI 序列，首位置填 50.0。
+    """
+    if len(closes) < 2:
+        return [50.0] * len(closes)
+
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+
+    # Wilder's EMA
+    alpha = 1.0 / period
+    avg_gains = [0.0] * len(gains)
+    avg_losses = [0.0] * len(losses)
+    if gains:
+        avg_gains[0] = sum(gains[:period]) / period if len(gains) >= period else gains[0]
+        avg_losses[0] = sum(losses[:period]) / period if len(losses) >= period else losses[0]
+        for i in range(1, len(gains)):
+            avg_gains[i] = alpha * gains[i] + (1 - alpha) * avg_gains[i - 1]
+            avg_losses[i] = alpha * losses[i] + (1 - alpha) * avg_losses[i - 1]
+
+    rsi_values: list[float] = [50.0]  # 首位无前日数据，填中性
+    for i in range(len(gains)):
+        if avg_losses[i] == 0:
+            rsi_values.append(100.0)
+        else:
+            rs = avg_gains[i] / avg_losses[i]
+            rsi_values.append(100.0 - 100.0 / (1.0 + rs))
+    return rsi_values
+
+
+def judge_trend_status(
+    ma5: list[float],
+    ma10: list[float],
+    ma20: list[float],
+) -> tuple[str, str, float]:
+    """根据最新均线值判断趋势状态，对齐 DSA _analyze_trend 逻辑。
+
+    Args:
+        ma5: MA5 序列。
+        ma10: MA10 序列。
+        ma20: MA20 序列。
+
+    Returns:
+        (趋势状态, 均线排列描述, 趋势强度 0-100)。
+    """
+    if len(ma5) < 6 or ma5[-1] == 0 or ma20[-1] == 0:
+        return "盘整", "均线数据不足", 50.0
+
+    cur_ma5, cur_ma10, cur_ma20 = ma5[-1], ma10[-1], ma20[-1]
+    prev_ma5, prev_ma20 = ma5[-6], ma20[-6]
+
+    if cur_ma5 > cur_ma10 > cur_ma20:
+        prev_spread = (prev_ma5 - prev_ma20) / prev_ma20 * 100 if prev_ma20 > 0 else 0
+        curr_spread = (cur_ma5 - cur_ma20) / cur_ma20 * 100
+        if curr_spread > prev_spread and curr_spread > 5:
+            return "强势多头", "强势多头排列，均线发散上行", 90.0
+        return "多头排列", "多头排列 MA5>MA10>MA20", 75.0
+
+    if cur_ma5 > cur_ma10 and cur_ma10 <= cur_ma20:
+        return "弱势多头", "弱势多头，MA5>MA10 但 MA10≤MA20", 55.0
+
+    if cur_ma5 < cur_ma10 < cur_ma20:
+        prev_spread = (prev_ma20 - prev_ma5) / prev_ma5 * 100 if prev_ma5 > 0 else 0
+        curr_spread = (cur_ma20 - cur_ma5) / cur_ma5 * 100
+        if curr_spread > prev_spread and curr_spread > 5:
+            return "强势空头", "强势空头排列，均线发散下行", 10.0
+        return "空头排列", "空头排列 MA5<MA10<MA20", 25.0
+
+    if cur_ma5 < cur_ma10 and cur_ma10 >= cur_ma20:
+        return "弱势空头", "弱势空头，MA5<MA10 但 MA10≥MA20", 40.0
+
+    return "盘整", "均线缠绕，趋势不明", 50.0
+
+
+def calculate_bias(price: float, ma5: float, ma10: float, ma20: float) -> tuple[float, float, float]:
+    """计算乖离率。
+
+    Args:
+        price: 当前价格。
+        ma5: MA5 值。
+        ma10: MA10 值。
+        ma20: MA20 值。
+
+    Returns:
+        (bias_ma5, bias_ma10, bias_ma20)，均以百分比表示。
+    """
+    b5 = (price - ma5) / ma5 * 100 if ma5 > 0 else 0.0
+    b10 = (price - ma10) / ma10 * 100 if ma10 > 0 else 0.0
+    b20 = (price - ma20) / ma20 * 100 if ma20 > 0 else 0.0
+    return b5, b10, b20
+
+
+def judge_volume_status(
+    volumes: list[float],
+    closes: list[float],
+) -> tuple[str, float, str]:
+    """分析量能状态，对齐 DSA _analyze_volume 逻辑。
+
+    Args:
+        volumes: 成交量序列。
+        closes: 收盘价序列。
+
+    Returns:
+        (量能状态, 5日量比, 量能趋势描述)。
+    """
+    if len(volumes) < 6:
+        return "量能正常", 0.0, "数据不足"
+
+    current_vol = volumes[-1]
+    avg_5d = sum(volumes[-6:-1]) / 5
+    ratio = current_vol / avg_5d if avg_5d > 0 else 0.0
+
+    prev_close = closes[-2]
+    price_change = (closes[-1] - prev_close) / prev_close * 100 if prev_close > 0 else 0.0
+
+    if ratio >= TREND_VOLUME_HEAVY_RATIO:
+        if price_change > 0:
+            return "放量上涨", ratio, "放量上涨，多头力量强劲"
+        return "放量下跌", ratio, "放量下跌，注意风险"
+    if ratio <= TREND_VOLUME_SHRINK_RATIO:
+        if price_change > 0:
+            return "缩量上涨", ratio, "缩量上涨，上攻动能不足"
+        return "缩量回调", ratio, "缩量回调，洗盘特征明显（好）"
+    return "量能正常", ratio, "量能正常"
+
+
+def judge_support_resistance(
+    kline_bars: list[KlineBar],
+    ma5: float,
+    ma10: float,
+    ma20: float,
+    current_price: float,
+) -> tuple[bool, bool, list[float], list[float]]:
+    """分析支撑压力位，对齐 DSA _analyze_support_resistance 逻辑。
+
+    Args:
+        kline_bars: K 线序列。
+        ma5: MA5 值。
+        ma10: MA10 值。
+        ma20: MA20 值。
+        current_price: 当前价格。
+
+    Returns:
+        (MA5是否支撑, MA10是否支撑, 支撑位列表, 压力位列表)。
+    """
+    support_ma5 = False
+    support_ma10 = False
+    support_levels: list[float] = []
+    resistance_levels: list[float] = []
+
+    if ma5 > 0:
+        dist = abs(current_price - ma5) / ma5
+        if dist <= TREND_MA_SUPPORT_TOLERANCE and current_price >= ma5:
+            support_ma5 = True
+            support_levels.append(ma5)
+
+    if ma10 > 0:
+        dist = abs(current_price - ma10) / ma10
+        if dist <= TREND_MA_SUPPORT_TOLERANCE and current_price >= ma10:
+            support_ma10 = True
+            if ma10 not in support_levels:
+                support_levels.append(ma10)
+
+    if ma20 > 0 and current_price >= ma20:
+        support_levels.append(ma20)
+
+    if len(kline_bars) >= 20:
+        recent_highs = [bar.high_price for bar in kline_bars[-20:]]
+        recent_high = max(recent_highs)
+        if recent_high > current_price:
+            resistance_levels.append(recent_high)
+
+    return support_ma5, support_ma10, support_levels, resistance_levels
+
+
+def judge_macd_status(
+    dif_series: list[float],
+    dea_series: list[float],
+    macd_bar_series: list[float],
+) -> tuple[float, float, float, str, str]:
+    """判断 MACD 状态，对齐 DSA _analyze_macd 逻辑。
+
+    Args:
+        dif_series: DIF 序列。
+        dea_series: DEA 序列。
+        macd_bar_series: MACD 柱状图序列。
+
+    Returns:
+        (DIF, DEA, MACD柱, 状态字符串, 信号描述)。
+    """
+    if len(dif_series) < 2:
+        return 0.0, 0.0, 0.0, "多头", "数据不足"
+
+    cur_dif = dif_series[-1]
+    cur_dea = dea_series[-1]
+    cur_bar = macd_bar_series[-1]
+    prev_dif = dif_series[-2]
+    prev_dea = dea_series[-2]
+
+    prev_diff = prev_dif - prev_dea
+    curr_diff = cur_dif - cur_dea
+
+    is_golden_cross = prev_diff <= 0 and curr_diff > 0
+    is_death_cross = prev_diff >= 0 and curr_diff < 0
+    is_crossing_up = prev_dif <= 0 and cur_dif > 0
+    is_crossing_down = prev_dif >= 0 and cur_dif < 0
+
+    if is_golden_cross and cur_dif > 0:
+        return cur_dif, cur_dea, cur_bar, "零轴上金叉", "零轴上金叉，强烈买入信号"
+    if is_crossing_up:
+        return cur_dif, cur_dea, cur_bar, "上穿零轴", "DIF上穿零轴，趋势转强"
+    if is_golden_cross:
+        return cur_dif, cur_dea, cur_bar, "金叉", "金叉，趋势向上"
+    if is_death_cross:
+        return cur_dif, cur_dea, cur_bar, "死叉", "死叉，趋势向下"
+    if is_crossing_down:
+        return cur_dif, cur_dea, cur_bar, "下穿零轴", "DIF下穿零轴，趋势转弱"
+    if cur_dif > 0 and cur_dea > 0:
+        return cur_dif, cur_dea, cur_bar, "多头", "多头排列，持续上涨"
+    if cur_dif < 0 and cur_dea < 0:
+        return cur_dif, cur_dea, cur_bar, "空头", "空头排列，持续下跌"
+    return cur_dif, cur_dea, cur_bar, "多头", "MACD 中性区域"
+
+
+def judge_rsi_status(
+    rsi_6: float,
+    rsi_12: float,
+    rsi_24: float,
+) -> tuple[str, str]:
+    """判断 RSI 状态，对齐 DSA _analyze_rsi 逻辑，以 RSI(12) 为主。
+
+    Args:
+        rsi_6: RSI(6) 值。
+        rsi_12: RSI(12) 值。
+        rsi_24: RSI(24) 值。
+
+    Returns:
+        (状态字符串, 信号描述)。
+    """
+    if rsi_12 > TREND_RSI_OVERBOUGHT:
+        return "超买", f"RSI超买({rsi_12:.1f}>70)，短期回调风险高"
+    if rsi_12 > 60:
+        return "强势", f"RSI强势({rsi_12:.1f})，多头力量充足"
+    if rsi_12 >= 40:
+        return "中性", f"RSI中性({rsi_12:.1f})，震荡整理中"
+    if rsi_12 >= TREND_RSI_OVERSOLD:
+        return "弱势", f"RSI弱势({rsi_12:.1f})，关注反弹"
+    return "超卖", f"RSI超卖({rsi_12:.1f}<30)，反弹机会大"
+
+
+def calculate_signal_score(
+    trend_status: str,
+    trend_strength: float,
+    bias_ma5: float,
+    volume_status: str,
+    support_ma5: bool,
+    support_ma10: bool,
+    macd_status: str,
+    macd_signal: str,
+    rsi_status: str,
+    rsi_signal: str,
+) -> tuple[int, list[str], list[str]]:
+    """综合评分，对齐 DSA _generate_signal 逻辑。
+
+    权重：趋势30 + 乖离20 + 量能15 + 支撑10 + MACD15 + RSI10 = 100。
+
+    Args:
+        trend_status: 趋势状态。
+        trend_strength: 趋势强度。
+        bias_ma5: MA5 乖离率。
+        volume_status: 量能状态。
+        support_ma5: MA5 是否支撑。
+        support_ma10: MA10 是否支撑。
+        macd_status: MACD 状态。
+        macd_signal: MACD 信号描述。
+        rsi_status: RSI 状态。
+        rsi_signal: RSI 信号描述。
+
+    Returns:
+        (综合评分 0-100, 买入理由列表, 风险因素列表)。
+    """
+    score = 0
+    reasons: list[str] = []
+    risks: list[str] = []
+
+    # === 趋势评分（30分）===
+    trend_scores = {
+        "强势多头": 30,
+        "多头排列": 26,
+        "弱势多头": 18,
+        "盘整": 12,
+        "弱势空头": 8,
+        "空头排列": 4,
+        "强势空头": 0,
+    }
+    score += trend_scores.get(trend_status, 12)
+    if trend_status in ("强势多头", "多头排列"):
+        reasons.append(f"✅ {trend_status}，顺势做多")
+    elif trend_status in ("空头排列", "强势空头"):
+        risks.append(f"⚠️ {trend_status}，不宜做多")
+
+    # === 乖离率评分（20分，强势趋势补偿）===
+    is_strong_bull = (
+        trend_status == "强势多头"
+        and trend_strength >= TREND_STRONG_BULL_STRENGTH_THRESHOLD
+    )
+    effective_threshold = TREND_BIAS_THRESHOLD * TREND_STRONG_BULL_BIAS_RELAX if is_strong_bull else TREND_BIAS_THRESHOLD
+
+    if bias_ma5 < 0:
+        if bias_ma5 > -3:
+            score += 20
+            reasons.append(f"✅ 价格略低于MA5({bias_ma5:.1f}%)，回踩买点")
+        elif bias_ma5 > -5:
+            score += 16
+            reasons.append(f"✅ 价格回踩MA5({bias_ma5:.1f}%)，观察支撑")
+        else:
+            score += 8
+            risks.append(f"⚠️ 乖离率过大({bias_ma5:.1f}%)，可能破位")
+    elif bias_ma5 < 2:
+        score += 18
+        reasons.append(f"✅ 价格贴近MA5({bias_ma5:.1f}%)，介入好时机")
+    elif bias_ma5 < effective_threshold:
+        score += 14
+        reasons.append(f"⚡ 价格略高于MA5({bias_ma5:.1f}%)，可小仓介入")
+    elif bias_ma5 > effective_threshold:
+        score += 4
+        risks.append(f"❌ 乖离率过高({bias_ma5:.1f}%>{effective_threshold:.1f}%)，严禁追高")
+    elif is_strong_bull:
+        score += 10
+        reasons.append(f"⚡ 强势趋势中乖离率偏高({bias_ma5:.1f}%)，可轻仓追踪")
+    else:
+        score += 4
+        risks.append(f"❌ 乖离率过高({bias_ma5:.1f}%>{TREND_BIAS_THRESHOLD:.1f}%)，严禁追高")
+
+    # === 量能评分（15分）===
+    volume_scores = {
+        "缩量回调": 15,
+        "放量上涨": 12,
+        "量能正常": 10,
+        "缩量上涨": 6,
+        "放量下跌": 0,
+    }
+    score += volume_scores.get(volume_status, 8)
+    if volume_status == "缩量回调":
+        reasons.append("✅ 缩量回调，主力洗盘")
+    elif volume_status == "放量下跌":
+        risks.append("⚠️ 放量下跌，注意风险")
+
+    # === 支撑评分（10分）===
+    if support_ma5:
+        score += 5
+        reasons.append("✅ MA5支撑有效")
+    if support_ma10:
+        score += 5
+        reasons.append("✅ MA10支撑有效")
+
+    # === MACD 评分（15分）===
+    macd_scores = {
+        "零轴上金叉": 15,
+        "金叉": 12,
+        "上穿零轴": 10,
+        "多头": 8,
+        "空头": 2,
+        "下穿零轴": 0,
+        "死叉": 0,
+    }
+    score += macd_scores.get(macd_status, 5)
+    if macd_status in ("零轴上金叉", "金叉"):
+        reasons.append(f"✅ {macd_signal}")
+    elif macd_status in ("死叉", "下穿零轴"):
+        risks.append(f"⚠️ {macd_signal}")
+    else:
+        reasons.append(macd_signal)
+
+    # === RSI 评分（10分）===
+    rsi_scores = {
+        "超卖": 10,
+        "强势": 8,
+        "中性": 5,
+        "弱势": 3,
+        "超买": 0,
+    }
+    score += rsi_scores.get(rsi_status, 5)
+    if rsi_status in ("超卖", "强势"):
+        reasons.append(f"✅ {rsi_signal}")
+    elif rsi_status == "超买":
+        risks.append(f"⚠️ {rsi_signal}")
+    else:
+        reasons.append(rsi_signal)
+
+    return score, reasons, risks
+
+
+def judge_buy_signal(score: int, trend_status: str) -> str:
+    """根据评分和趋势状态生成买入信号。
+
+    Args:
+        score: 综合评分 0-100。
+        trend_status: 趋势状态。
+
+    Returns:
+        买入信号字符串。
+    """
+    if score >= 75 and trend_status in ("强势多头", "多头排列"):
+        return "强烈买入"
+    if score >= 60 and trend_status in ("强势多头", "多头排列", "弱势多头"):
+        return "买入"
+    if score >= 45:
+        return "持有"
+    if score >= 30:
+        return "观望"
+    if trend_status in ("空头排列", "强势空头"):
+        return "强烈卖出"
+    return "卖出"
+
+
+def analyze_stock_trend(
+    code: str,
+    kline_bars: list[KlineBar],
+    macd_result: MacdResult,
+) -> TrendAnalysisResult:
+    """个股趋势分析主入口，对齐 DSA StockTrendAnalyzer.analyze 逻辑。
+
+    MACD 数据由外部通过通达信公式引擎计算后传入，其余指标从 K 线自行计算。
+
+    Args:
+        code: 纯数字股票代码。
+        kline_bars: K 线序列，按时间从早到晚。
+        macd_result: 通达信公式引擎计算的 MACD 结果。
+
+    Returns:
+        完整的趋势分析结果。
+    """
+    closes = [bar.close_price for bar in kline_bars]
+    volumes = [bar.volume for bar in kline_bars]
+    current_price = closes[-1]
+
+    # 均线
+    ma5_series = calculate_sma(closes, 5)
+    ma10_series = calculate_sma(closes, 10)
+    ma20_series = calculate_sma(closes, 20)
+    ma60_series = calculate_sma(closes, 60)
+    ma5 = ma5_series[-1]
+    ma10 = ma10_series[-1]
+    ma20 = ma20_series[-1]
+    ma60 = ma60_series[-1]
+
+    # 趋势判断
+    trend_status, ma_alignment, trend_strength = judge_trend_status(ma5_series, ma10_series, ma20_series)
+
+    # 乖离率
+    bias_ma5, bias_ma10, bias_ma20 = calculate_bias(current_price, ma5, ma10, ma20)
+
+    # 量能
+    volume_status, volume_ratio_5d, volume_trend = judge_volume_status(volumes, closes)
+
+    # 支撑压力
+    support_ma5, support_ma10, support_levels, resistance_levels = judge_support_resistance(
+        kline_bars, ma5, ma10, ma20, current_price
+    )
+
+    # MACD（复用通达信结果）
+    macd_dif, macd_dea, macd_bar, macd_status, macd_signal = judge_macd_status(
+        macd_result.dif, macd_result.dea, macd_result.macd
+    )
+
+    # RSI
+    rsi_6_series = calculate_rsi(closes, 6)
+    rsi_12_series = calculate_rsi(closes, 12)
+    rsi_24_series = calculate_rsi(closes, 24)
+    rsi_6 = rsi_6_series[-1]
+    rsi_12 = rsi_12_series[-1]
+    rsi_24 = rsi_24_series[-1]
+    rsi_status, rsi_signal = judge_rsi_status(rsi_6, rsi_12, rsi_24)
+
+    # 综合评分
+    signal_score, signal_reasons, risk_factors = calculate_signal_score(
+        trend_status,
+        trend_strength,
+        bias_ma5,
+        volume_status,
+        support_ma5,
+        support_ma10,
+        macd_status,
+        macd_signal,
+        rsi_status,
+        rsi_signal,
+    )
+
+    # 买入信号
+    buy_signal = judge_buy_signal(signal_score, trend_status)
+
+    return TrendAnalysisResult(
+        code=code,
+        trend_status=trend_status,
+        ma_alignment=ma_alignment,
+        trend_strength=trend_strength,
+        ma5=ma5,
+        ma10=ma10,
+        ma20=ma20,
+        ma60=ma60,
+        current_price=current_price,
+        bias_ma5=bias_ma5,
+        bias_ma10=bias_ma10,
+        bias_ma20=bias_ma20,
+        volume_status=volume_status,
+        volume_ratio_5d=volume_ratio_5d,
+        volume_trend=volume_trend,
+        support_ma5=support_ma5,
+        support_ma10=support_ma10,
+        resistance_levels=resistance_levels,
+        support_levels=support_levels,
+        macd_dif=macd_dif,
+        macd_dea=macd_dea,
+        macd_bar=macd_bar,
+        macd_status=macd_status,
+        macd_signal=macd_signal,
+        rsi_6=rsi_6,
+        rsi_12=rsi_12,
+        rsi_24=rsi_24,
+        rsi_status=rsi_status,
+        rsi_signal=rsi_signal,
+        buy_signal=buy_signal,
+        signal_score=signal_score,
+        signal_reasons=signal_reasons,
+        risk_factors=risk_factors,
+    )
+
+
+def extract_today_quote(kline_bars: list[KlineBar]) -> dict[str, float]:
+    """从最后两根 K 线提取当日完整行情。
+
+    Args:
+        kline_bars: K 线序列，按时间从早到晚。
+
+    Returns:
+        包含当日行情字段的字典：today_open / today_high / today_low /
+        yesterday_close / price_change / price_change_pct / amplitude。
+    """
+    result = {
+        "today_open": 0.0,
+        "today_high": 0.0,
+        "today_low": 0.0,
+        "yesterday_close": 0.0,
+        "price_change": 0.0,
+        "price_change_pct": 0.0,
+        "amplitude": 0.0,
+    }
+    if len(kline_bars) < 2:
+        return result
+
+    today = kline_bars[-1]
+    yesterday = kline_bars[-2]
+
+    result["today_open"] = today.open_price
+    result["today_high"] = today.high_price
+    result["today_low"] = today.low_price
+    result["yesterday_close"] = yesterday.close_price
+
+    change = today.close_price - yesterday.close_price
+    result["price_change"] = change
+    result["price_change_pct"] = change / yesterday.close_price * 100 if yesterday.close_price > 0 else 0.0
+    result["amplitude"] = (today.high_price - today.low_price) / yesterday.close_price * 100 if yesterday.close_price > 0 else 0.0
+
+    return result
+
+
+def collect_stock_info(
+    client: TdxClient,
+    stock_code: StockCode,
+) -> dict[str, Any]:
+    """采集个股基础信息、板块关系、基本面数据。
+
+    通过 stock_info / more_info / relation 三个接口采集，
+    返回统一字典供 run_report 填充到 TrendAnalysisResult。
+
+    Args:
+        client: 通达信客户端包装器。
+        stock_code: 已规整的股票代码对象。
+
+    Returns:
+        包含 name / industry / concepts / turnover_rate /
+        pe_dyna / pe_ttm / pb_mrq / main_business 的字典。
+    """
+    result: dict[str, Any] = {
+        "name": "",
+        "industry": "",
+        "concepts": [],
+        "turnover_rate": 0.0,
+        "pe_dyna": 0.0,
+        "pe_ttm": 0.0,
+        "pb_mrq": 0.0,
+        "main_business": "",
+        "net_buy_amount": 0.0,
+        "main_net_inflow": 0.0,
+    }
+
+    # stock_info：名称、总股本
+    try:
+        stock_info = client.get_stock_info(stock_code, field_list=[])
+        if stock_info:
+            result["name"] = str(stock_info.get("Name", "")).strip()
+            result["total_shares"] = float(stock_info.get("J_zgb", 0) or 0)
+    except Exception:
+        pass
+
+    # more_info：换手率、PE/PB、主营业务
+    try:
+        more_info = client.get_more_info(stock_code, field_list=[])
+        if more_info:
+            result["pe_dyna"] = float(more_info.get("DynaPE", 0) or 0)
+            result["pe_ttm"] = float(more_info.get("StaticPE_TTM", 0) or 0)
+            result["pb_mrq"] = float(more_info.get("PB_MRQ", 0) or 0)
+            result["main_business"] = str(more_info.get("MainBusiness", "")).strip()
+            result["turnover_rate"] = float(more_info.get("fHSL", 0) or 0)
+            result["net_buy_amount"] = float(more_info.get("Zjl", 0) or 0)
+            result["main_net_inflow"] = float(more_info.get("Zjl_HB", 0) or 0)
+    except Exception:
+        pass
+
+    # relation：行业板块 + 概念板块
+    try:
+        relations = client.get_relation(stock_code)
+        if relations:
+            industries: list[str] = []
+            concepts: list[str] = []
+            for item in relations:
+                block_type = str(item.get("BlockType", "")).strip()
+                block_name = str(item.get("BlockName", "")).strip()
+                if not block_name:
+                    continue
+                if block_type == "行业":
+                    if block_name not in industries:
+                        industries.append(block_name)
+                elif block_type == "概念":
+                    if block_name not in concepts:
+                        concepts.append(block_name)
+            result["industry"] = "、".join(industries) if industries else ""
+            result["concepts"] = concepts
+    except Exception:
+        pass
+
+    return result
+
+
+def load_observing_codes_from_pool() -> list[str]:
+    """从本地股票池读取所有 status='观察' 的纯数字股票代码。
+
+    Returns:
+        观察中的股票代码列表；如果数据库不存在或为空则返回空列表。
+    """
+    if not STOCK_POOL_DB_PATH.exists():
+        print(f"股票池数据库不存在: {STOCK_POOL_DB_PATH}")
+        return []
+
+    conn = sqlite3.connect(str(STOCK_POOL_DB_PATH))
+    try:
+        rows = conn.execute(
+            "SELECT code FROM stock_pool WHERE status = '观察' ORDER BY id DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return [row[0] for row in rows]
+
+
+def format_trend_result(result: TrendAnalysisResult) -> str:
+    """把趋势分析结果格式化为控制台文本。
+
+    Args:
+        result: 趋势分析结果。
+
+    Returns:
+        格式化后的多行文本。
+    """
+    lines: list[str] = []
+    # 标题行：代码 + 名称
+    name_str = f" {result.name}" if result.name else ""
+    lines.append(f"=== {result.code}{name_str} ===")
+
+    # 基本信息行
+    info_parts: list[str] = []
+    if result.industry:
+        info_parts.append(f"行业: {result.industry}")
+    if result.concepts:
+        info_parts.append(f"概念: {'、'.join(result.concepts)}")
+    if info_parts:
+        lines.append("  ".join(info_parts))
+
+    # 当日行情行
+    lines.append(
+        f"当日: 开{result.today_open:.2f} 高{result.today_high:.2f} "
+        f"低{result.today_low:.2f} 收{result.current_price:.2f} "
+        f"{result.price_change_pct:+.2f}% 振幅{result.amplitude:.2f}%"
+    )
+
+    # 趋势 + 信号行
+    lines.append(
+        f"趋势: {result.trend_status} ({result.trend_strength:.0f}/100)    "
+        f"信号: {result.buy_signal} ({result.signal_score}分)"
+    )
+
+    # 均线行
+    lines.append(
+        f"现价: {result.current_price:.2f}  "
+        f"MA5: {result.ma5:.2f}({result.bias_ma5:+.1f}%)  "
+        f"MA10: {result.ma10:.2f}({result.bias_ma10:+.1f}%)  "
+        f"MA20: {result.ma20:.2f}({result.bias_ma20:+.1f}%)"
+    )
+
+    # 量能 + MACD + RSI 行
+    turnover_str = f"  换手: {result.turnover_rate:.1f}%" if result.turnover_rate > 0 else ""
+    lines.append(
+        f"量能: {result.volume_status} ({result.volume_ratio_5d:.2f}x)      "
+        f"MACD: {result.macd_status}    RSI: {result.rsi_status}({result.rsi_12:.0f})"
+        f"{turnover_str}"
+    )
+
+    # 基本面行
+    if result.pe_dyna > 0 or result.pb_mrq > 0:
+        lines.append(
+            f"基本面: PE(动){result.pe_dyna:.1f}  PE(TTM){result.pe_ttm:.1f}  "
+            f"PB{result.pb_mrq:.2f}"
+        )
+
+    # 资金面行
+    if result.net_buy_amount != 0 or result.main_net_inflow != 0:
+        lines.append(
+            f"资金: 主买净额{result.net_buy_amount:.0f}万  "
+            f"主力净流入{result.main_net_inflow:.0f}万"
+        )
+
+    # 支撑压力行
+    support_str = ", ".join(f"{v:.2f}" for v in result.support_levels) if result.support_levels else "无"
+    resistance_str = ", ".join(f"{v:.2f}" for v in result.resistance_levels) if result.resistance_levels else "无"
+    lines.append(f"支撑: {support_str}  压力: {resistance_str}")
+
+    if result.signal_reasons:
+        lines.append(f"理由: {'  '.join(result.signal_reasons)}")
+    if result.risk_factors:
+        lines.append(f"风险: {'  '.join(result.risk_factors)}")
+    return "\n".join(lines)
+
+
+def run_report(args: argparse.Namespace, client: TdxClient) -> None:
+    """执行 `report` 子命令，对指定股票生成个股趋势分析报告。
+
+    流程：解析代码 → 逐只读 K 线 → 批量算 MACD → 逐只对齐 + 分析 → 打印结果。
+    支持 `--codes` 手动指定或 `--from-pool` 从股票池读取，两者互斥。
+
+    Args:
+        args: 命令行参数对象。
+        client: 通达信客户端包装器。
+    """
+    t0_total = time.perf_counter()
+
+    # 1. 解析股票代码：--from-pool 或 --codes
+    if args.from_pool:
+        raw_codes = load_observing_codes_from_pool()
+        if not raw_codes:
+            print("股票池中没有观察中的股票。")
+            return
+        print(f"从股票池加载 {len(raw_codes)} 只观察中的股票\n")
+    else:
+        if not args.codes:
+            print("请使用 --codes 或 --from-pool 指定股票。")
+            return
+        raw_codes = [c.strip() for c in args.codes.split(",") if c.strip()]
+        if not raw_codes:
+            print("未指定股票代码。")
+            return
+
+    print(f"个股趋势报告：{len(raw_codes)} 只股票\n")
+
+    # 2. 逐只读 K 线
+    kline_map: dict[str, list[KlineBar]] = {}
+    skipped_codes: list[str] = []
+    for raw_code in raw_codes:
+        try:
+            stock_code = normalize_stock_code(raw_code)
+        except ValueError as exc:
+            print(f"  {raw_code} 代码格式错误：{exc}")
+            skipped_codes.append(raw_code)
+            continue
+        kline_bars = load_daily_kline_from_db(
+            DAILY_KLINE_DB_PATH,
+            stock_code.internal_code,
+            TREND_MIN_KLINE_COUNT,
+        )
+        if kline_bars is None:
+            print(f"  {stock_code.internal_code} K线数据不足，跳过")
+            skipped_codes.append(stock_code.internal_code)
+            continue
+        kline_map[stock_code.internal_code] = kline_bars
+
+    if not kline_map:
+        print("没有可分析的股票。")
+        return
+
+    # 3. 批量算 MACD
+    tdx_codes = [to_tdx_stock_code(code) for code in kline_map.keys()]
+    print(f"正在计算 MACD（{len(tdx_codes)} 只）……")
+    t0_macd = time.perf_counter()
+    try:
+        macd_batch = client.calculate_macd_batch(
+            tdx_codes=tdx_codes,
+            count=SCREENER_MACD_BATCH_COUNT,
+            chunk_size=SCREENER_MACD_BATCH_CHUNK_SIZE,
+        )
+    except RuntimeError as exc:
+        print(f"批量 MACD 计算失败: {exc}")
+        return
+    print(f"MACD 计算完成，耗时 {time.perf_counter() - t0_macd:.1f}s\n")
+
+    # 4. 逐只对齐 + 分析 + 打印
+    for i, (internal_code, kline_bars) in enumerate(kline_map.items()):
+        tdx_code = to_tdx_stock_code(internal_code)
+        macd_raw = macd_batch.get(tdx_code)
+        if not macd_raw:
+            print(f"=== {internal_code} ===\n  MACD 数据缺失，跳过\n")
+            continue
+
+        macd_result = align_macd_with_kline(kline_bars, macd_raw)
+        if macd_result is None:
+            print(f"=== {internal_code} ===\n  MACD 对齐失败，跳过\n")
+            continue
+
+        result = analyze_stock_trend(internal_code, kline_bars, macd_result)
+
+        # 采集基本信息、当日行情、换手率、基本面
+        today_quote = extract_today_quote(kline_bars)
+        result.today_open = today_quote["today_open"]
+        result.today_high = today_quote["today_high"]
+        result.today_low = today_quote["today_low"]
+        result.yesterday_close = today_quote["yesterday_close"]
+        result.price_change = today_quote["price_change"]
+        result.price_change_pct = today_quote["price_change_pct"]
+        result.amplitude = today_quote["amplitude"]
+
+        stock_code_obj = normalize_stock_code(internal_code)
+        stock_info_data = collect_stock_info(client, stock_code_obj)
+        result.name = stock_info_data.get("name", "")
+        result.industry = stock_info_data.get("industry", "")
+        result.concepts = stock_info_data.get("concepts", [])
+        result.pe_dyna = stock_info_data.get("pe_dyna", 0.0)
+        result.pe_ttm = stock_info_data.get("pe_ttm", 0.0)
+        result.pb_mrq = stock_info_data.get("pb_mrq", 0.0)
+        result.main_business = stock_info_data.get("main_business", "")
+        result.turnover_rate = stock_info_data.get("turnover_rate", 0.0)
+        result.net_buy_amount = stock_info_data.get("net_buy_amount", 0.0)
+        result.main_net_inflow = stock_info_data.get("main_net_inflow", 0.0)
+
+        print(format_trend_result(result))
+
+        if args.debug:
+            print(f"  MA60: {result.ma60:.2f}")
+            print(f"  MACD: DIF={result.macd_dif:.4f} DEA={result.macd_dea:.4f} BAR={result.macd_bar:.4f}")
+            print(f"  RSI:  RSI6={result.rsi_6:.1f} RSI12={result.rsi_12:.1f} RSI24={result.rsi_24:.1f}")
+            print(f"  量能趋势: {result.volume_trend}")
+            print(f"  MACD信号: {result.macd_signal}")
+            print(f"  RSI信号: {result.rsi_signal}")
+            print(f"  均线排列: {result.ma_alignment}")
+            print(f"  MA5支撑: {'是' if result.support_ma5 else '否'}  MA10支撑: {'是' if result.support_ma10 else '否'}")
+            if result.main_business:
+                print(f"  主营: {result.main_business[:80]}")
+            print(f"  昨收: {result.yesterday_close:.2f}  涨跌额: {result.price_change:+.2f}")
+
+        if i < len(kline_map) - 1:
+            print()
+
+    if skipped_codes:
+        print(f"\n跳过 {len(skipped_codes)} 只: {', '.join(skipped_codes)}")
+    print(f"\n[总耗时 {time.perf_counter() - t0_total:.1f}s]")
+
+
 def parse_args() -> argparse.Namespace:
     """
         解析命令行参数。
@@ -3839,6 +4851,12 @@ def parse_args() -> argparse.Namespace:
 
     stock_pool_sync_parser = stock_pool_subparsers.add_parser("sync", help="从通达信 CASSA 自定义板块同步到本地股票池")
     stock_pool_sync_parser.set_defaults(handler=run_stock_pool_sync)
+
+    report_parser = module_parsers.add_parser("report", help="个股趋势分析报告")
+    report_parser.add_argument("--codes", help="股票代码，逗号分隔，例如 000001,600519")
+    report_parser.add_argument("--from-pool", action="store_true", help="从股票池读取观察中的股票")
+    report_parser.add_argument("--debug", action="store_true", help="输出完整分析字段")
+    report_parser.set_defaults(handler=run_report)
 
     tdx_api_parser = module_parsers.add_parser("tdx_api", help="调用通达信 `tqcenter` 接口")
     tdx_api_subparsers = tdx_api_parser.add_subparsers(dest="tdx_action", required=True)
