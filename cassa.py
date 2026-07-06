@@ -4300,6 +4300,134 @@ def analyze_stock_trend(
     )
 
 
+def format_trend_result(result: TrendAnalysisResult) -> str:
+    """把趋势分析结果格式化为控制台文本。
+
+    Args:
+        result: 趋势分析结果。
+
+    Returns:
+        格式化后的多行文本。
+    """
+    lines: list[str] = []
+    lines.append(f"=== {result.code} ===")
+    lines.append(
+        f"趋势: {result.trend_status} ({result.trend_strength:.0f}/100)    "
+        f"信号: {result.buy_signal} ({result.signal_score}分)"
+    )
+    lines.append(
+        f"现价: {result.current_price:.2f}  "
+        f"MA5: {result.ma5:.2f}({result.bias_ma5:+.1f}%)  "
+        f"MA10: {result.ma10:.2f}({result.bias_ma10:+.1f}%)  "
+        f"MA20: {result.ma20:.2f}({result.bias_ma20:+.1f}%)"
+    )
+    lines.append(
+        f"量能: {result.volume_status} ({result.volume_ratio_5d:.2f}x)      "
+        f"MACD: {result.macd_status}    RSI: {result.rsi_status}({result.rsi_12:.0f})"
+    )
+    support_str = ", ".join(f"{v:.2f}" for v in result.support_levels) if result.support_levels else "无"
+    resistance_str = ", ".join(f"{v:.2f}" for v in result.resistance_levels) if result.resistance_levels else "无"
+    lines.append(f"支撑: {support_str}  压力: {resistance_str}")
+    if result.signal_reasons:
+        lines.append(f"理由: {'  '.join(result.signal_reasons)}")
+    if result.risk_factors:
+        lines.append(f"风险: {'  '.join(result.risk_factors)}")
+    return "\n".join(lines)
+
+
+def run_report(args: argparse.Namespace, client: TdxClient) -> None:
+    """执行 `report` 子命令，对指定股票生成个股趋势分析报告。
+
+    流程：解析代码 → 逐只读 K 线 → 批量算 MACD → 逐只对齐 + 分析 → 打印结果。
+
+    Args:
+        args: 命令行参数对象，需包含 `codes`（逗号分隔）和可选 `debug`。
+        client: 通达信客户端包装器。
+    """
+    t0_total = time.perf_counter()
+
+    # 1. 解析股票代码
+    raw_codes = [c.strip() for c in args.codes.split(",") if c.strip()]
+    if not raw_codes:
+        print("未指定股票代码。")
+        return
+
+    print(f"个股趋势报告：{len(raw_codes)} 只股票\n")
+
+    # 2. 逐只读 K 线
+    kline_map: dict[str, list[KlineBar]] = {}
+    skipped_codes: list[str] = []
+    for raw_code in raw_codes:
+        try:
+            stock_code = normalize_stock_code(raw_code)
+        except ValueError as exc:
+            print(f"  {raw_code} 代码格式错误：{exc}")
+            skipped_codes.append(raw_code)
+            continue
+        kline_bars = load_daily_kline_from_db(
+            DAILY_KLINE_DB_PATH,
+            stock_code.internal_code,
+            TREND_MIN_KLINE_COUNT,
+        )
+        if kline_bars is None:
+            print(f"  {stock_code.internal_code} K线数据不足，跳过")
+            skipped_codes.append(stock_code.internal_code)
+            continue
+        kline_map[stock_code.internal_code] = kline_bars
+
+    if not kline_map:
+        print("没有可分析的股票。")
+        return
+
+    # 3. 批量算 MACD
+    tdx_codes = [to_tdx_stock_code(code) for code in kline_map.keys()]
+    print(f"正在计算 MACD（{len(tdx_codes)} 只）……")
+    t0_macd = time.perf_counter()
+    try:
+        macd_batch = client.calculate_macd_batch(
+            tdx_codes=tdx_codes,
+            count=SCREENER_MACD_BATCH_COUNT,
+            chunk_size=SCREENER_MACD_BATCH_CHUNK_SIZE,
+        )
+    except RuntimeError as exc:
+        print(f"批量 MACD 计算失败: {exc}")
+        return
+    print(f"MACD 计算完成，耗时 {time.perf_counter() - t0_macd:.1f}s\n")
+
+    # 4. 逐只对齐 + 分析 + 打印
+    for i, (internal_code, kline_bars) in enumerate(kline_map.items()):
+        tdx_code = to_tdx_stock_code(internal_code)
+        macd_raw = macd_batch.get(tdx_code)
+        if not macd_raw:
+            print(f"=== {internal_code} ===\n  MACD 数据缺失，跳过\n")
+            continue
+
+        macd_result = align_macd_with_kline(kline_bars, macd_raw)
+        if macd_result is None:
+            print(f"=== {internal_code} ===\n  MACD 对齐失败，跳过\n")
+            continue
+
+        result = analyze_stock_trend(internal_code, kline_bars, macd_result)
+        print(format_trend_result(result))
+
+        if args.debug:
+            print(f"  MA60: {result.ma60:.2f}")
+            print(f"  MACD: DIF={result.macd_dif:.4f} DEA={result.macd_dea:.4f} BAR={result.macd_bar:.4f}")
+            print(f"  RSI:  RSI6={result.rsi_6:.1f} RSI12={result.rsi_12:.1f} RSI24={result.rsi_24:.1f}")
+            print(f"  量能趋势: {result.volume_trend}")
+            print(f"  MACD信号: {result.macd_signal}")
+            print(f"  RSI信号: {result.rsi_signal}")
+            print(f"  均线排列: {result.ma_alignment}")
+            print(f"  MA5支撑: {'是' if result.support_ma5 else '否'}  MA10支撑: {'是' if result.support_ma10 else '否'}")
+
+        if i < len(kline_map) - 1:
+            print()
+
+    if skipped_codes:
+        print(f"\n跳过 {len(skipped_codes)} 只: {', '.join(skipped_codes)}")
+    print(f"\n[总耗时 {time.perf_counter() - t0_total:.1f}s]")
+
+
 def parse_args() -> argparse.Namespace:
     """
         解析命令行参数。
@@ -4320,6 +4448,11 @@ def parse_args() -> argparse.Namespace:
     screener_parser.add_argument("--min-kline", type=int, default=SCREENER_MIN_KLINE_COUNT, help=f"最小K线数，默认 {SCREENER_MIN_KLINE_COUNT}")
     screener_parser.add_argument("--debug", action="store_true", help="输出每只股票的详细筛选过程")
     screener_parser.set_defaults(handler=run_screener)
+
+    report_parser = module_parsers.add_parser("report", help="个股趋势分析报告")
+    report_parser.add_argument("--codes", required=True, help="股票代码，逗号分隔，例如 000001,600519")
+    report_parser.add_argument("--debug", action="store_true", help="输出完整分析字段")
+    report_parser.set_defaults(handler=run_report)
 
     tdx_api_parser = module_parsers.add_parser("tdx_api", help="调用通达信 `tqcenter` 接口")
     tdx_api_subparsers = tdx_api_parser.add_subparsers(dest="tdx_action", required=True)
