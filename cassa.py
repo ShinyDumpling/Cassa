@@ -308,8 +308,12 @@ class TrendAnalysisResult:
     pe_ttm: float = 0.0
     pb_mrq: float = 0.0
     main_business: str = ""
+    # 资金面
+    net_buy_amount: float = 0.0      # 主买净额（万元）
+    main_net_inflow: float = 0.0     # 主力净流入（万元）
     # TODO: 筹码分布（获利比例/平均成本/集中度）—— 暂无数据源
     # TODO: 舆情/新闻/公告 —— 暂无数据源
+    # TODO: 考虑把所有通达信接口的数据都接入（stock_info / more_info / snapshot 等全量字段）
 
 
 # ============================================================================
@@ -4385,6 +4389,8 @@ def collect_stock_info(
         "pe_ttm": 0.0,
         "pb_mrq": 0.0,
         "main_business": "",
+        "net_buy_amount": 0.0,
+        "main_net_inflow": 0.0,
     }
 
     # stock_info：名称、总股本
@@ -4405,6 +4411,8 @@ def collect_stock_info(
             result["pb_mrq"] = float(more_info.get("PB_MRQ", 0) or 0)
             result["main_business"] = str(more_info.get("MainBusiness", "")).strip()
             result["turnover_rate"] = float(more_info.get("fHSL", 0) or 0)
+            result["net_buy_amount"] = float(more_info.get("Zjl", 0) or 0)
+            result["main_net_inflow"] = float(more_info.get("Zjl_HB", 0) or 0)
     except Exception:
         pass
 
@@ -4490,6 +4498,13 @@ def format_trend_result(result: TrendAnalysisResult) -> str:
         lines.append(
             f"基本面: PE(动){result.pe_dyna:.1f}  PE(TTM){result.pe_ttm:.1f}  "
             f"PB{result.pb_mrq:.2f}"
+        )
+
+    # 资金面行
+    if result.net_buy_amount != 0 or result.main_net_inflow != 0:
+        lines.append(
+            f"资金: 主买净额{result.net_buy_amount:.0f}万  "
+            f"主力净流入{result.main_net_inflow:.0f}万"
         )
 
     # 支撑压力行
@@ -4598,6 +4613,8 @@ def run_report(args: argparse.Namespace, client: TdxClient) -> None:
         result.pb_mrq = stock_info_data.get("pb_mrq", 0.0)
         result.main_business = stock_info_data.get("main_business", "")
         result.turnover_rate = stock_info_data.get("turnover_rate", 0.0)
+        result.net_buy_amount = stock_info_data.get("net_buy_amount", 0.0)
+        result.main_net_inflow = stock_info_data.get("main_net_inflow", 0.0)
 
         print(format_trend_result(result))
 
