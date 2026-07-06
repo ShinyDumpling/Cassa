@@ -30,7 +30,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import io
 import json
 import os
@@ -249,46 +249,67 @@ class TrendAnalysisResult:
     """个股趋势分析结果，对齐 DSA 的 StockTrendAnalyzer 输出口径。"""
 
     code: str
+    # 基本信息
+    name: str = ""
+    industry: str = ""
+    concepts: list[str] = field(default_factory=list)
     # 趋势
-    trend_status: str
-    ma_alignment: str
-    trend_strength: float
+    trend_status: str = ""
+    ma_alignment: str = ""
+    trend_strength: float = 0.0
     # 均线
-    ma5: float
-    ma10: float
-    ma20: float
-    ma60: float
-    current_price: float
+    ma5: float = 0.0
+    ma10: float = 0.0
+    ma20: float = 0.0
+    ma60: float = 0.0
+    current_price: float = 0.0
     # 乖离率
-    bias_ma5: float
-    bias_ma10: float
-    bias_ma20: float
+    bias_ma5: float = 0.0
+    bias_ma10: float = 0.0
+    bias_ma20: float = 0.0
     # 量能
-    volume_status: str
-    volume_ratio_5d: float
-    volume_trend: str
+    volume_status: str = ""
+    volume_ratio_5d: float = 0.0
+    volume_trend: str = ""
     # 支撑压力
-    support_ma5: bool
-    support_ma10: bool
-    resistance_levels: list[float]
-    support_levels: list[float]
+    support_ma5: bool = False
+    support_ma10: bool = False
+    resistance_levels: list[float] = field(default_factory=list)
+    support_levels: list[float] = field(default_factory=list)
     # MACD
-    macd_dif: float
-    macd_dea: float
-    macd_bar: float
-    macd_status: str
-    macd_signal: str
+    macd_dif: float = 0.0
+    macd_dea: float = 0.0
+    macd_bar: float = 0.0
+    macd_status: str = ""
+    macd_signal: str = ""
     # RSI
-    rsi_6: float
-    rsi_12: float
-    rsi_24: float
-    rsi_status: str
-    rsi_signal: str
+    rsi_6: float = 0.0
+    rsi_12: float = 0.0
+    rsi_24: float = 0.0
+    rsi_status: str = ""
+    rsi_signal: str = ""
     # 信号
-    buy_signal: str
-    signal_score: int
-    signal_reasons: list[str]
-    risk_factors: list[str]
+    buy_signal: str = ""
+    signal_score: int = 0
+    signal_reasons: list[str] = field(default_factory=list)
+    risk_factors: list[str] = field(default_factory=list)
+    # 当日完整行情
+    today_open: float = 0.0
+    today_high: float = 0.0
+    today_low: float = 0.0
+    yesterday_close: float = 0.0
+    price_change: float = 0.0
+    price_change_pct: float = 0.0
+    amplitude: float = 0.0
+    # 换手率
+    turnover_rate: float = 0.0
+    # 基本面
+    pe_dyna: float = 0.0
+    pe_ttm: float = 0.0
+    pb_mrq: float = 0.0
+    main_business: str = ""
+    # TODO: 筹码分布（获利比例/平均成本/集中度）—— 暂无数据源
+    # TODO: 舆情/新闻/公告 —— 暂无数据源
 
 
 # ============================================================================
@@ -4300,6 +4321,123 @@ def analyze_stock_trend(
     )
 
 
+def extract_today_quote(kline_bars: list[KlineBar]) -> dict[str, float]:
+    """从最后两根 K 线提取当日完整行情。
+
+    Args:
+        kline_bars: K 线序列，按时间从早到晚。
+
+    Returns:
+        包含当日行情字段的字典：today_open / today_high / today_low /
+        yesterday_close / price_change / price_change_pct / amplitude。
+    """
+    result = {
+        "today_open": 0.0,
+        "today_high": 0.0,
+        "today_low": 0.0,
+        "yesterday_close": 0.0,
+        "price_change": 0.0,
+        "price_change_pct": 0.0,
+        "amplitude": 0.0,
+    }
+    if len(kline_bars) < 2:
+        return result
+
+    today = kline_bars[-1]
+    yesterday = kline_bars[-2]
+
+    result["today_open"] = today.open_price
+    result["today_high"] = today.high_price
+    result["today_low"] = today.low_price
+    result["yesterday_close"] = yesterday.close_price
+
+    change = today.close_price - yesterday.close_price
+    result["price_change"] = change
+    result["price_change_pct"] = change / yesterday.close_price * 100 if yesterday.close_price > 0 else 0.0
+    result["amplitude"] = (today.high_price - today.low_price) / yesterday.close_price * 100 if yesterday.close_price > 0 else 0.0
+
+    return result
+
+
+def collect_stock_info(
+    client: TdxClient,
+    stock_code: StockCode,
+) -> dict[str, Any]:
+    """采集个股基础信息、板块关系、基本面数据。
+
+    通过 stock_info / more_info / relation 三个接口采集，
+    返回统一字典供 run_report 填充到 TrendAnalysisResult。
+
+    Args:
+        client: 通达信客户端包装器。
+        stock_code: 已规整的股票代码对象。
+
+    Returns:
+        包含 name / industry / concepts / turnover_rate /
+        pe_dyna / pe_ttm / pb_mrq / main_business 的字典。
+    """
+    result: dict[str, Any] = {
+        "name": "",
+        "industry": "",
+        "concepts": [],
+        "turnover_rate": 0.0,
+        "pe_dyna": 0.0,
+        "pe_ttm": 0.0,
+        "pb_mrq": 0.0,
+        "main_business": "",
+    }
+
+    # stock_info：名称、总股本
+    try:
+        stock_info = client.get_stock_info(stock_code, field_list=[])
+        if stock_info:
+            result["name"] = str(stock_info.get("Name", "")).strip()
+            result["total_shares"] = float(stock_info.get("J_zgb", 0) or 0)
+    except Exception:
+        pass
+
+    # more_info：换手率、PE/PB、主营业务
+    try:
+        more_info = client.get_more_info(stock_code, field_list=[])
+        if more_info:
+            free_ltgb = float(more_info.get("FreeLtgb", 0) or 0)
+            result["pe_dyna"] = float(more_info.get("DynaPE", 0) or 0)
+            result["pe_ttm"] = float(more_info.get("StaticPE_TTM", 0) or 0)
+            result["pb_mrq"] = float(more_info.get("PB_MRQ", 0) or 0)
+            result["main_business"] = str(more_info.get("MainBusiness", "")).strip()
+            result["free_ltgb"] = free_ltgb
+    except Exception:
+        pass
+
+    # relation：行业板块 + 概念板块
+    try:
+        relations = client.get_relation(stock_code)
+        if relations:
+            industries: list[str] = []
+            concepts: list[str] = []
+            for item in relations:
+                block_type = str(item.get("type", "")).lower()
+                block_name = str(item.get("name", "")).strip()
+                if not block_name:
+                    continue
+                if block_type == "industry":
+                    if block_name not in industries:
+                        industries.append(block_name)
+                elif block_type == "theme" or block_type == "concept":
+                    if block_name not in concepts:
+                        concepts.append(block_name)
+            result["industry"] = "、".join(industries) if industries else ""
+            result["concepts"] = concepts
+    except Exception:
+        pass
+
+    # 换手率 = 当日成交量 / 自由流通股本 * 100（由 run_report 传入当日成交量）
+    result["free_ltgb"] = result.get("free_ltgb", 0.0)
+    result["total_shares"] = result.get("total_shares", 0.0)
+
+    return result
+
+
 def format_trend_result(result: TrendAnalysisResult) -> str:
     """把趋势分析结果格式化为控制台文本。
 
@@ -4310,24 +4448,60 @@ def format_trend_result(result: TrendAnalysisResult) -> str:
         格式化后的多行文本。
     """
     lines: list[str] = []
-    lines.append(f"=== {result.code} ===")
+    # 标题行：代码 + 名称
+    name_str = f" {result.name}" if result.name else ""
+    lines.append(f"=== {result.code}{name_str} ===")
+
+    # 基本信息行
+    info_parts: list[str] = []
+    if result.industry:
+        info_parts.append(f"行业: {result.industry}")
+    if result.concepts:
+        info_parts.append(f"概念: {'、'.join(result.concepts)}")
+    if info_parts:
+        lines.append("  ".join(info_parts))
+
+    # 当日行情行
+    lines.append(
+        f"当日: 开{result.today_open:.2f} 高{result.today_high:.2f} "
+        f"低{result.today_low:.2f} 收{result.current_price:.2f} "
+        f"{result.price_change_pct:+.2f}% 振幅{result.amplitude:.2f}%"
+    )
+
+    # 趋势 + 信号行
     lines.append(
         f"趋势: {result.trend_status} ({result.trend_strength:.0f}/100)    "
         f"信号: {result.buy_signal} ({result.signal_score}分)"
     )
+
+    # 均线行
     lines.append(
         f"现价: {result.current_price:.2f}  "
         f"MA5: {result.ma5:.2f}({result.bias_ma5:+.1f}%)  "
         f"MA10: {result.ma10:.2f}({result.bias_ma10:+.1f}%)  "
         f"MA20: {result.ma20:.2f}({result.bias_ma20:+.1f}%)"
     )
+
+    # 量能 + MACD + RSI 行
+    turnover_str = f"  换手: {result.turnover_rate:.1f}%" if result.turnover_rate > 0 else ""
     lines.append(
         f"量能: {result.volume_status} ({result.volume_ratio_5d:.2f}x)      "
         f"MACD: {result.macd_status}    RSI: {result.rsi_status}({result.rsi_12:.0f})"
+        f"{turnover_str}"
     )
+
+    # 基本面行
+    if result.pe_dyna > 0 or result.pb_mrq > 0:
+        lines.append(
+            f"基本面: PE(动){result.pe_dyna:.1f}  PE(TTM){result.pe_ttm:.1f}  "
+            f"PB{result.pb_mrq:.2f}"
+        )
+
+    # 支撑压力行
     support_str = ", ".join(f"{v:.2f}" for v in result.support_levels) if result.support_levels else "无"
     resistance_str = ", ".join(f"{v:.2f}" for v in result.resistance_levels) if result.resistance_levels else "无"
     lines.append(f"支撑: {support_str}  压力: {resistance_str}")
+
     if result.signal_reasons:
         lines.append(f"理由: {'  '.join(result.signal_reasons)}")
     if result.risk_factors:
@@ -4408,6 +4582,33 @@ def run_report(args: argparse.Namespace, client: TdxClient) -> None:
             continue
 
         result = analyze_stock_trend(internal_code, kline_bars, macd_result)
+
+        # 采集基本信息、当日行情、换手率、基本面
+        today_quote = extract_today_quote(kline_bars)
+        result.today_open = today_quote["today_open"]
+        result.today_high = today_quote["today_high"]
+        result.today_low = today_quote["today_low"]
+        result.yesterday_close = today_quote["yesterday_close"]
+        result.price_change = today_quote["price_change"]
+        result.price_change_pct = today_quote["price_change_pct"]
+        result.amplitude = today_quote["amplitude"]
+
+        stock_code_obj = normalize_stock_code(internal_code)
+        stock_info_data = collect_stock_info(client, stock_code_obj)
+        result.name = stock_info_data.get("name", "")
+        result.industry = stock_info_data.get("industry", "")
+        result.concepts = stock_info_data.get("concepts", [])
+        result.pe_dyna = stock_info_data.get("pe_dyna", 0.0)
+        result.pe_ttm = stock_info_data.get("pe_ttm", 0.0)
+        result.pb_mrq = stock_info_data.get("pb_mrq", 0.0)
+        result.main_business = stock_info_data.get("main_business", "")
+
+        # 换手率 = 当日成交量 / 自由流通股本 * 100
+        free_ltgb = stock_info_data.get("free_ltgb", 0.0)
+        today_volume = kline_bars[-1].volume
+        if free_ltgb > 0:
+            result.turnover_rate = today_volume / free_ltgb * 100
+
         print(format_trend_result(result))
 
         if args.debug:
@@ -4419,6 +4620,9 @@ def run_report(args: argparse.Namespace, client: TdxClient) -> None:
             print(f"  RSI信号: {result.rsi_signal}")
             print(f"  均线排列: {result.ma_alignment}")
             print(f"  MA5支撑: {'是' if result.support_ma5 else '否'}  MA10支撑: {'是' if result.support_ma10 else '否'}")
+            if result.main_business:
+                print(f"  主营: {result.main_business[:80]}")
+            print(f"  昨收: {result.yesterday_close:.2f}  涨跌额: {result.price_change:+.2f}")
 
         if i < len(kline_map) - 1:
             print()
