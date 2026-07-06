@@ -131,7 +131,8 @@ SCREENER_MIN_KLINE_COUNT = 60
 SCREENER_DEFAULT_POOL_SIZE = 20
 SCREENER_PIVOT_LEFT_WINDOW = 5
 SCREENER_PIVOT_RIGHT_WINDOW = 5
-SCREENER_DIVERGENCE_MAX_INTERVAL = 60
+SCREENER_DIVERGENCE_MAX_INTERVAL = 40
+SCREENER_DIVERGENCE_RECENCY = 30
 SCREENER_CONSOLIDATION_AMPLITUDE_THRESHOLD = 0.08
 SCREENER_KISS_RATIO = 0.3
 SCREENER_HIGH_PULLBACK_THRESHOLD = 0.5
@@ -2376,58 +2377,59 @@ def find_pivot_lows(
 
 def check_bottom_divergence(
     price_lows: list[PivotLow],
-    macd_lows: list[PivotLow],
+    macd_values: list[float],
     max_interval: int,
+    recency: int,
+    total_bars: int,
 ) -> dict[str, Any]:
     """
-    检测底背离：最近的价格低点低于前一个价格低点，但对应的 MACD 低点高于前一个。
+    检测底背离：最近的价格低点低于前一个价格低点，但对应位置的 MACD 值高于前一个。
+
+    直接取价格低点对应位置的 MACD 柱状图值进行比较，不再要求 MACD 也形成 pivot low。
+    同时要求最近的价格低点距离最新 K 线不超过 recency 根，确保背离有时效性。
 
     Args:
         price_lows: 价格枢轴低点列表。
-        macd_lows: MACD 柱状图枢轴低点列表。
+        macd_values: MACD 柱状图序列（与 K 线等长）。
         max_interval: 两个低点之间的最大 K 线距离。
+        recency: 最近低点距最新 K 线的最大允许距离。
+        total_bars: K 线总数量。
 
     Returns:
         包含是否发现背离、背离位置等信息的字典。
     """
-    if len(price_lows) < 2 or len(macd_lows) < 2:
+    if len(price_lows) < 2:
         return {"found": False, "reason": "低点数量不足"}
 
     latest_price_low = price_lows[-1]
     prev_price_low = price_lows[-2]
 
+    # 时效性约束：最近的价格低点距最新 K 线不超过 recency 根
+    bars_since_latest = total_bars - 1 - latest_price_low.bar_index
+    if bars_since_latest > recency:
+        return {"found": False, "reason": f"最近低点距今{bars_since_latest}根，超过{recency}根时效限制"}
+
+    # 两个低点间隔不超过 max_interval
     if latest_price_low.bar_index - prev_price_low.bar_index > max_interval:
         return {"found": False, "reason": "两个价格低点间隔超过阈值"}
 
+    # 价格必须创新低
     if latest_price_low.value >= prev_price_low.value:
         return {"found": False, "reason": "价格未创新低"}
 
-    # 在价格低点附近找对应的 MACD 低点
-    def find_nearest_macd_low(bar_index: int) -> PivotLow | None:
-        nearest: PivotLow | None = None
-        min_distance = 999999
-        for ml in macd_lows:
-            distance = abs(ml.bar_index - bar_index)
-            if distance <= max(left := SCREENER_PIVOT_LEFT_WINDOW, right := SCREENER_PIVOT_RIGHT_WINDOW) and distance < min_distance:
-                min_distance = distance
-                nearest = ml
-        return nearest
+    # 直接取价格低点对应位置的 MACD 值比较
+    latest_macd_value = macd_values[latest_price_low.bar_index]
+    prev_macd_value = macd_values[prev_price_low.bar_index]
 
-    latest_macd_low = find_nearest_macd_low(latest_price_low.bar_index)
-    prev_macd_low = find_nearest_macd_low(prev_price_low.bar_index)
-
-    if latest_macd_low is None or prev_macd_low is None:
-        return {"found": False, "reason": "未找到对应的 MACD 低点"}
-
-    if latest_macd_low.value <= prev_macd_low.value:
-        return {"found": False, "reason": "MACD 低点未抬高"}
+    if latest_macd_value <= prev_macd_value:
+        return {"found": False, "reason": "MACD 值未抬高"}
 
     return {
         "found": True,
         "prev_price_low": prev_price_low,
         "latest_price_low": latest_price_low,
-        "prev_macd_low": prev_macd_low,
-        "latest_macd_low": latest_macd_low,
+        "prev_macd_value": prev_macd_value,
+        "latest_macd_value": latest_macd_value,
     }
 
 
@@ -2586,14 +2588,9 @@ def screen_single_stock(
         SCREENER_PIVOT_RIGHT_WINDOW,
         dates,
     )
-    macd_lows = find_pivot_lows(
-        macd.macd,
-        SCREENER_PIVOT_LEFT_WINDOW,
-        SCREENER_PIVOT_RIGHT_WINDOW,
-        dates,
-    )
     divergence_result = check_bottom_divergence(
-        price_lows, macd_lows, SCREENER_DIVERGENCE_MAX_INTERVAL,
+        price_lows, macd.macd, SCREENER_DIVERGENCE_MAX_INTERVAL,
+        SCREENER_DIVERGENCE_RECENCY, len(kline_bars),
     )
     divergence_found = divergence_result.get("found", False)
 
