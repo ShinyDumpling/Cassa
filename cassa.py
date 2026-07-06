@@ -137,6 +137,8 @@ SCREENER_KISS_RATIO = 0.3
 SCREENER_HIGH_PULLBACK_THRESHOLD = 0.5
 SCREENER_LOOKBACK_BARS_FOR_BREAK = 20
 SCREENER_DIF_RECENT_WINDOW = 40
+SCREENER_MACD_BATCH_COUNT = 150
+SCREENER_MACD_BATCH_CHUNK_SIZE = 500
 
 
 # ============================================================================
@@ -505,6 +507,55 @@ class TdxClient:
         if not isinstance(result, dict) or result.get("ErrorId") != "0":
             raise RuntimeError(f"通达信公式计算失败：{result}")
         return result.get("Value", {})
+
+    def calculate_macd_batch(
+        self,
+        tdx_codes: list[str],
+        count: int,
+        chunk_size: int,
+    ) -> dict[str, dict[str, list[dict[str, str]]]]:
+        """
+        批量调用通达信指标公式计算 MACD，内部自动分批。
+
+        使用 `formula_process_mul_zb` 接口，无需提前 set_data，
+        通达信引擎直接从本地盘后数据拉取 K 线并计算。
+
+        Args:
+            tdx_codes: 通达信格式股票代码列表。
+            count: 每只股票截取的 K 线数量（从最新往前算）。
+            chunk_size: 每批调用的股票数量上限。
+
+        Returns:
+            以 tdx_code 为键的字典，值为各输出线列表，例如：
+            `{'000001.SZ': {'DIF': [{'Date': 'YYYYMMDD', 'Value': '0.05'}, ...], ...}}`
+
+        Raises:
+            RuntimeError: 当批量计算失败时抛出。
+        """
+        self.initialize()
+        all_results: dict[str, dict[str, list[dict[str, str]]]] = {}
+
+        for chunk in chunk_list(tdx_codes, chunk_size):
+            result = self._invoke_quietly(
+                tq.formula_process_mul_zb,
+                formula_name=MACD_FORMULA_NAME,
+                formula_arg=MACD_FORMULA_ARG,
+                xsflag=-1,
+                return_count=count,
+                return_date=True,
+                stock_list=chunk,
+                stock_period="1d",
+                count=count,
+                dividend_type=1,
+            )
+            if not isinstance(result, dict) or result.get("ErrorId") != "0":
+                raise RuntimeError(f"批量 MACD 计算失败：{result}")
+            for code, values in result.items():
+                if code == "ErrorId":
+                    continue
+                all_results[code] = values
+
+        return all_results
 
 
 class OpenAiCompatibleLlmClient:
@@ -2169,11 +2220,18 @@ def load_stock_codes_from_db(
     conn = sqlite3.connect(str(db_path))
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT code, COUNT(*) as cnt FROM daily_kline "
-            "GROUP BY code HAVING cnt >= ? ORDER BY cnt DESC LIMIT ?",
-            (min_kline_count, pool_size),
-        )
+        if pool_size == 0:
+            cursor.execute(
+                "SELECT code, COUNT(*) as cnt FROM daily_kline "
+                "GROUP BY code HAVING cnt >= ? ORDER BY cnt DESC",
+                (min_kline_count,),
+            )
+        else:
+            cursor.execute(
+                "SELECT code, COUNT(*) as cnt FROM daily_kline "
+                "GROUP BY code HAVING cnt >= ? ORDER BY cnt DESC LIMIT ?",
+                (min_kline_count, pool_size),
+            )
         rows = cursor.fetchall()
     finally:
         conn.close()
@@ -2228,49 +2286,55 @@ def load_daily_kline_from_db(
     return bars
 
 
-def calculate_macd_via_tdx(
-    client: TdxClient,
-    tdx_code: str,
+def align_macd_with_kline(
     kline_bars: list[KlineBar],
+    macd_raw: dict[str, list[dict[str, str]]],
 ) -> MacdResult | None:
     """
-    把 K 线数据喂给通达信公式引擎，计算 MACD。
+    把批量 MACD 结果按日期和 SQLite K 线对齐。
+
+    通达信批量接口返回的 MACD 数据按日期从早到晚排列，
+    通过日期匹配把 MACD 值对齐到 K 线序列上。
+    如果尾部 MACD 数据缺失（停牌等），用 0.0 填充。
 
     Args:
-        client: 已初始化的通达信客户端包装器。
-        tdx_code: 通达信格式的股票代码。
-        kline_bars: 日 K 线列表。
+        kline_bars: SQLite 读取的 K 线列表，按时间从早到晚。
+        macd_raw: 批量接口返回的单只股票 MACD 字典，例如
+            `{'DIF': [{'Date': 'YYYYMMDD', 'Value': '0.05'}, ...], ...}`。
 
     Returns:
-        包含 DIF、DEA、MACD 三条线的对象；如果计算失败则返回 None。
+        对齐后的 MacdResult；如果数据为空则返回 None。
     """
-    try:
-        client.set_formula_data(tdx_code, kline_bars)
-        raw = client.calculate_formula_zb(MACD_FORMULA_NAME, MACD_FORMULA_ARG)
-    except RuntimeError:
+    if not macd_raw:
         return None
 
-    dif_raw = raw.get("DIF", [])
-    dea_raw = raw.get("DEA", [])
-    macd_raw = raw.get("MACD", [])
-
-    def to_float_list(values: list) -> list[float]:
-        result: list[float] = []
-        for v in values:
-            if v is None:
-                result.append(0.0)
-            else:
-                try:
-                    result.append(float(v))
-                except (TypeError, ValueError):
-                    result.append(0.0)
+    def build_date_value_map(items: list[dict[str, str]]) -> dict[str, float]:
+        result: dict[str, float] = {}
+        for item in items:
+            date_str = item.get("Date", "")
+            value_str = item.get("Value", "")
+            try:
+                result[date_str] = float(value_str)
+            except (TypeError, ValueError):
+                result[date_str] = 0.0
         return result
 
-    return MacdResult(
-        dif=to_float_list(dif_raw),
-        dea=to_float_list(dea_raw),
-        macd=to_float_list(macd_raw),
-    )
+    dif_map = build_date_value_map(macd_raw.get("DIF", []))
+    dea_map = build_date_value_map(macd_raw.get("DEA", []))
+    macd_map = build_date_value_map(macd_raw.get("MACD", []))
+
+    dif: list[float] = []
+    dea: list[float] = []
+    macd: list[float] = []
+
+    for bar in kline_bars:
+        # SQLite 日期格式为 YYYY-MM-DD，通达信返回格式为 YYYYMMDD
+        date_compact = bar.trade_date.replace("-", "")
+        dif.append(dif_map.get(date_compact, 0.0))
+        dea.append(dea_map.get(date_compact, 0.0))
+        macd.append(macd_map.get(date_compact, 0.0))
+
+    return MacdResult(dif=dif, dea=dea, macd=macd)
 
 
 def find_pivot_lows(
@@ -2493,42 +2557,26 @@ def check_band_position(
     }
 
 
-def run_screener_pipeline(
-    client: TdxClient,
+def screen_single_stock(
     code: str,
+    kline_bars: list[KlineBar],
+    macd: MacdResult,
     debug: bool = False,
 ) -> ScreenResult:
     """
-    对单只股票执行完整的选股筛选流程。
+    对单只股票执行纯筛选逻辑（底背离 + 趋势反转 + 波段位置）。
+
+    数据加载和 MACD 计算由调用方完成，本函数只做筛选判断。
 
     Args:
-        client: 已初始化的通达信客户端包装器。
         code: 纯数字股票代码。
+        kline_bars: 已从 SQLite 加载的 K 线列表。
+        macd: 已对齐的 MACD 结果。
         debug: 是否在控制台打印详细筛选过程。
 
     Returns:
         选股筛选结果对象。
     """
-    kline_bars = load_daily_kline_from_db(DAILY_KLINE_DB_PATH, code, SCREENER_MIN_KLINE_COUNT)
-    if kline_bars is None:
-        return ScreenResult(
-            code=code, passed=False, fail_reason="K线数据不足",
-            kline_count=0, latest_close=0, latest_date="", latest_dif=0,
-            latest_dea=0, latest_macd=0, divergence_found=False,
-            reversal_confirmed=False, band_position_ok=False, detail={},
-        )
-
-    stock_code = normalize_stock_code(code)
-    macd = calculate_macd_via_tdx(client, stock_code.tdx_code, kline_bars)
-    if macd is None:
-        return ScreenResult(
-            code=code, passed=False, fail_reason="MACD计算失败",
-            kline_count=len(kline_bars), latest_close=kline_bars[-1].close_price,
-            latest_date=kline_bars[-1].trade_date, latest_dif=0,
-            latest_dea=0, latest_macd=0, divergence_found=False,
-            reversal_confirmed=False, band_position_ok=False, detail={},
-        )
-
     dates = [bar.trade_date for bar in kline_bars]
 
     # 第3步：底背离检测
@@ -3456,6 +3504,9 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
     """
     执行 `screener` 子命令，对股票池执行选股筛选。
 
+    使用通达信批量公式接口一次性计算全部股票的 MACD，
+    再逐只对齐 K 线并执行三步筛选。
+
     Args:
         args: 命令行参数对象。
         client: 通达信客户端包装器。
@@ -3469,10 +3520,13 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
     min_kline = args.min_kline
     debug = args.debug
 
-    print(f"股票池大小: {pool_size} | 最小K线数: {min_kline}")
+    if pool_size == 0:
+        print(f"股票池: 全市场 | 最小K线数: {min_kline}")
+    else:
+        print(f"股票池大小: {pool_size} | 最小K线数: {min_kline}")
 
-    # 从 SQLite 读取股票池
-    print("\n>>> 从数据库加载股票池...")
+    # 第1步：从 SQLite 读取股票池
+    print("\n>>> 1. 从数据库加载股票池...")
     codes = load_stock_codes_from_db(DAILY_KLINE_DB_PATH, pool_size, min_kline)
     print(f"加载到 {len(codes)} 只股票")
 
@@ -3480,15 +3534,58 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
         print("股票池为空，退出。")
         return
 
-    # 逐只筛选
-    print(f"\n>>> 开始筛选...")
+    # 第2步：批量计算 MACD
+    print(f"\n>>> 2. 批量计算 MACD（每批 {SCREENER_MACD_BATCH_CHUNK_SIZE} 只）...")
+    t0_macd = time.perf_counter()
+    tdx_codes = [to_tdx_stock_code(code) for code in codes]
+    try:
+        macd_batch = client.calculate_macd_batch(
+            tdx_codes=tdx_codes,
+            count=SCREENER_MACD_BATCH_COUNT,
+            chunk_size=SCREENER_MACD_BATCH_CHUNK_SIZE,
+        )
+    except RuntimeError as exc:
+        print(f"批量 MACD 计算失败: {exc}")
+        return
+    print(f"MACD 计算完成，耗时 {time.perf_counter() - t0_macd:.1f}s，覆盖 {len(macd_batch)} 只")
+
+    # 第3步：逐只加载 K 线 + 对齐 MACD + 筛选
+    print(f"\n>>> 3. 逐只筛选...")
     results: list[ScreenResult] = []
     for i, code in enumerate(codes, 1):
-        t0 = time.perf_counter()
-        result = run_screener_pipeline(client, code, debug)
-        elapsed = time.perf_counter() - t0
+        kline_bars = load_daily_kline_from_db(DAILY_KLINE_DB_PATH, code, min_kline)
+        if kline_bars is None:
+            result = ScreenResult(
+                code=code, passed=False, fail_reason="K线数据不足",
+                kline_count=0, latest_close=0, latest_date="", latest_dif=0,
+                latest_dea=0, latest_macd=0, divergence_found=False,
+                reversal_confirmed=False, band_position_ok=False, detail={},
+            )
+            results.append(result)
+            if i % 500 == 0:
+                print(f"  [{i}/{len(codes)}] 进度...")
+            continue
+
+        tdx_code = to_tdx_stock_code(code)
+        macd_raw = macd_batch.get(tdx_code, {})
+        macd = align_macd_with_kline(kline_bars, macd_raw)
+        if macd is None:
+            result = ScreenResult(
+                code=code, passed=False, fail_reason="MACD数据缺失",
+                kline_count=len(kline_bars), latest_close=kline_bars[-1].close_price,
+                latest_date=kline_bars[-1].trade_date, latest_dif=0,
+                latest_dea=0, latest_macd=0, divergence_found=False,
+                reversal_confirmed=False, band_position_ok=False, detail={},
+            )
+            results.append(result)
+            continue
+
+        result = screen_single_stock(code, kline_bars, macd, debug)
         status = "通过" if result.passed else "未通过"
-        print(f"  [{i}/{len(codes)}] {code} - {status} ({elapsed:.1f}s) - {result.fail_reason}")
+        if result.passed or debug:
+            print(f"  [{i}/{len(codes)}] {code} - {status} - {result.fail_reason}")
+        elif i % 500 == 0:
+            print(f"  [{i}/{len(codes)}] 进度...")
         results.append(result)
 
     # 打印摘要
@@ -3543,7 +3640,7 @@ def parse_args() -> argparse.Namespace:
     market_parser.set_defaults(handler=run_market)
 
     screener_parser = module_parsers.add_parser("screener", help="执行选股筛选")
-    screener_parser.add_argument("--pool-size", type=int, default=SCREENER_DEFAULT_POOL_SIZE, help=f"股票池大小，默认 {SCREENER_DEFAULT_POOL_SIZE}")
+    screener_parser.add_argument("--pool-size", type=int, default=0, help="股票池大小，0=全市场，默认 0")
     screener_parser.add_argument("--min-kline", type=int, default=SCREENER_MIN_KLINE_COUNT, help=f"最小K线数，默认 {SCREENER_MIN_KLINE_COUNT}")
     screener_parser.add_argument("--debug", action="store_true", help="输出每只股票的详细筛选过程")
     screener_parser.set_defaults(handler=run_screener)
