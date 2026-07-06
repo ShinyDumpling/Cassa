@@ -123,6 +123,21 @@ LLM_BASE_URL_ENV_NAME = "CASSA_LLM_BASE_URL"
 LLM_MODEL_ENV_NAME = "CASSA_LLM_MODEL"
 DEFAULT_LLM_TIMEOUT_SECONDS = 60
 
+# ── 选股模块常量 ──
+DAILY_KLINE_DB_PATH = Path(r"D:\股神养成plan\Sentinel\all_daily_k.db")
+MACD_FORMULA_NAME = "MACD"
+MACD_FORMULA_ARG = "12,26,9"
+SCREENER_MIN_KLINE_COUNT = 60
+SCREENER_DEFAULT_POOL_SIZE = 20
+SCREENER_PIVOT_LEFT_WINDOW = 5
+SCREENER_PIVOT_RIGHT_WINDOW = 5
+SCREENER_DIVERGENCE_MAX_INTERVAL = 60
+SCREENER_CONSOLIDATION_AMPLITUDE_THRESHOLD = 0.08
+SCREENER_KISS_RATIO = 0.3
+SCREENER_HIGH_PULLBACK_THRESHOLD = 0.5
+SCREENER_LOOKBACK_BARS_FOR_BREAK = 20
+SCREENER_DIF_RECENT_WINDOW = 40
+
 
 # ============================================================================
 # 第三层：数据结构层
@@ -158,6 +173,56 @@ class LlmConfig:
     base_url: str
     model: str
     timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
+
+
+@dataclass
+class KlineBar:
+    """单根日 K 线的规整结构。"""
+
+    trade_date: str
+    open_price: float
+    high_price: float
+    low_price: float
+    close_price: float
+    volume: float
+    amount: float
+
+
+@dataclass
+class PivotLow:
+    """枢轴低点：某一根 K 线在其左右窗口内是最低点。"""
+
+    bar_index: int
+    trade_date: str
+    value: float
+
+
+@dataclass
+class MacdResult:
+    """通达信公式引擎返回的 MACD 三条线。"""
+
+    dif: list[float]
+    dea: list[float]
+    macd: list[float]
+
+
+@dataclass
+class ScreenResult:
+    """单只股票的选股筛选结果。"""
+
+    code: str
+    passed: bool
+    fail_reason: str
+    kline_count: int
+    latest_close: float
+    latest_date: str
+    latest_dif: float
+    latest_dea: float
+    latest_macd: float
+    divergence_found: bool
+    reversal_confirmed: bool
+    band_position_ok: bool
+    detail: dict[str, Any]
 
 
 # ============================================================================
@@ -371,6 +436,75 @@ class TdxClient:
             block_type=block_type,
             list_type=list_type,
         )
+
+    def set_formula_data(
+        self,
+        tdx_code: str,
+        kline_bars: list[KlineBar],
+    ) -> None:
+        """
+        把外部 K 线数据喂给通达信公式引擎，供后续 formula_zb 计算使用。
+
+        Args:
+            tdx_code: 通达信格式的股票代码，例如 `000001.SZ`。
+            kline_bars: 已规整的日 K 线列表，按时间从早到晚排列。
+
+        Raises:
+            RuntimeError: 当通达信公式引擎设置数据失败时抛出。
+        """
+        self.initialize()
+        formatted_data = [
+            {
+                "Date": f"{bar.trade_date} 00:00:00",
+                "Open": bar.open_price,
+                "High": bar.high_price,
+                "Low": bar.low_price,
+                "Close": bar.close_price,
+                "Volume": bar.volume,
+                "Amount": bar.amount,
+            }
+            for bar in kline_bars
+        ]
+        result = self._invoke_quietly(
+            tq.formula_set_data,
+            stock_code=tdx_code,
+            stock_period="1d",
+            stock_data=formatted_data,
+            count=len(formatted_data),
+            dividend_type=1,
+        )
+        if not isinstance(result, dict) or result.get("ErrorId") != "0":
+            raise RuntimeError(f"通达信公式引擎设置数据失败：{result}")
+
+    def calculate_formula_zb(
+        self,
+        formula_name: str,
+        formula_arg: str,
+    ) -> dict[str, list[float | None]]:
+        """
+        调用通达信技术指标公式，返回各输出线。
+
+        需要先调用 `set_formula_data` 设置 K 线数据。
+
+        Args:
+            formula_name: 公式名称，例如 `MACD`。
+            formula_arg: 公式参数，例如 `12,26,9`。
+
+        Returns:
+            以输出线名称为键的字典，值为与 K 线等长的列表。
+
+        Raises:
+            RuntimeError: 当公式计算失败时抛出。
+        """
+        self.initialize()
+        result = self._invoke_quietly(
+            tq.formula_zb,
+            formula_name=formula_name,
+            formula_arg=formula_arg,
+        )
+        if not isinstance(result, dict) or result.get("ErrorId") != "0":
+            raise RuntimeError(f"通达信公式计算失败：{result}")
+        return result.get("Value", {})
 
 
 class OpenAiCompatibleLlmClient:
@@ -2010,6 +2144,461 @@ def collect_key_sector_member_snapshot(client: TdxClient, key_blocks: list[dict[
 
 
 # ============================================================================
+# 第六层补充：选股模块 —— SQLite 数据读取 + MACD 计算 + 筛选逻辑
+# 这一块负责从本地 SQLite 读取 K 线、喂给通达信公式引擎算 MACD、执行三步筛选。
+# ============================================================================
+
+def load_stock_codes_from_db(
+    db_path: Path,
+    pool_size: int,
+    min_kline_count: int,
+) -> list[str]:
+    """
+    从 SQLite 数据库中选取 K 线数量最多的前 N 只股票代码。
+
+    Args:
+        db_path: SQLite 数据库路径。
+        pool_size: 需要返回的股票数量上限。
+        min_kline_count: K 线数量的最低门槛。
+
+    Returns:
+        纯数字股票代码列表，按 K 线数量从多到少排列。
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT code, COUNT(*) as cnt FROM daily_kline "
+            "GROUP BY code HAVING cnt >= ? ORDER BY cnt DESC LIMIT ?",
+            (min_kline_count, pool_size),
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    return [row[0] for row in rows]
+
+
+def load_daily_kline_from_db(
+    db_path: Path,
+    code: str,
+    min_kline_count: int,
+) -> list[KlineBar] | None:
+    """
+    从 SQLite 数据库读取单只股票的全部日 K 线。
+
+    Args:
+        db_path: SQLite 数据库路径。
+        code: 纯数字股票代码。
+        min_kline_count: K 线数量的最低门槛，不足则返回 None。
+
+    Returns:
+        按时间从早到晚排列的 K 线列表；如果数据不足则返回 None。
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT trade_date, open_price, high_price, low_price, close_price, volume, amount "
+            "FROM daily_kline WHERE code = ? ORDER BY trade_date ASC",
+            (code,),
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    if len(rows) < min_kline_count:
+        return None
+
+    bars: list[KlineBar] = []
+    for row in rows:
+        bars.append(KlineBar(
+            trade_date=row[0],
+            open_price=float(row[1]),
+            high_price=float(row[2]),
+            low_price=float(row[3]),
+            close_price=float(row[4]),
+            volume=float(row[5]),
+            amount=float(row[6]),
+        ))
+    return bars
+
+
+def calculate_macd_via_tdx(
+    client: TdxClient,
+    tdx_code: str,
+    kline_bars: list[KlineBar],
+) -> MacdResult | None:
+    """
+    把 K 线数据喂给通达信公式引擎，计算 MACD。
+
+    Args:
+        client: 已初始化的通达信客户端包装器。
+        tdx_code: 通达信格式的股票代码。
+        kline_bars: 日 K 线列表。
+
+    Returns:
+        包含 DIF、DEA、MACD 三条线的对象；如果计算失败则返回 None。
+    """
+    try:
+        client.set_formula_data(tdx_code, kline_bars)
+        raw = client.calculate_formula_zb(MACD_FORMULA_NAME, MACD_FORMULA_ARG)
+    except RuntimeError:
+        return None
+
+    dif_raw = raw.get("DIF", [])
+    dea_raw = raw.get("DEA", [])
+    macd_raw = raw.get("MACD", [])
+
+    def to_float_list(values: list) -> list[float]:
+        result: list[float] = []
+        for v in values:
+            if v is None:
+                result.append(0.0)
+            else:
+                try:
+                    result.append(float(v))
+                except (TypeError, ValueError):
+                    result.append(0.0)
+        return result
+
+    return MacdResult(
+        dif=to_float_list(dif_raw),
+        dea=to_float_list(dea_raw),
+        macd=to_float_list(macd_raw),
+    )
+
+
+def find_pivot_lows(
+    values: list[float],
+    left_window: int,
+    right_window: int,
+    dates: list[str],
+) -> list[PivotLow]:
+    """
+    检测序列中的枢轴低点。
+
+    某个位置 i 是枢轴低点，当且仅当 values[i] 是 [i-left, i+right] 范围内的最小值。
+
+    Args:
+        values: 数值序列。
+        left_window: 左侧窗口大小。
+        right_window: 右侧窗口大小。
+        dates: 与 values 等长的日期序列。
+
+    Returns:
+        枢轴低点列表，按位置从早到晚排列。
+    """
+    pivot_lows: list[PivotLow] = []
+    total = len(values)
+
+    for i in range(left_window, total - right_window):
+        window_start = i - left_window
+        window_end = i + right_window + 1
+        window = values[window_start:window_end]
+        if values[i] == min(window) and values[i] < max(window):
+            pivot_lows.append(PivotLow(
+                bar_index=i,
+                trade_date=dates[i],
+                value=values[i],
+            ))
+
+    return pivot_lows
+
+
+def check_bottom_divergence(
+    price_lows: list[PivotLow],
+    macd_lows: list[PivotLow],
+    max_interval: int,
+) -> dict[str, Any]:
+    """
+    检测底背离：最近的价格低点低于前一个价格低点，但对应的 MACD 低点高于前一个。
+
+    Args:
+        price_lows: 价格枢轴低点列表。
+        macd_lows: MACD 柱状图枢轴低点列表。
+        max_interval: 两个低点之间的最大 K 线距离。
+
+    Returns:
+        包含是否发现背离、背离位置等信息的字典。
+    """
+    if len(price_lows) < 2 or len(macd_lows) < 2:
+        return {"found": False, "reason": "低点数量不足"}
+
+    latest_price_low = price_lows[-1]
+    prev_price_low = price_lows[-2]
+
+    if latest_price_low.bar_index - prev_price_low.bar_index > max_interval:
+        return {"found": False, "reason": "两个价格低点间隔超过阈值"}
+
+    if latest_price_low.value >= prev_price_low.value:
+        return {"found": False, "reason": "价格未创新低"}
+
+    # 在价格低点附近找对应的 MACD 低点
+    def find_nearest_macd_low(bar_index: int) -> PivotLow | None:
+        nearest: PivotLow | None = None
+        min_distance = 999999
+        for ml in macd_lows:
+            distance = abs(ml.bar_index - bar_index)
+            if distance <= max(left := SCREENER_PIVOT_LEFT_WINDOW, right := SCREENER_PIVOT_RIGHT_WINDOW) and distance < min_distance:
+                min_distance = distance
+                nearest = ml
+        return nearest
+
+    latest_macd_low = find_nearest_macd_low(latest_price_low.bar_index)
+    prev_macd_low = find_nearest_macd_low(prev_price_low.bar_index)
+
+    if latest_macd_low is None or prev_macd_low is None:
+        return {"found": False, "reason": "未找到对应的 MACD 低点"}
+
+    if latest_macd_low.value <= prev_macd_low.value:
+        return {"found": False, "reason": "MACD 低点未抬高"}
+
+    return {
+        "found": True,
+        "prev_price_low": prev_price_low,
+        "latest_price_low": latest_price_low,
+        "prev_macd_low": prev_macd_low,
+        "latest_macd_low": latest_macd_low,
+    }
+
+
+def check_trend_reversal(
+    dif: list[float],
+    dea: list[float],
+    divergence_result: dict[str, Any],
+    kline_bars: list[KlineBar],
+) -> dict[str, Any]:
+    """
+    确认趋势反转：DIF 上零轴 + 零轴下方金叉 + 下跌节奏被打破。
+
+    Args:
+        dif: DIF 序列。
+        dea: DEA 序列。
+        divergence_result: 底背离检测结果。
+        kline_bars: K 线列表。
+
+    Returns:
+        包含是否确认反转、各项子条件状态的字典。
+    """
+    total = len(dif)
+    if total < 2:
+        return {"confirmed": False, "reason": "数据不足"}
+
+    latest_dif = dif[-1]
+
+    # 条件1：DIF 当前在零轴上方
+    dif_above_zero = latest_dif > 0
+
+    # 条件2：在背离低点之后出现过零轴下方金叉（DIF 从下穿上 DEA，且两者都在零轴下方）
+    golden_cross_below_zero = False
+    if divergence_result.get("found"):
+        divergence_bar = divergence_result["latest_price_low"].bar_index
+        for i in range(divergence_bar + 1, total):
+            if i < 1:
+                continue
+            prev_dif = dif[i - 1]
+            prev_dea = dea[i - 1]
+            curr_dif = dif[i]
+            curr_dea = dea[i]
+            if prev_dif <= prev_dea and curr_dif > curr_dea and curr_dif < 0 and curr_dea < 0:
+                golden_cross_below_zero = True
+                break
+
+    # 条件3：下跌节奏被打破 —— 最近 N 根 K 线的最低价 > 最近的 pivot low
+    rhythm_broken = False
+    if divergence_result.get("found"):
+        divergence_low_value = divergence_result["latest_price_low"].value
+        lookback_start = max(0, total - SCREENER_LOOKBACK_BARS_FOR_BREAK)
+        recent_lowest = min(bar.low_price for bar in kline_bars[lookback_start:])
+        rhythm_broken = recent_lowest > divergence_low_value
+
+    confirmed = dif_above_zero and golden_cross_below_zero and rhythm_broken
+
+    return {
+        "confirmed": confirmed,
+        "dif_above_zero": dif_above_zero,
+        "golden_cross_below_zero": golden_cross_below_zero,
+        "rhythm_broken": rhythm_broken,
+    }
+
+
+def check_band_position(
+    dif: list[float],
+    dea: list[float],
+    kline_bars: list[KlineBar],
+) -> dict[str, Any]:
+    """
+    判断波段位置：盘整 + 飞吻 + 排除高位回调。
+
+    Args:
+        dif: DIF 序列。
+        dea: DEA 序列。
+        kline_bars: K 线列表。
+
+    Returns:
+        包含是否处于合适波段位置、各项子条件状态的字典。
+    """
+    total = len(dif)
+    if total < SCREENER_LOOKBACK_BARS_FOR_BREAK:
+        return {"ok": False, "reason": "数据不足"}
+
+    latest_dif = dif[-1]
+
+    # 条件1：盘整 —— 最近 N 根 K 线振幅小于阈值
+    lookback_start = total - SCREENER_LOOKBACK_BARS_FOR_BREAK
+    recent_bars = kline_bars[lookback_start:]
+    recent_high = max(bar.high_price for bar in recent_bars)
+    recent_low = min(bar.low_price for bar in recent_bars)
+    recent_avg = sum(bar.close_price for bar in recent_bars) / len(recent_bars)
+    amplitude = (recent_high - recent_low) / recent_avg if recent_avg > 0 else 999
+    is_consolidating = amplitude < SCREENER_CONSOLIDATION_AMPLITUDE_THRESHOLD
+
+    # 条件2：飞吻 —— DIF 在零轴上方但贴近零轴
+    recent_dif_max = max(abs(d) for d in dif[-SCREENER_DIF_RECENT_WINDOW:])
+    kiss_upper = recent_dif_max * SCREENER_KISS_RATIO
+    is_kiss = 0 < latest_dif < kiss_upper if kiss_upper > 0 else False
+
+    # 条件3：排除高位回调 —— DIF 从近期高点的回落幅度不超过阈值
+    dif_recent_window = dif[-SCREENER_DIF_RECENT_WINDOW:]
+    dif_high = max(dif_recent_window)
+    pullback_ratio = (dif_high - latest_dif) / dif_high if dif_high > 0 else 0
+    not_high_pullback = pullback_ratio < SCREENER_HIGH_PULLBACK_THRESHOLD
+
+    # 条件4：没有出现高位死叉（DIF 从上方下穿 DEA 且 DIF 仍在较高位置）
+    no_high_death_cross = True
+    if total >= 2:
+        prev_dif = dif[-2]
+        prev_dea = dea[-2]
+        curr_dif = dif[-1]
+        curr_dea = dea[-1]
+        if prev_dif > prev_dea and curr_dif <= curr_dea and curr_dif > kiss_upper:
+            no_high_death_cross = False
+
+    ok = is_consolidating and is_kiss and not_high_pullback and no_high_death_cross
+
+    return {
+        "ok": ok,
+        "is_consolidating": is_consolidating,
+        "amplitude": amplitude,
+        "is_kiss": is_kiss,
+        "kiss_upper": kiss_upper,
+        "not_high_pullback": not_high_pullback,
+        "pullback_ratio": pullback_ratio,
+        "no_high_death_cross": no_high_death_cross,
+    }
+
+
+def run_screener_pipeline(
+    client: TdxClient,
+    code: str,
+    debug: bool = False,
+) -> ScreenResult:
+    """
+    对单只股票执行完整的选股筛选流程。
+
+    Args:
+        client: 已初始化的通达信客户端包装器。
+        code: 纯数字股票代码。
+        debug: 是否在控制台打印详细筛选过程。
+
+    Returns:
+        选股筛选结果对象。
+    """
+    kline_bars = load_daily_kline_from_db(DAILY_KLINE_DB_PATH, code, SCREENER_MIN_KLINE_COUNT)
+    if kline_bars is None:
+        return ScreenResult(
+            code=code, passed=False, fail_reason="K线数据不足",
+            kline_count=0, latest_close=0, latest_date="", latest_dif=0,
+            latest_dea=0, latest_macd=0, divergence_found=False,
+            reversal_confirmed=False, band_position_ok=False, detail={},
+        )
+
+    stock_code = normalize_stock_code(code)
+    macd = calculate_macd_via_tdx(client, stock_code.tdx_code, kline_bars)
+    if macd is None:
+        return ScreenResult(
+            code=code, passed=False, fail_reason="MACD计算失败",
+            kline_count=len(kline_bars), latest_close=kline_bars[-1].close_price,
+            latest_date=kline_bars[-1].trade_date, latest_dif=0,
+            latest_dea=0, latest_macd=0, divergence_found=False,
+            reversal_confirmed=False, band_position_ok=False, detail={},
+        )
+
+    dates = [bar.trade_date for bar in kline_bars]
+
+    # 第3步：底背离检测
+    price_lows = find_pivot_lows(
+        [bar.low_price for bar in kline_bars],
+        SCREENER_PIVOT_LEFT_WINDOW,
+        SCREENER_PIVOT_RIGHT_WINDOW,
+        dates,
+    )
+    macd_lows = find_pivot_lows(
+        macd.macd,
+        SCREENER_PIVOT_LEFT_WINDOW,
+        SCREENER_PIVOT_RIGHT_WINDOW,
+        dates,
+    )
+    divergence_result = check_bottom_divergence(
+        price_lows, macd_lows, SCREENER_DIVERGENCE_MAX_INTERVAL,
+    )
+    divergence_found = divergence_result.get("found", False)
+
+    if debug:
+        print(f"  [{code}] 底背离: {divergence_result}")
+
+    if not divergence_found:
+        return ScreenResult(
+            code=code, passed=False, fail_reason=f"底背离未通过: {divergence_result.get('reason', '')}",
+            kline_count=len(kline_bars), latest_close=kline_bars[-1].close_price,
+            latest_date=kline_bars[-1].trade_date, latest_dif=macd.dif[-1],
+            latest_dea=macd.dea[-1], latest_macd=macd.macd[-1],
+            divergence_found=False, reversal_confirmed=False,
+            band_position_ok=False, detail={"divergence": divergence_result},
+        )
+
+    # 第4步：趋势反转确认
+    reversal_result = check_trend_reversal(macd.dif, macd.dea, divergence_result, kline_bars)
+    reversal_confirmed = reversal_result.get("confirmed", False)
+
+    if debug:
+        print(f"  [{code}] 趋势反转: {reversal_result}")
+
+    if not reversal_confirmed:
+        return ScreenResult(
+            code=code, passed=False, fail_reason=f"趋势反转未通过: {reversal_result}",
+            kline_count=len(kline_bars), latest_close=kline_bars[-1].close_price,
+            latest_date=kline_bars[-1].trade_date, latest_dif=macd.dif[-1],
+            latest_dea=macd.dea[-1], latest_macd=macd.macd[-1],
+            divergence_found=True, reversal_confirmed=False,
+            band_position_ok=False, detail={"divergence": divergence_result, "reversal": reversal_result},
+        )
+
+    # 第5步：波段位置判断
+    band_result = check_band_position(macd.dif, macd.dea, kline_bars)
+    band_position_ok = band_result.get("ok", False)
+
+    if debug:
+        print(f"  [{code}] 波段位置: {band_result}")
+
+    return ScreenResult(
+        code=code, passed=band_position_ok,
+        fail_reason="" if band_position_ok else f"波段位置未通过: {band_result}",
+        kline_count=len(kline_bars), latest_close=kline_bars[-1].close_price,
+        latest_date=kline_bars[-1].trade_date, latest_dif=macd.dif[-1],
+        latest_dea=macd.dea[-1], latest_macd=macd.macd[-1],
+        divergence_found=True, reversal_confirmed=True,
+        band_position_ok=band_position_ok,
+        detail={"divergence": divergence_result, "reversal": reversal_result, "band": band_result},
+    )
+
+
+# ============================================================================
 # 第七层：输出渲染层
 # 这一层负责把内部结构渲染成控制台摘要或 JSON 文本。
 # 后续大盘模块的控制台输出、debug JSON、Markdown 报告也会按这个思路分层。
@@ -2812,6 +3401,132 @@ def run_llm_text(args: argparse.Namespace, client: TdxClient) -> None:
     print(result["text"])
 
 
+def print_screener_summary(results: list[ScreenResult]) -> None:
+    """
+    打印选股结果摘要表格。
+
+    Args:
+        results: 全部股票的筛选结果列表。
+
+    Returns:
+        无返回值。
+    """
+    print("\n" + "=" * 72)
+    print("选股结果摘要")
+    print("=" * 72)
+
+    # 统计
+    total = len(results)
+    passed = sum(1 for r in results if r.passed)
+    divergence_count = sum(1 for r in results if r.divergence_found)
+    reversal_count = sum(1 for r in results if r.reversal_confirmed)
+
+    print(f"扫描: {total} 只 | 底背离: {divergence_count} | 趋势反转: {reversal_count} | 通过: {passed}")
+    print("-" * 72)
+
+    # 通过的股票
+    if passed > 0:
+        print("\n>>> 通过筛选")
+        print(f"{'代码':<8} {'K线':>4} {'最新价':>8} {'日期':<12} {'DIF':>8} {'DEA':>8} {'MACD':>8}")
+        print("-" * 72)
+        for r in results:
+            if r.passed:
+                print(f"{r.code:<8} {r.kline_count:>4} {r.latest_close:>8.2f} {r.latest_date:<12} {r.latest_dif:>8.3f} {r.latest_dea:>8.3f} {r.latest_macd:>8.3f}")
+
+    # 未通过的摘要
+    failed = [r for r in results if not r.passed]
+    if failed:
+        print(f"\n>>> 未通过 ({len(failed)} 只)")
+        print(f"{'代码':<8} {'K线':>4} {'阶段':<8} {'原因'}")
+        print("-" * 72)
+        for r in failed:
+            if not r.divergence_found:
+                stage = "底背离"
+            elif not r.reversal_confirmed:
+                stage = "趋势反转"
+            elif not r.band_position_ok:
+                stage = "波段位置"
+            else:
+                stage = "未知"
+            reason = r.fail_reason[:50] if r.fail_reason else ""
+            print(f"{r.code:<8} {r.kline_count:>4} {stage:<8} {reason}")
+
+
+def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
+    """
+    执行 `screener` 子命令，对股票池执行选股筛选。
+
+    Args:
+        args: 命令行参数对象。
+        client: 通达信客户端包装器。
+
+    Returns:
+        无返回值。
+    """
+    t0_total = time.perf_counter()
+
+    pool_size = args.pool_size
+    min_kline = args.min_kline
+    debug = args.debug
+
+    print(f"股票池大小: {pool_size} | 最小K线数: {min_kline}")
+
+    # 从 SQLite 读取股票池
+    print("\n>>> 从数据库加载股票池...")
+    codes = load_stock_codes_from_db(DAILY_KLINE_DB_PATH, pool_size, min_kline)
+    print(f"加载到 {len(codes)} 只股票")
+
+    if not codes:
+        print("股票池为空，退出。")
+        return
+
+    # 逐只筛选
+    print(f"\n>>> 开始筛选...")
+    results: list[ScreenResult] = []
+    for i, code in enumerate(codes, 1):
+        t0 = time.perf_counter()
+        result = run_screener_pipeline(client, code, debug)
+        elapsed = time.perf_counter() - t0
+        status = "通过" if result.passed else "未通过"
+        print(f"  [{i}/{len(codes)}] {code} - {status} ({elapsed:.1f}s) - {result.fail_reason}")
+        results.append(result)
+
+    # 打印摘要
+    print_screener_summary(results)
+
+    # 输出结果到 result/ 目录
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    result_path = RESULT_DIR / f"screener_{timestamp}.json"
+    result_data = {
+        "scan_time": timestamp,
+        "pool_size": len(codes),
+        "total_scanned": len(results),
+        "total_passed": sum(1 for r in results if r.passed),
+        "results": [
+            {
+                "code": r.code,
+                "passed": r.passed,
+                "fail_reason": r.fail_reason,
+                "kline_count": r.kline_count,
+                "latest_close": r.latest_close,
+                "latest_date": r.latest_date,
+                "latest_dif": r.latest_dif,
+                "latest_dea": r.latest_dea,
+                "latest_macd": r.latest_macd,
+                "divergence_found": r.divergence_found,
+                "reversal_confirmed": r.reversal_confirmed,
+                "band_position_ok": r.band_position_ok,
+            }
+            for r in results
+        ],
+    }
+    with result_path.open("w", encoding="utf-8") as f:
+        json.dump(result_data, f, ensure_ascii=False, indent=2)
+    print(f"\n结果已保存到: {result_path}")
+
+    print(f"\n[总耗时 {time.perf_counter() - t0_total:.1f}s]")
+
+
 def parse_args() -> argparse.Namespace:
     """
         解析命令行参数。
@@ -2826,6 +3541,12 @@ def parse_args() -> argparse.Namespace:
     market_parser.add_argument("--no-llm", action="store_true", help="跳过 market 中的 LLM 判断")
     market_parser.add_argument("--debug-llm", action="store_true", help="打印传给 LLM 的完整 prompt 和原始返回")
     market_parser.set_defaults(handler=run_market)
+
+    screener_parser = module_parsers.add_parser("screener", help="执行选股筛选")
+    screener_parser.add_argument("--pool-size", type=int, default=SCREENER_DEFAULT_POOL_SIZE, help=f"股票池大小，默认 {SCREENER_DEFAULT_POOL_SIZE}")
+    screener_parser.add_argument("--min-kline", type=int, default=SCREENER_MIN_KLINE_COUNT, help=f"最小K线数，默认 {SCREENER_MIN_KLINE_COUNT}")
+    screener_parser.add_argument("--debug", action="store_true", help="输出每只股票的详细筛选过程")
+    screener_parser.set_defaults(handler=run_screener)
 
     tdx_api_parser = module_parsers.add_parser("tdx_api", help="调用通达信 `tqcenter` 接口")
     tdx_api_subparsers = tdx_api_parser.add_subparsers(dest="tdx_action", required=True)
