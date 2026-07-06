@@ -132,8 +132,7 @@ SCREENER_DEFAULT_POOL_SIZE = 20
 SCREENER_PIVOT_LEFT_WINDOW = 5
 SCREENER_PIVOT_RIGHT_WINDOW = 5
 SCREENER_DIVERGENCE_MAX_INTERVAL = 40
-SCREENER_DIVERGENCE_RECENCY = 50
-SCREENER_RECENT_LOW_WINDOW = 10
+SCREENER_DIVERGENCE_RECENCY = 10
 SCREENER_CONSOLIDATION_AMPLITUDE_THRESHOLD = 0.08
 SCREENER_KISS_RATIO = 0.3
 SCREENER_HIGH_PULLBACK_THRESHOLD = 0.5
@@ -228,6 +227,7 @@ class ScreenResult:
     reversal_confirmed: bool
     band_position_ok: bool
     divergence_low_date: str
+    prev_divergence_low_date: str
     detail: dict[str, Any]
 
 
@@ -2391,7 +2391,7 @@ def check_bottom_divergence(
 
     最近低点不要求 pivot 确认，直接取最近 N 根 K 线的最低价位置，
     这样能更早发现背离信号，不用等右边 5 根 K 线确认。
-    前一个低点仍用 pivot low 确认，保证可靠性。
+    前一个低点仍用 pivot low 确认，保证它是一个已经成型的结构低点。
 
     Args:
         price_lows: 价格枢轴低点列表（用于取前一个低点）。
@@ -2409,10 +2409,8 @@ def check_bottom_divergence(
 
     prev_price_low = price_lows[-1]
 
-    # 最近低点：取最近 N 根 K 线的最低价位置，不要求 pivot 确认
-    recent_window = kline_bars[-SCREENER_RECENT_LOW_WINDOW:]
+    recent_window = kline_bars[-recency:]
     recent_low_value = min(bar.low_price for bar in recent_window)
-    # 找到最低价对应的 bar_index
     recent_start = total_bars - len(recent_window)
     latest_bar_index = recent_start
     for i, bar in enumerate(recent_window):
@@ -2426,7 +2424,7 @@ def check_bottom_divergence(
         value=recent_low_value,
     )
 
-    # 时效性约束：最近低点天然在最近 N 根内，这里检查是否超 recency
+    # 时效性约束：最近低点必须足够贴近最新 K 线
     bars_since_latest = total_bars - 1 - latest_bar_index
     if bars_since_latest > recency:
         return {"found": False, "reason": f"最近低点距今{bars_since_latest}根，超过{recency}根时效限制"}
@@ -2522,10 +2520,9 @@ def check_band_position(
     kline_bars: list[KlineBar],
 ) -> dict[str, Any]:
     """
-    判断波段位置：飞吻 + 排除高位回调 + 没有高位死叉。
+    判断波段位置：飞吻 + 没有高位死叉。
 
     飞吻：DIF 在零轴上方且小于绝对小值阈值（贴零轴）。
-    高位回调：DIF 从近期高点的回落幅度超过阈值则排除。
     高位死叉：DIF 从上方下穿 DEA 且 DIF 仍在较高位置则排除。
 
     Args:
@@ -2545,13 +2542,12 @@ def check_band_position(
     # 条件1：飞吻 —— DIF 在零轴上方且小于绝对阈值
     is_kiss = 0 < latest_dif < SCREENER_DIF_KISS_THRESHOLD
 
-    # 条件2：排除高位回调 —— DIF 从近期高点的回落幅度不超过阈值
+    # TODO: 后续重新设计“高位回调”判断，当前先移除，观察人工筛选结果。
     dif_recent_window = dif[-SCREENER_DIF_RECENT_WINDOW:]
     dif_high = max(dif_recent_window)
     pullback_ratio = (dif_high - latest_dif) / dif_high if dif_high > 0 else 0
-    not_high_pullback = pullback_ratio < SCREENER_HIGH_PULLBACK_THRESHOLD
 
-    # 条件3：没有出现高位死叉（DIF 从上方下穿 DEA 且 DIF 仍在较高位置）
+    # 条件2：没有出现高位死叉（DIF 从上方下穿 DEA 且 DIF 仍在较高位置）
     no_high_death_cross = True
     prev_dif = dif[-2]
     prev_dea = dea[-2]
@@ -2560,13 +2556,12 @@ def check_band_position(
     if prev_dif > prev_dea and curr_dif <= curr_dea and curr_dif > SCREENER_DIF_KISS_THRESHOLD:
         no_high_death_cross = False
 
-    ok = is_kiss and not_high_pullback and no_high_death_cross
+    ok = is_kiss and no_high_death_cross
 
     return {
         "ok": ok,
         "is_kiss": is_kiss,
         "latest_dif": latest_dif,
-        "not_high_pullback": not_high_pullback,
         "pullback_ratio": pullback_ratio,
         "no_high_death_cross": no_high_death_cross,
     }
@@ -2617,11 +2612,13 @@ def screen_single_stock(
             latest_date=kline_bars[-1].trade_date, latest_dif=macd.dif[-1],
             latest_dea=macd.dea[-1], latest_macd=macd.macd[-1],
             divergence_found=False, reversal_confirmed=False,
-            band_position_ok=False, divergence_low_date="",
+            band_position_ok=False, divergence_low_date="", prev_divergence_low_date="",
             detail={"divergence": divergence_result},
         )
 
-    # 记录创新低的K线日期
+    # 记录底背离两个价格低点的K线日期
+    prev_divergence_low_date = divergence_result.get("prev_price_low", None)
+    prev_divergence_low_date = prev_divergence_low_date.trade_date if prev_divergence_low_date else ""
     divergence_low_date = divergence_result.get("latest_price_low", None)
     divergence_low_date = divergence_low_date.trade_date if divergence_low_date else ""
 
@@ -2640,6 +2637,7 @@ def screen_single_stock(
             latest_dea=macd.dea[-1], latest_macd=macd.macd[-1],
             divergence_found=True, reversal_confirmed=False,
             band_position_ok=False, divergence_low_date=divergence_low_date,
+            prev_divergence_low_date=prev_divergence_low_date,
             detail={"divergence": divergence_result, "reversal": reversal_result},
         )
 
@@ -2658,6 +2656,7 @@ def screen_single_stock(
         latest_dea=macd.dea[-1], latest_macd=macd.macd[-1],
         divergence_found=True, reversal_confirmed=True,
         band_position_ok=band_position_ok, divergence_low_date=divergence_low_date,
+        prev_divergence_low_date=prev_divergence_low_date,
         detail={"divergence": divergence_result, "reversal": reversal_result, "band": band_result},
     )
 
@@ -3576,7 +3575,7 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
                 kline_count=0, latest_close=0, latest_date="", latest_dif=0,
                 latest_dea=0, latest_macd=0, divergence_found=False,
                 reversal_confirmed=False, band_position_ok=False,
-                divergence_low_date="", detail={},
+                divergence_low_date="", prev_divergence_low_date="", detail={},
             )
             results.append(result)
             if i % 500 == 0:
@@ -3593,7 +3592,7 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
                 latest_date=kline_bars[-1].trade_date, latest_dif=0,
                 latest_dea=0, latest_macd=0, divergence_found=False,
                 reversal_confirmed=False, band_position_ok=False,
-                divergence_low_date="", detail={},
+                divergence_low_date="", prev_divergence_low_date="", detail={},
             )
             results.append(result)
             continue
@@ -3648,6 +3647,7 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
                 "reversal_confirmed": r.reversal_confirmed,
                 "band_position_ok": r.band_position_ok,
                 "divergence_low_date": r.divergence_low_date,
+                "prev_divergence_low_date": r.prev_divergence_low_date,
             }
             for r in results
         ],
