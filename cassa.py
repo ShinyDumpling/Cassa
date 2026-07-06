@@ -4400,12 +4400,11 @@ def collect_stock_info(
     try:
         more_info = client.get_more_info(stock_code, field_list=[])
         if more_info:
-            free_ltgb = float(more_info.get("FreeLtgb", 0) or 0)
             result["pe_dyna"] = float(more_info.get("DynaPE", 0) or 0)
             result["pe_ttm"] = float(more_info.get("StaticPE_TTM", 0) or 0)
             result["pb_mrq"] = float(more_info.get("PB_MRQ", 0) or 0)
             result["main_business"] = str(more_info.get("MainBusiness", "")).strip()
-            result["free_ltgb"] = free_ltgb
+            result["turnover_rate"] = float(more_info.get("fHSL", 0) or 0)
     except Exception:
         pass
 
@@ -4416,24 +4415,20 @@ def collect_stock_info(
             industries: list[str] = []
             concepts: list[str] = []
             for item in relations:
-                block_type = str(item.get("type", "")).lower()
-                block_name = str(item.get("name", "")).strip()
+                block_type = str(item.get("BlockType", "")).strip()
+                block_name = str(item.get("BlockName", "")).strip()
                 if not block_name:
                     continue
-                if block_type == "industry":
+                if block_type == "行业":
                     if block_name not in industries:
                         industries.append(block_name)
-                elif block_type == "theme" or block_type == "concept":
+                elif block_type == "概念":
                     if block_name not in concepts:
                         concepts.append(block_name)
             result["industry"] = "、".join(industries) if industries else ""
             result["concepts"] = concepts
     except Exception:
         pass
-
-    # 换手率 = 当日成交量 / 自由流通股本 * 100（由 run_report 传入当日成交量）
-    result["free_ltgb"] = result.get("free_ltgb", 0.0)
-    result["total_shares"] = result.get("total_shares", 0.0)
 
     return result
 
@@ -4602,12 +4597,7 @@ def run_report(args: argparse.Namespace, client: TdxClient) -> None:
         result.pe_ttm = stock_info_data.get("pe_ttm", 0.0)
         result.pb_mrq = stock_info_data.get("pb_mrq", 0.0)
         result.main_business = stock_info_data.get("main_business", "")
-
-        # 换手率 = 当日成交量 / 自由流通股本 * 100
-        free_ltgb = stock_info_data.get("free_ltgb", 0.0)
-        today_volume = kline_bars[-1].volume
-        if free_ltgb > 0:
-            result.turnover_rate = today_volume / free_ltgb * 100
+        result.turnover_rate = stock_info_data.get("turnover_rate", 0.0)
 
         print(format_trend_result(result))
 
