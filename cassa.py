@@ -35,6 +35,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import time
 from typing import Any
 
@@ -141,6 +142,9 @@ SCREENER_LOOKBACK_BARS_FOR_BREAK = 20
 SCREENER_DIF_RECENT_WINDOW = 40
 SCREENER_MACD_BATCH_COUNT = 150
 SCREENER_MACD_BATCH_CHUNK_SIZE = 500
+
+# ── 股票池常量 ──
+STOCK_POOL_DB_PATH = DATA_DIR / "stock_pool.db"
 
 # ── 趋势分析常量 ──
 TREND_MA_PERIODS = [5, 10, 20, 60]
@@ -4441,6 +4445,27 @@ def collect_stock_info(
     return result
 
 
+def load_observing_codes_from_pool() -> list[str]:
+    """从本地股票池读取所有 status='观察' 的纯数字股票代码。
+
+    Returns:
+        观察中的股票代码列表；如果数据库不存在或为空则返回空列表。
+    """
+    if not STOCK_POOL_DB_PATH.exists():
+        print(f"股票池数据库不存在: {STOCK_POOL_DB_PATH}")
+        return []
+
+    conn = sqlite3.connect(str(STOCK_POOL_DB_PATH))
+    try:
+        rows = conn.execute(
+            "SELECT code FROM stock_pool WHERE status = '观察' ORDER BY id DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return [row[0] for row in rows]
+
+
 def format_trend_result(result: TrendAnalysisResult) -> str:
     """把趋势分析结果格式化为控制台文本。
 
@@ -4523,18 +4548,29 @@ def run_report(args: argparse.Namespace, client: TdxClient) -> None:
     """执行 `report` 子命令，对指定股票生成个股趋势分析报告。
 
     流程：解析代码 → 逐只读 K 线 → 批量算 MACD → 逐只对齐 + 分析 → 打印结果。
+    支持 `--codes` 手动指定或 `--from-pool` 从股票池读取，两者互斥。
 
     Args:
-        args: 命令行参数对象，需包含 `codes`（逗号分隔）和可选 `debug`。
+        args: 命令行参数对象。
         client: 通达信客户端包装器。
     """
     t0_total = time.perf_counter()
 
-    # 1. 解析股票代码
-    raw_codes = [c.strip() for c in args.codes.split(",") if c.strip()]
-    if not raw_codes:
-        print("未指定股票代码。")
-        return
+    # 1. 解析股票代码：--from-pool 或 --codes
+    if args.from_pool:
+        raw_codes = load_observing_codes_from_pool()
+        if not raw_codes:
+            print("股票池中没有观察中的股票。")
+            return
+        print(f"从股票池加载 {len(raw_codes)} 只观察中的股票\n")
+    else:
+        if not args.codes:
+            print("请使用 --codes 或 --from-pool 指定股票。")
+            return
+        raw_codes = [c.strip() for c in args.codes.split(",") if c.strip()]
+        if not raw_codes:
+            print("未指定股票代码。")
+            return
 
     print(f"个股趋势报告：{len(raw_codes)} 只股票\n")
 
@@ -4661,7 +4697,8 @@ def parse_args() -> argparse.Namespace:
     screener_parser.set_defaults(handler=run_screener)
 
     report_parser = module_parsers.add_parser("report", help="个股趋势分析报告")
-    report_parser.add_argument("--codes", required=True, help="股票代码，逗号分隔，例如 000001,600519")
+    report_parser.add_argument("--codes", help="股票代码，逗号分隔，例如 000001,600519")
+    report_parser.add_argument("--from-pool", action="store_true", help="从股票池读取观察中的股票")
     report_parser.add_argument("--debug", action="store_true", help="输出完整分析字段")
     report_parser.set_defaults(handler=run_report)
 
