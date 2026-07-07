@@ -53,6 +53,7 @@
 | T037 | done | 个股报告 CLI 入口与数据采集 | `python cassa.py report --codes` 支持；采集基本信息/当日行情/换手率/基本面/行业概念/资金面 | 新增 `extract_today_quote` / `collect_stock_info` / `format_trend_result` / `run_report`；接口坑点：BlockType/BlockName 首字母大写、换手率直接用 fHSL |
 | T038 | todo | 接入 LLM 做个股预期判断 | 在现有纯规则事实基础上，拼 prompt 调 LLM，输出预期方向/成立信号/失效信号/关键价位/风险 | 依赖 T022 公共 LLM 接入层已就绪；设计参考 DSA stock_expectation 的输出结构，合并报告+预期为一步 |
 | T039 | todo | 全量接入通达信接口数据 | 把 stock_info / more_info / snapshot 等接口的全量字段都纳入个股报告 | 当前只取了部分字段，很多有价值的数据（如涨停价/跌停价/封单等）未接入 |
+| T040 | done | 更新 AGENTS.md 协作规则与 context 书写规范 | 在 AGENTS.md 中新增：1. 每次提交前必须更新对应 context 文件；2. context 文件必须详细记录功能实现、代码设计、TODO、接口坑点、测试验证、输出示例等 | 已同步更新 `context/2026-07-03-cassa-project-init.md` 和 `context/README.md` |
 
 ## 待整理 / 收件箱
 
