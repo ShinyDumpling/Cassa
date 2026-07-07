@@ -4747,7 +4747,7 @@ def format_trend_result(result: TrendAnalysisResult) -> str:
     # 量能 + MACD + RSI 行
     turnover_str = f"  换手: {result.turnover_rate:.1f}%" if result.turnover_rate > 0 else ""
     lines.append(
-        f"量能: {result.volume_status} ({result.volume_ratio:.2f}x)      "
+        f"量能: {result.volume_status} ({result.volume_ratio:.2f})      "
         f"MACD: {result.macd_status}    RSI: {result.rsi_status}({result.rsi_12:.0f})"
         f"{turnover_str}"
     )
