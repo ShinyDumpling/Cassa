@@ -4059,6 +4059,9 @@ def judge_volume_status(
         return "量能正常", 0.0, "数据不足"
 
     current_vol = volumes[-1]
+    # 盘中数据（volume=0）：fallback 到前一根完整日数据
+    if current_vol == 0 and len(volumes) >= 2:
+        current_vol = volumes[-2]
     avg_5d = sum(volumes[-6:-1]) / 5
     ratio = current_vol / avg_5d if avg_5d > 0 else 0.0
 
@@ -4526,21 +4529,22 @@ def append_today_kline(
     high_val = float(snapshot.get("Max", 0) or 0)
     low_val = float(snapshot.get("Min", 0) or 0)
     close_val = float(now_val)
-    volume_val = float(snapshot.get("Volume", 0) or 0)
-    amount_val = float(snapshot.get("Amount", 0) or 0)
+    # snapshot 的 volume/amount 为盘中累计值，不覆盖 DB 已有完整日数据；
+    # 仅在新追加 K 线（DB 无今日数据）时用作占位。
+    snap_volume = float(snapshot.get("Volume", 0) or 0)
+    snap_amount = float(snapshot.get("Amount", 0) or 0)
 
     today_str = datetime.now().strftime("%Y-%m-%d")
 
     if kline_bars and kline_bars[-1].trade_date == today_str:
-        # 已有今日 K 线，更新为最新实时数据
+        # 已有今日 K 线，只更新价格字段，保留 DB 原有完整日 volume/amount
         kline_bars[-1].open_price = open_val
         kline_bars[-1].high_price = high_val
         kline_bars[-1].low_price = low_val
         kline_bars[-1].close_price = close_val
-        kline_bars[-1].volume = volume_val
-        kline_bars[-1].amount = amount_val
     else:
-        # 没有今日 K 线，追加一根
+        # 没有今日 K 线，用 snapshot 价格 + 0 占位 volume 追加一根；
+        # volume 填 0 表示盘中数据，judge_volume_status 会 fallback 到前一日完整量。
         kline_bars.append(
             KlineBar(
                 trade_date=today_str,
@@ -4548,8 +4552,8 @@ def append_today_kline(
                 high_price=high_val,
                 low_price=low_val,
                 close_price=close_val,
-                volume=volume_val,
-                amount=amount_val,
+                volume=0.0,
+                amount=0.0,
             )
         )
 
