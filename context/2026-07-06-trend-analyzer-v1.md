@@ -124,6 +124,32 @@ python cassa.py report --codes 000001,600519 [--debug]
 - `FreeLtgb` 单位是万股，和 K 线 volume（股）差 10000 倍，不能自己算换手率
 - 换手率直接用 more_info 的 `fHSL` 字段
 - `Zjl` 是主买净额（万元），`Zjl_HB` 是主力净流入（万元）
+- **snapshot 接口没有日期字段**，追加今日 K 线时用系统日期 `datetime.now()` 判断是否是今天；周末/节假日 snapshot 返回的是上一交易日数据，此时 DB 最后一根已是最新交易日，不会重复追加
+- **DB K 线不是实时数据**（每天下午手动更新），`extract_today_quote` 和 `current_price` 等字段必须从实时 snapshot 取，不能从 DB K 线取；均线/RSI/量能等历史指标通过 DB K 线 + `append_today_kline` 追加实时快照后计算
+
+### 数据源方案（2026-07-06 修复）
+
+| 数据 | 来源 | 说明 |
+|------|------|------|
+| 现价 | snapshot.Now | 实时 |
+| 今开/最高/最低/昨收 | snapshot.Open/Max/Min/LastClose | 实时 |
+| 涨跌额/涨幅/振幅 | snapshot 计算 | 实时 |
+| 换手率 | more_info.fHSL | 实时（一直如此） |
+| PE/PB/资金面 | more_info | 实时（一直如此） |
+| 名称/行业/概念 | stock_info/relation | 实时（一直如此） |
+| MA/RSI/量能/支撑压力 | DB K线 + `append_today_kline` 追加实时快照 | 历史指标用 DB，最新点用实时 |
+| MACD | 通达信公式引擎 | 本身实时 |
+
+修复在分支 `fix/report-realtime-snapshot` 完成。
+
+### 验证结果
+
+```bash
+python cassa.py report --codes 600030
+```
+
+修复前：现价 29.23（DB 中的昨日收盘价）
+修复后：现价 28.45（实时快照最新价，实际跌幅 -2.67%）
 
 ## TODO
 

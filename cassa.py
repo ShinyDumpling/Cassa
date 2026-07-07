@@ -4479,17 +4479,94 @@ def analyze_stock_trend(
     )
 
 
-def extract_today_quote(kline_bars: list[KlineBar]) -> dict[str, float]:
-    """从最后两根 K 线提取当日完整行情。
+def fetch_realtime_snapshot(
+    client: TdxClient,
+    stock_code: StockCode,
+) -> dict[str, Any]:
+    """通过通达信 snapshot 接口获取个股实时行情快照。
 
     Args:
-        kline_bars: K 线序列，按时间从早到晚。
+        client: 通达信客户端包装器。
+        stock_code: 已规整的股票代码对象。
+
+    Returns:
+        包含 LastClose / Open / Max / Min / Now / Volume / Amount 的字典，
+        字段名与接口返回一致；如果接口调用失败则返回空字典。
+    """
+    try:
+        raw = client.get_market_snapshot(stock_code)
+        if not raw:
+            return {}
+        return raw
+    except Exception:
+        return {}
+
+
+def append_today_kline(
+    kline_bars: list[KlineBar],
+    snapshot: dict[str, Any],
+) -> list[KlineBar]:
+    """在数据库 K 线末尾追加或更新今日 K 线。
+
+    如果数据库最后一根 K 线的日期已经是今天（上次更新已包含今日数据），
+    则用 snapshot 更新最后一根；否则用 snapshot 新建一根追加到末尾。
+
+    Args:
+        kline_bars: 从 SQLite 读出的历史 K 线序列，按时间从早到晚。
+        snapshot: fetch_realtime_snapshot 返回的实时行情。
+
+    Returns:
+        更新后的 K 线序列（可能原地修改了最后一根，也可能追加了一根）。
+    """
+    now_val = snapshot.get("Now")
+    if not now_val or float(now_val) <= 0:
+        return kline_bars
+
+    open_val = float(snapshot.get("Open", 0) or 0)
+    high_val = float(snapshot.get("Max", 0) or 0)
+    low_val = float(snapshot.get("Min", 0) or 0)
+    close_val = float(now_val)
+    volume_val = float(snapshot.get("Volume", 0) or 0)
+    amount_val = float(snapshot.get("Amount", 0) or 0)
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    if kline_bars and kline_bars[-1].trade_date == today_str:
+        # 已有今日 K 线，更新为最新实时数据
+        kline_bars[-1].open_price = open_val
+        kline_bars[-1].high_price = high_val
+        kline_bars[-1].low_price = low_val
+        kline_bars[-1].close_price = close_val
+        kline_bars[-1].volume = volume_val
+        kline_bars[-1].amount = amount_val
+    else:
+        # 没有今日 K 线，追加一根
+        kline_bars.append(
+            KlineBar(
+                trade_date=today_str,
+                open_price=open_val,
+                high_price=high_val,
+                low_price=low_val,
+                close_price=close_val,
+                volume=volume_val,
+                amount=amount_val,
+            )
+        )
+
+    return kline_bars
+
+
+def extract_today_quote(snapshot: dict[str, Any]) -> dict[str, float]:
+    """从实时 snapshot 快照提取当日完整行情。
+
+    Args:
+        snapshot: fetch_realtime_snapshot 返回的实时行情字典。
 
     Returns:
         包含当日行情字段的字典：today_open / today_high / today_low /
         yesterday_close / price_change / price_change_pct / amplitude。
     """
-    result = {
+    result: dict[str, float] = {
         "today_open": 0.0,
         "today_high": 0.0,
         "today_low": 0.0,
@@ -4498,21 +4575,26 @@ def extract_today_quote(kline_bars: list[KlineBar]) -> dict[str, float]:
         "price_change_pct": 0.0,
         "amplitude": 0.0,
     }
-    if len(kline_bars) < 2:
+
+    if not snapshot:
         return result
 
-    today = kline_bars[-1]
-    yesterday = kline_bars[-2]
+    last_close = float(snapshot.get("LastClose", 0) or 0)
+    today_open = float(snapshot.get("Open", 0) or 0)
+    today_high = float(snapshot.get("Max", 0) or 0)
+    today_low = float(snapshot.get("Min", 0) or 0)
+    now = float(snapshot.get("Now", 0) or 0)
 
-    result["today_open"] = today.open_price
-    result["today_high"] = today.high_price
-    result["today_low"] = today.low_price
-    result["yesterday_close"] = yesterday.close_price
+    if last_close <= 0 or now <= 0:
+        return result
 
-    change = today.close_price - yesterday.close_price
-    result["price_change"] = change
-    result["price_change_pct"] = change / yesterday.close_price * 100 if yesterday.close_price > 0 else 0.0
-    result["amplitude"] = (today.high_price - today.low_price) / yesterday.close_price * 100 if yesterday.close_price > 0 else 0.0
+    result["today_open"] = today_open
+    result["today_high"] = today_high
+    result["today_low"] = today_low
+    result["yesterday_close"] = last_close
+    result["price_change"] = now - last_close
+    result["price_change_pct"] = (now - last_close) / last_close * 100
+    result["amplitude"] = (today_high - today_low) / last_close * 100
 
     return result
 
@@ -4764,13 +4846,19 @@ def run_report(args: argparse.Namespace, client: TdxClient) -> None:
         return
     print(f"MACD 计算完成，耗时 {time.perf_counter() - t0_macd:.1f}s\n")
 
-    # 4. 逐只对齐 + 分析 + 打印
+    # 4. 逐只：取实时快照 → 追加今日K线 → 对齐MACD → 分析 → 打印
     for i, (internal_code, kline_bars) in enumerate(kline_map.items()):
         tdx_code = to_tdx_stock_code(internal_code)
         macd_raw = macd_batch.get(tdx_code)
         if not macd_raw:
             print(f"=== {internal_code} ===\n  MACD 数据缺失，跳过\n")
             continue
+
+        # 取实时快照并追加今日 K 线
+        stock_code_obj = normalize_stock_code(internal_code)
+        snapshot = fetch_realtime_snapshot(client, stock_code_obj)
+        if snapshot:
+            kline_bars = append_today_kline(kline_bars, snapshot)
 
         macd_result = align_macd_with_kline(kline_bars, macd_raw)
         if macd_result is None:
@@ -4779,8 +4867,8 @@ def run_report(args: argparse.Namespace, client: TdxClient) -> None:
 
         result = analyze_stock_trend(internal_code, kline_bars, macd_result)
 
-        # 采集基本信息、当日行情、换手率、基本面
-        today_quote = extract_today_quote(kline_bars)
+        # 采集基本信息、当日行情（从实时快照）、换手率、基本面
+        today_quote = extract_today_quote(snapshot)
         result.today_open = today_quote["today_open"]
         result.today_high = today_quote["today_high"]
         result.today_low = today_quote["today_low"]
@@ -4789,7 +4877,12 @@ def run_report(args: argparse.Namespace, client: TdxClient) -> None:
         result.price_change_pct = today_quote["price_change_pct"]
         result.amplitude = today_quote["amplitude"]
 
-        stock_code_obj = normalize_stock_code(internal_code)
+        # 现价用实时快照覆盖
+        if snapshot:
+            now_val = float(snapshot.get("Now", 0) or 0)
+            if now_val > 0:
+                result.current_price = now_val
+
         stock_info_data = collect_stock_info(client, stock_code_obj)
         result.name = stock_info_data.get("name", "")
         result.industry = stock_info_data.get("industry", "")
