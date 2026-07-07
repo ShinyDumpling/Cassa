@@ -38,7 +38,7 @@ import os
 from pathlib import Path
 import sqlite3
 import time
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from tqcenter import tq
@@ -143,6 +143,7 @@ SCREENER_LOOKBACK_BARS_FOR_BREAK = 20
 SCREENER_DIF_RECENT_WINDOW = 40
 SCREENER_MACD_BATCH_COUNT = 150
 SCREENER_MACD_BATCH_CHUNK_SIZE = 500
+SCREENER_DEFAULT_STRATEGY = "breakout_pre_entry"
 
 # ── 股票池常量 ──
 STOCK_POOL_DB_PATH = DATA_DIR / "stock_pool.db"
@@ -248,6 +249,21 @@ class ScreenResult:
     divergence_low_date: str
     prev_divergence_low_date: str
     detail: dict[str, Any]
+
+
+@dataclass
+class ScreenerStockData:
+    """单只股票经过主流程规整后的策略输入。
+
+    Attributes:
+        code: 纯数字股票代码。
+        kline_bars: 按交易日期升序排列的日 K 数据。
+        indicators: 已与 K 线对齐的指标结果，键名使用稳定英文标识。
+    """
+
+    code: str
+    kline_bars: list[KlineBar]
+    indicators: dict[str, Any]
 
 
 @dataclass
@@ -2309,8 +2325,65 @@ def collect_key_sector_member_snapshot(client: TdxClient, key_blocks: list[dict[
 
 
 # ============================================================================
-# 第六层补充：选股模块 —— SQLite 数据读取 + MACD 计算 + 筛选逻辑
-# 这一块负责从本地 SQLite 读取 K 线、喂给通达信公式引擎算 MACD、执行三步筛选。
+# 第六层补充：选股模块 —— 公共数据中心 + SQLite 读取 + MACD 计算 + 筛选逻辑
+# ============================================================================
+
+
+class CassaDataCenter:
+    """统一提供 Cassa 各业务需要的公共行情与股票数据。
+
+    第一版只包装已有数据读取能力，不在这里实现选股规则，也不缓存复杂业务状态。
+    """
+
+    def __init__(self, client: TdxClient):
+        self.client = client
+
+    def get_stock_codes(
+        self,
+        pool_size: int,
+        min_kline: int,
+    ) -> list[str]:
+        """从本地日 K 数据库读取可扫描股票代码。"""
+        return load_stock_codes_from_db(
+            DAILY_KLINE_DB_PATH,
+            pool_size,
+            min_kline,
+        )
+
+    def get_daily_klines(
+        self,
+        code: str,
+        min_kline: int,
+    ) -> list[KlineBar] | None:
+        """读取单只股票按日期升序排列的日 K。"""
+        return load_daily_kline_from_db(
+            DAILY_KLINE_DB_PATH,
+            code,
+            min_kline,
+        )
+
+    def calculate_macd_batch(
+        self,
+        codes: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """通过通达信公式引擎批量计算股票 MACD。"""
+        tdx_codes = [to_tdx_stock_code(code) for code in codes]
+        return self.client.calculate_macd_batch(
+            tdx_codes=tdx_codes,
+            count=SCREENER_MACD_BATCH_COUNT,
+            chunk_size=SCREENER_MACD_BATCH_CHUNK_SIZE,
+        )
+
+    def get_stock_name(self, code: str) -> str:
+        """读取股票名称，供公共过滤和展示使用。"""
+        stock_code = normalize_stock_code(code)
+        stock_info = self.client.get_stock_info(stock_code, field_list=["Name"])
+        return str(stock_info.get("Name", ""))
+
+
+# ============================================================================
+# 第六层补充续：SQLite 数据读取函数
+# 这一块负责从本地 SQLite 读取 K 线。
 # ============================================================================
 
 def load_stock_codes_from_db(
@@ -2677,26 +2750,58 @@ def check_band_position(
     }
 
 
-def screen_single_stock(
+def create_failed_screen_result(
     code: str,
-    kline_bars: list[KlineBar],
-    macd: MacdResult,
+    fail_reason: str,
+    kline_bars: list[KlineBar] | None = None,
+    macd: MacdResult | None = None,
+) -> ScreenResult:
+    """构造数据缺失或前置条件失败时的统一选股结果。"""
+    latest_bar = kline_bars[-1] if kline_bars else None
+
+    return ScreenResult(
+        code=code,
+        passed=False,
+        fail_reason=fail_reason,
+        kline_count=len(kline_bars) if kline_bars else 0,
+        latest_close=latest_bar.close_price if latest_bar else 0,
+        latest_date=latest_bar.trade_date if latest_bar else "",
+        latest_dif=macd.dif[-1] if macd and macd.dif else 0,
+        latest_dea=macd.dea[-1] if macd and macd.dea else 0,
+        latest_macd=macd.macd[-1] if macd and macd.macd else 0,
+        divergence_found=False,
+        reversal_confirmed=False,
+        band_position_ok=False,
+        divergence_low_date="",
+        prev_divergence_low_date="",
+        detail={},
+    )
+
+
+def screen_strategy_breakout_pre_entry(
+    stock_data: ScreenerStockData,
     debug: bool = False,
 ) -> ScreenResult:
-    """
-    对单只股票执行纯筛选逻辑（底背离 + 趋势反转 + 波段位置）。
-
-    数据加载和 MACD 计算由调用方完成，本函数只做筛选判断。
+    """执行"突破前入场"选股策略。
 
     Args:
-        code: 纯数字股票代码。
-        kline_bars: 已从 SQLite 加载的 K 线列表。
-        macd: 已对齐的 MACD 结果。
-        debug: 是否在控制台打印详细筛选过程。
+        stock_data: 主流程已经准备并对齐的单股数据。
+        debug: 是否打印该股票的策略判断细节。
 
     Returns:
-        选股筛选结果对象。
+        该股票的筛选结果。
     """
+    code = stock_data.code
+    kline_bars = stock_data.kline_bars
+    macd = stock_data.indicators.get("macd")
+
+    if not isinstance(macd, MacdResult):
+        return create_failed_screen_result(
+            code=code,
+            kline_bars=kline_bars,
+            fail_reason="策略输入缺少已对齐的 MACD 数据",
+        )
+
     dates = [bar.trade_date for bar in kline_bars]
 
     # 第3步：底背离检测
@@ -2769,6 +2874,11 @@ def screen_single_stock(
         prev_divergence_low_date=prev_divergence_low_date,
         detail={"divergence": divergence_result, "reversal": reversal_result, "band": band_result},
     )
+
+
+SCREENER_STRATEGIES: dict[str, Callable[[ScreenerStockData, bool], ScreenResult]] = {
+    "breakout_pre_entry": screen_strategy_breakout_pre_entry,
+}
 
 
 # ============================================================================
@@ -3574,18 +3684,19 @@ def run_llm_text(args: argparse.Namespace, client: TdxClient) -> None:
     print(result["text"])
 
 
-def print_screener_summary(results: list[ScreenResult]) -> None:
+def print_screener_summary(results: list[ScreenResult], strategy_name: str) -> None:
     """
     打印选股结果摘要表格。
 
     Args:
         results: 全部股票的筛选结果列表。
+        strategy_name: 当前使用的策略名称。
 
     Returns:
         无返回值。
     """
     print("\n" + "=" * 72)
-    print("选股结果摘要")
+    print(f"选股结果摘要 [{strategy_name}]")
     print("=" * 72)
 
     # 统计
@@ -3626,11 +3737,7 @@ def print_screener_summary(results: list[ScreenResult]) -> None:
 
 
 def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
-    """
-    执行 `screener` 子命令，对股票池执行选股筛选。
-
-    使用通达信批量公式接口一次性计算全部股票的 MACD，
-    再逐只对齐 K 线并执行三步筛选。
+    """按指定策略扫描股票池并输出结果。
 
     Args:
         args: 命令行参数对象。
@@ -3644,7 +3751,12 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
     pool_size = args.pool_size
     min_kline = args.min_kline
     debug = args.debug
+    strategy_name = args.strategy
 
+    data_center = CassaDataCenter(client)
+    strategy_func = SCREENER_STRATEGIES[strategy_name]
+
+    print(f"选股策略: {strategy_name}")
     if pool_size == 0:
         print(f"股票池: 全市场 | 最小K线数: {min_kline}")
     else:
@@ -3652,7 +3764,7 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
 
     # 第1步：从 SQLite 读取股票池
     print("\n>>> 1. 从数据库加载股票池...")
-    codes = load_stock_codes_from_db(DAILY_KLINE_DB_PATH, pool_size, min_kline)
+    codes = data_center.get_stock_codes(pool_size, min_kline)
     print(f"加载到 {len(codes)} 只股票")
 
     if not codes:
@@ -3662,13 +3774,8 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
     # 第2步：批量计算 MACD
     print(f"\n>>> 2. 批量计算 MACD（每批 {SCREENER_MACD_BATCH_CHUNK_SIZE} 只）...")
     t0_macd = time.perf_counter()
-    tdx_codes = [to_tdx_stock_code(code) for code in codes]
     try:
-        macd_batch = client.calculate_macd_batch(
-            tdx_codes=tdx_codes,
-            count=SCREENER_MACD_BATCH_COUNT,
-            chunk_size=SCREENER_MACD_BATCH_CHUNK_SIZE,
-        )
+        macd_batch = data_center.calculate_macd_batch(codes)
     except RuntimeError as exc:
         print(f"批量 MACD 计算失败: {exc}")
         return
@@ -3678,16 +3785,14 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
     print(f"\n>>> 3. 逐只筛选...")
     results: list[ScreenResult] = []
     for i, code in enumerate(codes, 1):
-        kline_bars = load_daily_kline_from_db(DAILY_KLINE_DB_PATH, code, min_kline)
+        kline_bars = data_center.get_daily_klines(code, min_kline)
         if kline_bars is None:
-            result = ScreenResult(
-                code=code, passed=False, fail_reason="K线数据不足",
-                kline_count=0, latest_close=0, latest_date="", latest_dif=0,
-                latest_dea=0, latest_macd=0, divergence_found=False,
-                reversal_confirmed=False, band_position_ok=False,
-                divergence_low_date="", prev_divergence_low_date="", detail={},
+            results.append(
+                create_failed_screen_result(
+                    code=code,
+                    fail_reason="K线数据不足",
+                )
             )
-            results.append(result)
             if i % 500 == 0:
                 print(f"  [{i}/{len(codes)}] 进度...")
             continue
@@ -3696,18 +3801,21 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
         macd_raw = macd_batch.get(tdx_code, {})
         macd = align_macd_with_kline(kline_bars, macd_raw)
         if macd is None:
-            result = ScreenResult(
-                code=code, passed=False, fail_reason="MACD数据缺失",
-                kline_count=len(kline_bars), latest_close=kline_bars[-1].close_price,
-                latest_date=kline_bars[-1].trade_date, latest_dif=0,
-                latest_dea=0, latest_macd=0, divergence_found=False,
-                reversal_confirmed=False, band_position_ok=False,
-                divergence_low_date="", prev_divergence_low_date="", detail={},
+            results.append(
+                create_failed_screen_result(
+                    code=code,
+                    kline_bars=kline_bars,
+                    fail_reason="MACD数据缺失",
+                )
             )
-            results.append(result)
             continue
 
-        result = screen_single_stock(code, kline_bars, macd, debug)
+        stock_data = ScreenerStockData(
+            code=code,
+            kline_bars=kline_bars,
+            indicators={"macd": macd},
+        )
+        result = strategy_func(stock_data, debug)
         status = "通过" if result.passed else "未通过"
         if result.passed or debug:
             print(f"  [{i}/{len(codes)}] {code} - {status} - {result.fail_reason}")
@@ -3721,9 +3829,7 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
         print(f"\n>>> 过滤 ST 股票（{len(passed_results)} 只待查）...")
         for r in passed_results:
             try:
-                stock_code = normalize_stock_code(r.code)
-                info = client.get_stock_info(stock_code, field_list=["Name"])
-                stock_name = str(info.get("Name", ""))
+                stock_name = data_center.get_stock_name(r.code)
                 if "ST" in stock_name:
                     r.passed = False
                     r.fail_reason = f"ST股票: {stock_name}"
@@ -3732,13 +3838,14 @@ def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
                 pass
 
     # 打印摘要
-    print_screener_summary(results)
+    print_screener_summary(results, strategy_name)
 
     # 输出结果到 result/ 目录
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    result_path = RESULT_DIR / f"screener_{timestamp}.json"
+    result_path = RESULT_DIR / f"screener_{strategy_name}_{timestamp}.json"
     result_data = {
         "scan_time": timestamp,
+        "strategy": strategy_name,
         "pool_size": len(codes),
         "total_scanned": len(results),
         "total_passed": sum(1 for r in results if r.passed),
@@ -4944,6 +5051,12 @@ def parse_args() -> argparse.Namespace:
     screener_parser.add_argument("--pool-size", type=int, default=0, help="股票池大小，0=全市场，默认 0")
     screener_parser.add_argument("--min-kline", type=int, default=SCREENER_MIN_KLINE_COUNT, help=f"最小K线数，默认 {SCREENER_MIN_KLINE_COUNT}")
     screener_parser.add_argument("--debug", action="store_true", help="输出每只股票的详细筛选过程")
+    screener_parser.add_argument(
+        "--strategy",
+        choices=sorted(SCREENER_STRATEGIES),
+        default=SCREENER_DEFAULT_STRATEGY,
+        help=f"选股策略，默认 {SCREENER_DEFAULT_STRATEGY}",
+    )
     screener_parser.set_defaults(handler=run_screener)
 
     stock_pool_parser = module_parsers.add_parser("stock_pool", help="股票池管理")
