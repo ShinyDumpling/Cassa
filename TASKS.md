@@ -54,6 +54,7 @@
 | T038 | todo | 接入 LLM 做个股预期判断 | 在现有纯规则事实基础上，拼 prompt 调 LLM，输出预期方向/成立信号/失效信号/关键价位/风险 | 依赖 T022 公共 LLM 接入层已就绪；设计参考 DSA stock_expectation 的输出结构，合并报告+预期为一步 |
 | T039 | todo | 全量接入通达信接口数据 | 把 stock_info / more_info / snapshot 等接口的全量字段都纳入个股报告 | 当前只取了部分字段，很多有价值的数据（如涨停价/跌停价/封单等）未接入 |
 | T040 | done | 更新 AGENTS.md 协作规则与 context 书写规范 | 在 AGENTS.md 中新增：1. 每次提交前必须更新对应 context 文件；2. context 文件必须详细记录功能实现、代码设计、TODO、接口坑点、测试验证、输出示例等 | 已同步更新 `context/2026-07-03-cassa-project-init.md` 和 `context/README.md` |
+| T041 | todo | 将 screener 改造为可选择的多策略结构 | 在保持单文件的前提下，增加轻量公共数据中心、统一策略输入、具名策略函数、策略注册表和 `--strategy` 参数；选股主流程负责取数与规整，策略函数只负责纯判断 | 完整设计、代码签名、兼容边界、实施顺序和验证方案见 `context/2026-07-07-screener-multi-strategy-architecture.md`；第一轮只做结构改造，不改变当前突破前入场策略口径 |
 
 ## 待整理 / 收件箱
 
