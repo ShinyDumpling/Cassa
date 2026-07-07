@@ -276,6 +276,7 @@ class TrendAnalysisResult:
     # 量能
     volume_status: str = ""
     volume_ratio_5d: float = 0.0
+    volume_ratio: float = 0.0       # 通达信 fLianB 量比
     volume_trend: str = ""
     # 支撑压力
     support_ma5: bool = False
@@ -4043,28 +4044,22 @@ def calculate_bias(price: float, ma5: float, ma10: float, ma20: float) -> tuple[
 
 
 def judge_volume_status(
-    volumes: list[float],
     closes: list[float],
+    volume_ratio: float,
 ) -> tuple[str, float, str]:
-    """分析量能状态，对齐 DSA _analyze_volume 逻辑。
+    """分析量能状态，量比直接使用通达信 more_info 接口的 fLianB。
 
     Args:
-        volumes: 成交量序列。
         closes: 收盘价序列。
+        volume_ratio: 通达信接口量比。
 
     Returns:
-        (量能状态, 5日量比, 量能趋势描述)。
+        (量能状态, 量比, 量能趋势描述)。
     """
-    if len(volumes) < 6:
+    if volume_ratio <= 0:
         return "量能正常", 0.0, "数据不足"
 
-    current_vol = volumes[-1]
-    # 盘中数据（volume=0）：fallback 到前一根完整日数据
-    if current_vol == 0 and len(volumes) >= 2:
-        current_vol = volumes[-2]
-    avg_5d = sum(volumes[-6:-1]) / 5
-    ratio = current_vol / avg_5d if avg_5d > 0 else 0.0
-
+    ratio = volume_ratio
     prev_close = closes[-2]
     price_change = (closes[-1] - prev_close) / prev_close * 100 if prev_close > 0 else 0.0
 
@@ -4373,6 +4368,7 @@ def analyze_stock_trend(
     code: str,
     kline_bars: list[KlineBar],
     macd_result: MacdResult,
+    volume_ratio: float = 0.0,
 ) -> TrendAnalysisResult:
     """个股趋势分析主入口，对齐 DSA StockTrendAnalyzer.analyze 逻辑。
 
@@ -4407,7 +4403,7 @@ def analyze_stock_trend(
     bias_ma5, bias_ma10, bias_ma20 = calculate_bias(current_price, ma5, ma10, ma20)
 
     # 量能
-    volume_status, volume_ratio_5d, volume_trend = judge_volume_status(volumes, closes)
+    volume_status, volume_ratio_5d, volume_trend = judge_volume_status(closes, volume_ratio)
 
     # 支撑压力
     support_ma5, support_ma10, support_levels, resistance_levels = judge_support_resistance(
@@ -4629,6 +4625,7 @@ def collect_stock_info(
         "pe_ttm": 0.0,
         "pb_mrq": 0.0,
         "main_business": "",
+        "volume_ratio": 0.0,
         "net_buy_amount": 0.0,
         "main_net_inflow": 0.0,
     }
@@ -4651,6 +4648,7 @@ def collect_stock_info(
             result["pb_mrq"] = float(more_info.get("PB_MRQ", 0) or 0)
             result["main_business"] = str(more_info.get("MainBusiness", "")).strip()
             result["turnover_rate"] = float(more_info.get("fHSL", 0) or 0)
+            result["volume_ratio"] = float(more_info.get("fLianB", 0) or 0)
             result["net_buy_amount"] = float(more_info.get("Zjl", 0) or 0)
             result["main_net_inflow"] = float(more_info.get("Zjl_HB", 0) or 0)
     except Exception:
@@ -4749,7 +4747,7 @@ def format_trend_result(result: TrendAnalysisResult) -> str:
     # 量能 + MACD + RSI 行
     turnover_str = f"  换手: {result.turnover_rate:.1f}%" if result.turnover_rate > 0 else ""
     lines.append(
-        f"量能: {result.volume_status} ({result.volume_ratio_5d:.2f}x)      "
+        f"量能: {result.volume_status} ({result.volume_ratio:.2f}x)      "
         f"MACD: {result.macd_status}    RSI: {result.rsi_status}({result.rsi_12:.0f})"
         f"{turnover_str}"
     )
@@ -4869,7 +4867,12 @@ def run_report(args: argparse.Namespace, client: TdxClient) -> None:
             print(f"=== {internal_code} ===\n  MACD 对齐失败，跳过\n")
             continue
 
-        result = analyze_stock_trend(internal_code, kline_bars, macd_result)
+        # 先取 more_info 拿到通达信量比（fLianB），传给趋势分析
+        stock_info_data = collect_stock_info(client, stock_code_obj)
+        vol_ratio = stock_info_data.get("volume_ratio", 0.0)
+
+        result = analyze_stock_trend(internal_code, kline_bars, macd_result, vol_ratio)
+        result.volume_ratio = vol_ratio
 
         # 采集基本信息、当日行情（从实时快照）、换手率、基本面
         today_quote = extract_today_quote(snapshot)
@@ -4887,7 +4890,7 @@ def run_report(args: argparse.Namespace, client: TdxClient) -> None:
             if now_val > 0:
                 result.current_price = now_val
 
-        stock_info_data = collect_stock_info(client, stock_code_obj)
+        # 其余 collect_stock_info 字段直接填回 result
         result.name = stock_info_data.get("name", "")
         result.industry = stock_info_data.get("industry", "")
         result.concepts = stock_info_data.get("concepts", [])
