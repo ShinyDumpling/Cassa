@@ -55,6 +55,7 @@
 | T039 | todo | 全量接入通达信接口数据 | 把 stock_info / more_info / snapshot 等接口的全量字段都纳入个股报告 | 当前只取了部分字段，很多有价值的数据（如涨停价/跌停价/封单等）未接入 |
 | T040 | done | 更新 AGENTS.md 协作规则与 context 书写规范 | 在 AGENTS.md 中新增：1. 每次提交前必须更新对应 context 文件；2. context 文件必须详细记录功能实现、代码设计、TODO、接口坑点、测试验证、输出示例等 | 已同步更新 `context/2026-07-03-cassa-project-init.md` 和 `context/README.md` |
 | T041 | todo | 将 screener 改造为可选择的多策略结构 | 在保持单文件的前提下，增加轻量公共数据中心、统一策略输入、具名策略函数、策略注册表和 `--strategy` 参数；选股主流程负责取数与规整，策略函数只负责纯判断 | 完整设计、代码签名、兼容边界、实施顺序和验证方案见 `context/2026-07-07-screener-multi-strategy-architecture.md`；第一轮只做结构改造，不改变当前突破前入场策略口径 |
+| T042 | doing | 板块内选股第一版：sector_pick 四维分类 + 成交量 TOP5 | 在 `feat/sector-pick` 分支上实现 `python cassa.py sector_pick --block-code <code>` 命令；根据板块趋势区间对成分股做四维分类（领先启动/滞后补涨/涨幅前列/高弹性）+ 成交量 TOP5 | 代码已完成编写与多轮调试（952行新增），待补充 context 文件后提交 | | 在保持单文件的前提下，增加轻量公共数据中心、统一策略输入、具名策略函数、策略注册表和 `--strategy` 参数；选股主流程负责取数与规整，策略函数只负责纯判断 | 完整设计、代码签名、兼容边界、实施顺序和验证方案见 `context/2026-07-07-screener-multi-strategy-architecture.md`；第一轮只做结构改造，不改变当前突破前入场策略口径 |
 
 ## 待整理 / 收件箱
 
