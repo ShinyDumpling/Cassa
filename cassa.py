@@ -326,6 +326,8 @@ class TrendAnalysisResult:
     amplitude: float = 0.0
     # 换手率
     turnover_rate: float = 0.0
+    # 总股本（万股，来自通达信 J_zgb）
+    total_shares: float = 0.0
     # 基本面
     pe_dyna: float = 0.0
     pe_ttm: float = 0.0
@@ -4860,11 +4862,18 @@ def format_trend_result(result: TrendAnalysisResult) -> str:
     )
 
     # 基本面行
-    if result.pe_dyna > 0 or result.pb_mrq > 0:
-        lines.append(
-            f"基本面: PE(动){result.pe_dyna:.1f}  PE(TTM){result.pe_ttm:.1f}  "
-            f"PB{result.pb_mrq:.2f}"
-        )
+    if result.pe_dyna > 0 or result.pb_mrq > 0 or result.total_shares > 0:
+        parts: list[str] = []
+        if result.pe_dyna > 0 or result.pb_mrq > 0:
+            parts.append(
+                f"PE(动){result.pe_dyna:.1f}  PE(TTM){result.pe_ttm:.1f}  "
+                f"PB{result.pb_mrq:.2f}"
+            )
+        if result.total_shares > 0 and result.current_price > 0:
+            market_cap = result.total_shares * result.current_price / 10000
+            parts.append(f"总市值{market_cap:.1f}亿")
+        if parts:
+            lines.append(f"基本面: {'  '.join(parts)}")
 
     # 资金面行
     if result.net_buy_amount != 0 or result.main_net_inflow != 0:
@@ -5006,6 +5015,7 @@ def run_report(args: argparse.Namespace, client: TdxClient) -> None:
         result.pb_mrq = stock_info_data.get("pb_mrq", 0.0)
         result.main_business = stock_info_data.get("main_business", "")
         result.turnover_rate = stock_info_data.get("turnover_rate", 0.0)
+        result.total_shares = stock_info_data.get("total_shares", 0.0)
         result.net_buy_amount = stock_info_data.get("net_buy_amount", 0.0)
         result.main_net_inflow = stock_info_data.get("main_net_inflow", 0.0)
 
