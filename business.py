@@ -21,6 +21,25 @@ MARKET_SUFFIXES = {"SH", "SZ", "BJ"}
 REPORT_HISTORY_COUNT = 120
 REPORT_WITH_REALTIME_COUNT = REPORT_HISTORY_COUNT + 1
 
+TREND_RSI_OVERBOUGHT = 70
+TREND_RSI_OVERSOLD = 30
+TREND_VOLUME_SHRINK_RATIO = 0.7
+TREND_VOLUME_HEAVY_RATIO = 1.5
+TREND_MA_SUPPORT_TOLERANCE = 0.02
+TREND_BIAS_THRESHOLD = 5.0
+TREND_STRONG_BULL_BIAS_RELAX = 1.5
+TREND_STRONG_BULL_STRENGTH_THRESHOLD = 70
+
+
+def safe_float(value, default=0.0):
+    """把接口返回值尽量转换成 float。"""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
 
 def has_market_suffix(code):
     """判断 code 是否已经带通达信市场后缀。"""
@@ -128,46 +147,12 @@ def resolve_report_codes(codes):
     return [resolve_report_code(code, sector_lookup) for code in codes]
 
 
-def safe_float(value, default=0.0):
-    """把接口返回值尽量转换成 float。"""
-    if value is None or value == "":
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def format_number(value, digits=2):
-    """格式化普通数字。"""
-    return f"{safe_float(value):.{digits}f}"
-
-
-def format_signed_percent(value):
-    """格式化带正负号的百分比。"""
-    return f"{safe_float(value):+.2f}%"
-
-
 def get_kline_value(row, *keys):
     """从不同命名风格的 K 线字典中读取数值。"""
     for key in keys:
         if key in row:
             return safe_float(row.get(key))
     return 0.0
-
-
-def calculate_average(values, period):
-    """计算最近 period 个值的平均数。"""
-    if len(values) < period or period <= 0:
-        return 0.0
-    return sum(values[-period:]) / period
-
-
-def calculate_bias(current_price, average_price):
-    """计算价格相对均线的乖离率。"""
-    if average_price <= 0:
-        return 0.0
-    return (current_price - average_price) / average_price * 100
 
 
 def map_relation_type(block_type):
@@ -190,22 +175,6 @@ def map_relation_rows(relation_rows):
         mapped_row["mapped_type"] = map_relation_type(mapped_row.get("BlockType"))
         mapped_rows.append(mapped_row)
     return mapped_rows
-
-
-def extract_industry_and_concepts(relation_rows):
-    """从所属板块数组中提取行业和概念名称。"""
-    industries = []
-    concepts = []
-    for row in relation_rows or []:
-        block_name = str(row.get("BlockName", "") or "").strip()
-        if not block_name:
-            continue
-        mapped_type = row.get("mapped_type") or map_relation_type(row.get("BlockType"))
-        if mapped_type == "industry" and block_name not in industries:
-            industries.append(block_name)
-        elif mapped_type == "concept" and block_name not in concepts:
-            concepts.append(block_name)
-    return "、".join(industries), concepts
 
 
 def collect_realtime_report_data(code):
@@ -334,6 +303,336 @@ def build_report_data(codes):
     }
 
 
+def calculate_sma(values, period):
+    """计算简单移动平均线，长度与输入一致。"""
+    result = []
+    for index in range(len(values)):
+        if index + 1 < period:
+            result.append(0.0)
+        else:
+            result.append(sum(values[index + 1 - period : index + 1]) / period)
+    return result
+
+
+def calculate_rsi(closes, period):
+    """计算 RSI 指标，复刻旧 cassa.py 的 Wilder's EMA / SMMA 口径。"""
+    if len(closes) < 2:
+        return [50.0] * len(closes)
+
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(delta, 0.0) for delta in deltas]
+    losses = [max(-delta, 0.0) for delta in deltas]
+    alpha = 1.0 / period
+    avg_gains = [0.0] * len(gains)
+    avg_losses = [0.0] * len(losses)
+
+    if gains:
+        avg_gains[0] = sum(gains[:period]) / period if len(gains) >= period else gains[0]
+        avg_losses[0] = sum(losses[:period]) / period if len(losses) >= period else losses[0]
+        for index in range(1, len(gains)):
+            avg_gains[index] = alpha * gains[index] + (1 - alpha) * avg_gains[index - 1]
+            avg_losses[index] = alpha * losses[index] + (1 - alpha) * avg_losses[index - 1]
+
+    rsi_values = [50.0]
+    for index in range(len(gains)):
+        if avg_losses[index] == 0:
+            rsi_values.append(100.0)
+        else:
+            rs = avg_gains[index] / avg_losses[index]
+            rsi_values.append(100.0 - 100.0 / (1.0 + rs))
+    return rsi_values
+
+
+def extract_close_values(item):
+    """从 daily_kline 中提取收盘价序列。"""
+    values = [
+        get_kline_value(row, "close_price", "Close", "close")
+        for row in item.get("daily_kline") or []
+    ]
+    return [value for value in values if value > 0]
+
+
+def extract_high_low_values(item):
+    """从 daily_kline 中提取高低点序列。"""
+    rows = item.get("daily_kline") or []
+    highs = [get_kline_value(row, "high_price", "High", "high") for row in rows]
+    lows = [get_kline_value(row, "low_price", "Low", "low") for row in rows]
+    return [value for value in highs if value > 0], [value for value in lows if value > 0]
+
+
+def judge_trend_status(ma5, ma10, ma20):
+    """根据最新均线值判断趋势状态，对齐旧 cassa.py 逻辑。"""
+    if len(ma5) < 6 or ma5[-1] == 0 or ma20[-1] == 0:
+        return "盘整", "均线数据不足", 50.0
+
+    cur_ma5, cur_ma10, cur_ma20 = ma5[-1], ma10[-1], ma20[-1]
+    prev_ma5, prev_ma20 = ma5[-6], ma20[-6]
+
+    if cur_ma5 > cur_ma10 > cur_ma20:
+        prev_spread = (prev_ma5 - prev_ma20) / prev_ma20 * 100 if prev_ma20 > 0 else 0
+        curr_spread = (cur_ma5 - cur_ma20) / cur_ma20 * 100
+        if curr_spread > prev_spread and curr_spread > 5:
+            return "强势多头", "强势多头排列，均线发散上行", 90.0
+        return "多头排列", "多头排列 MA5>MA10>MA20", 75.0
+
+    if cur_ma5 > cur_ma10 and cur_ma10 <= cur_ma20:
+        return "弱势多头", "弱势多头，MA5>MA10 但 MA10≤MA20", 55.0
+
+    if cur_ma5 < cur_ma10 < cur_ma20:
+        prev_spread = (prev_ma20 - prev_ma5) / prev_ma5 * 100 if prev_ma5 > 0 else 0
+        curr_spread = (cur_ma20 - cur_ma5) / cur_ma5 * 100
+        if curr_spread > prev_spread and curr_spread > 5:
+            return "强势空头", "强势空头排列，均线发散下行", 10.0
+        return "空头排列", "空头排列 MA5<MA10<MA20", 25.0
+
+    if cur_ma5 < cur_ma10 and cur_ma10 >= cur_ma20:
+        return "弱势空头", "弱势空头，MA5<MA10 但 MA10≥MA20", 40.0
+
+    return "盘整", "均线缠绕，趋势不明", 50.0
+
+
+def calculate_bias(price, ma5, ma10, ma20):
+    """计算 MA5 / MA10 / MA20 乖离率。"""
+    bias_ma5 = (price - ma5) / ma5 * 100 if ma5 > 0 else 0.0
+    bias_ma10 = (price - ma10) / ma10 * 100 if ma10 > 0 else 0.0
+    bias_ma20 = (price - ma20) / ma20 * 100 if ma20 > 0 else 0.0
+    return bias_ma5, bias_ma10, bias_ma20
+
+
+def judge_volume_status(closes, volume_ratio):
+    """分析量能状态，复刻旧 cassa.py 口径。"""
+    if volume_ratio <= 0 or len(closes) < 2:
+        return "量能正常", 0.0, "数据不足"
+
+    prev_close = closes[-2]
+    price_change = (closes[-1] - prev_close) / prev_close * 100 if prev_close > 0 else 0.0
+
+    if volume_ratio >= TREND_VOLUME_HEAVY_RATIO:
+        if price_change > 0:
+            return "放量上涨", volume_ratio, "放量上涨，多头力量强劲"
+        return "放量下跌", volume_ratio, "放量下跌，注意风险"
+    if volume_ratio <= TREND_VOLUME_SHRINK_RATIO:
+        if price_change > 0:
+            return "缩量上涨", volume_ratio, "缩量上涨，上攻动能不足"
+        return "缩量回调", volume_ratio, "缩量回调，洗盘特征明显（好）"
+    return "量能正常", volume_ratio, "量能正常"
+
+
+def judge_support_resistance(item, ma5, ma10, ma20, current_price):
+    """分析支撑压力位，复刻旧 cassa.py 逻辑。"""
+    support_ma5 = False
+    support_ma10 = False
+    support_levels = []
+    resistance_levels = []
+
+    if ma5 > 0:
+        dist = abs(current_price - ma5) / ma5
+        if dist <= TREND_MA_SUPPORT_TOLERANCE and current_price >= ma5:
+            support_ma5 = True
+            support_levels.append(ma5)
+
+    if ma10 > 0:
+        dist = abs(current_price - ma10) / ma10
+        if dist <= TREND_MA_SUPPORT_TOLERANCE and current_price >= ma10:
+            support_ma10 = True
+            if ma10 not in support_levels:
+                support_levels.append(ma10)
+
+    if ma20 > 0 and current_price >= ma20:
+        support_levels.append(ma20)
+
+    highs, _ = extract_high_low_values(item)
+    if len(highs) >= 20:
+        recent_high = max(highs[-20:])
+        if recent_high > current_price:
+            resistance_levels.append(recent_high)
+
+    return support_ma5, support_ma10, support_levels, resistance_levels
+
+
+def judge_macd_status(item):
+    """判断 MACD 状态，对齐旧 cassa.py 逻辑。"""
+    rows = item.get("macd") or []
+    if len(rows) < 2:
+        return 0.0, 0.0, 0.0, "多头", "数据不足"
+
+    cur_dif = safe_float(rows[-1].get("dif"))
+    cur_dea = safe_float(rows[-1].get("dea"))
+    cur_bar = safe_float(rows[-1].get("macd"))
+    prev_dif = safe_float(rows[-2].get("dif"))
+    prev_dea = safe_float(rows[-2].get("dea"))
+
+    prev_diff = prev_dif - prev_dea
+    curr_diff = cur_dif - cur_dea
+    is_golden_cross = prev_diff <= 0 and curr_diff > 0
+    is_death_cross = prev_diff >= 0 and curr_diff < 0
+    is_crossing_up = prev_dif <= 0 and cur_dif > 0
+    is_crossing_down = prev_dif >= 0 and cur_dif < 0
+
+    if is_golden_cross and cur_dif > 0:
+        return cur_dif, cur_dea, cur_bar, "零轴上金叉", "零轴上金叉，强烈买入信号"
+    if is_crossing_up:
+        return cur_dif, cur_dea, cur_bar, "上穿零轴", "DIF上穿零轴，趋势转强"
+    if is_golden_cross:
+        return cur_dif, cur_dea, cur_bar, "金叉", "金叉，趋势向上"
+    if is_death_cross:
+        return cur_dif, cur_dea, cur_bar, "死叉", "死叉，趋势向下"
+    if is_crossing_down:
+        return cur_dif, cur_dea, cur_bar, "下穿零轴", "DIF下穿零轴，趋势转弱"
+    if cur_dif > 0 and cur_dea > 0:
+        return cur_dif, cur_dea, cur_bar, "多头", "多头排列，持续上涨"
+    if cur_dif < 0 and cur_dea < 0:
+        return cur_dif, cur_dea, cur_bar, "空头", "空头排列，持续下跌"
+    return cur_dif, cur_dea, cur_bar, "多头", "MACD 中性区域"
+
+
+def judge_rsi_status(rsi_6, rsi_12, rsi_24):
+    """判断 RSI 状态，对齐旧 cassa.py 逻辑，以 RSI(12) 为主。"""
+    if rsi_12 > TREND_RSI_OVERBOUGHT:
+        return "超买", f"RSI超买({rsi_12:.1f}>70)，短期回调风险高"
+    if rsi_12 > 60:
+        return "强势", f"RSI强势({rsi_12:.1f})，多头力量充足"
+    if rsi_12 >= 40:
+        return "中性", f"RSI中性({rsi_12:.1f})，震荡整理中"
+    if rsi_12 >= TREND_RSI_OVERSOLD:
+        return "弱势", f"RSI弱势({rsi_12:.1f})，关注反弹"
+    return "超卖", f"RSI超卖({rsi_12:.1f}<30)，反弹机会大"
+
+
+def calculate_signal_score(
+    trend_status,
+    trend_strength,
+    bias_ma5,
+    volume_status,
+    support_ma5,
+    support_ma10,
+    macd_status,
+    macd_signal,
+    rsi_status,
+    rsi_signal,
+):
+    """综合评分，对齐旧 cassa.py 逻辑。"""
+    score = 0
+    reasons = []
+    risks = []
+
+    trend_scores = {
+        "强势多头": 30,
+        "多头排列": 26,
+        "弱势多头": 18,
+        "盘整": 12,
+        "弱势空头": 8,
+        "空头排列": 4,
+        "强势空头": 0,
+    }
+    score += trend_scores.get(trend_status, 12)
+    if trend_status in ("强势多头", "多头排列"):
+        reasons.append(f"✅ {trend_status}，顺势做多")
+    elif trend_status in ("空头排列", "强势空头"):
+        risks.append(f"⚠️ {trend_status}，不宜做多")
+
+    is_strong_bull = (
+        trend_status == "强势多头"
+        and trend_strength >= TREND_STRONG_BULL_STRENGTH_THRESHOLD
+    )
+    effective_threshold = TREND_BIAS_THRESHOLD * TREND_STRONG_BULL_BIAS_RELAX if is_strong_bull else TREND_BIAS_THRESHOLD
+
+    if bias_ma5 < 0:
+        if bias_ma5 > -3:
+            score += 20
+            reasons.append(f"✅ 价格略低于MA5({bias_ma5:.1f}%)，回踩买点")
+        elif bias_ma5 > -5:
+            score += 16
+            reasons.append(f"✅ 价格回踩MA5({bias_ma5:.1f}%)，观察支撑")
+        else:
+            score += 8
+            risks.append(f"⚠️ 乖离率过大({bias_ma5:.1f}%)，可能破位")
+    elif bias_ma5 < 2:
+        score += 18
+        reasons.append(f"✅ 价格贴近MA5({bias_ma5:.1f}%)，介入好时机")
+    elif bias_ma5 < effective_threshold:
+        score += 14
+        reasons.append(f"⚡ 价格略高于MA5({bias_ma5:.1f}%)，可小仓介入")
+    elif bias_ma5 > effective_threshold:
+        score += 4
+        risks.append(f"❌ 乖离率过高({bias_ma5:.1f}%>{effective_threshold:.1f}%)，严禁追高")
+    elif is_strong_bull:
+        score += 10
+        reasons.append(f"⚡ 强势趋势中乖离率偏高({bias_ma5:.1f}%)，可轻仓追踪")
+    else:
+        score += 4
+        risks.append(f"❌ 乖离率过高({bias_ma5:.1f}%>{TREND_BIAS_THRESHOLD:.1f}%)，严禁追高")
+
+    volume_scores = {
+        "缩量回调": 15,
+        "放量上涨": 12,
+        "量能正常": 10,
+        "缩量上涨": 6,
+        "放量下跌": 0,
+    }
+    score += volume_scores.get(volume_status, 8)
+    if volume_status == "缩量回调":
+        reasons.append("✅ 缩量回调，主力洗盘")
+    elif volume_status == "放量下跌":
+        risks.append("⚠️ 放量下跌，注意风险")
+
+    if support_ma5:
+        score += 5
+        reasons.append("✅ MA5支撑有效")
+    if support_ma10:
+        score += 5
+        reasons.append("✅ MA10支撑有效")
+
+    macd_scores = {
+        "零轴上金叉": 15,
+        "金叉": 12,
+        "上穿零轴": 10,
+        "多头": 8,
+        "空头": 2,
+        "下穿零轴": 0,
+        "死叉": 0,
+    }
+    score += macd_scores.get(macd_status, 5)
+    if macd_status in ("零轴上金叉", "金叉"):
+        reasons.append(f"✅ {macd_signal}")
+    elif macd_status in ("死叉", "下穿零轴"):
+        risks.append(f"⚠️ {macd_signal}")
+    else:
+        reasons.append(macd_signal)
+
+    rsi_scores = {
+        "超卖": 10,
+        "强势": 8,
+        "中性": 5,
+        "弱势": 3,
+        "超买": 0,
+    }
+    score += rsi_scores.get(rsi_status, 5)
+    if rsi_status in ("超卖", "强势"):
+        reasons.append(f"✅ {rsi_signal}")
+    elif rsi_status == "超买":
+        risks.append(f"⚠️ {rsi_signal}")
+    else:
+        reasons.append(rsi_signal)
+
+    return score, reasons, risks
+
+
+def judge_buy_signal(score, trend_status):
+    """根据评分和趋势状态生成买入信号，对齐旧 cassa.py 逻辑。"""
+    if score >= 75 and trend_status in ("强势多头", "多头排列"):
+        return "强烈买入"
+    if score >= 60 and trend_status in ("强势多头", "多头排列", "弱势多头"):
+        return "买入"
+    if score >= 45:
+        return "持有"
+    if score >= 30:
+        return "观望"
+    if trend_status in ("空头排列", "强势空头"):
+        return "强烈卖出"
+    return "卖出"
+
+
 def calculate_today_quote(item):
     """从 market_snapshot 中计算当日行情。"""
     snapshot = item.get("market_snapshot") or {}
@@ -357,178 +656,80 @@ def calculate_today_quote(item):
     }
 
 
-def calculate_moving_average(item, current_price):
-    """从 daily_kline 中计算均线和乖离率。"""
-    close_values = [
-        get_kline_value(row, "close_price", "Close", "close")
-        for row in item.get("daily_kline") or []
-    ]
-    close_values = [value for value in close_values if value > 0]
-    ma5 = calculate_average(close_values, 5)
-    ma10 = calculate_average(close_values, 10)
-    ma20 = calculate_average(close_values, 20)
-    ma60 = calculate_average(close_values, 60)
-    return {
-        "ma5": ma5,
-        "ma10": ma10,
-        "ma20": ma20,
-        "ma60": ma60,
-        "bias_ma5": calculate_bias(current_price, ma5),
-        "bias_ma10": calculate_bias(current_price, ma10),
-        "bias_ma20": calculate_bias(current_price, ma20),
-        "bias_ma60": calculate_bias(current_price, ma60),
-    }
-
-
-def calculate_macd_status(item):
-    """从 macd 数组中判断最新 MACD 状态。"""
-    rows = item.get("macd") or []
-    if not rows:
-        return {"status": "无数据", "signal": "无数据", "dif": 0.0, "dea": 0.0, "bar": 0.0}
-    latest = rows[-1]
-    previous = rows[-2] if len(rows) >= 2 else {}
-    dif = safe_float(latest.get("dif"))
-    dea = safe_float(latest.get("dea"))
-    bar = safe_float(latest.get("macd"))
-    previous_dif = safe_float(previous.get("dif"))
-    previous_dea = safe_float(previous.get("dea"))
-    previous_bar = safe_float(previous.get("macd"))
-
-    if previous_dif <= previous_dea and dif > dea:
-        status = "金叉"
-    elif previous_dif >= previous_dea and dif < dea:
-        status = "死叉"
-    elif dif > dea and bar > 0:
-        status = "多头"
-    elif dif < dea and bar < 0:
-        status = "空头"
-    else:
-        status = "震荡"
-
-    if bar >= 0 and bar >= previous_bar:
-        signal = "红柱放大"
-    elif bar >= 0:
-        signal = "红柱缩小"
-    elif bar < previous_bar:
-        signal = "绿柱放大"
-    else:
-        signal = "绿柱缩小"
-
-    return {"status": status, "signal": signal, "dif": dif, "dea": dea, "bar": bar}
-
-
-def calculate_support_resistance(item, current_price, ma_values):
-    """基于均线和近 20 日高低点计算支撑压力。"""
-    support = []
-    resistance = []
-    for key in ["ma5", "ma10", "ma20", "ma60"]:
-        value = safe_float(ma_values.get(key))
-        if value <= 0:
+def extract_industry_and_concepts(relation_rows):
+    """从所属板块数组中提取行业和概念名称。"""
+    industries = []
+    concepts = []
+    for row in relation_rows or []:
+        block_name = str(row.get("BlockName", "") or "").strip()
+        if not block_name:
             continue
-        if current_price > 0 and value <= current_price:
-            support.append(value)
-        elif current_price > 0:
-            resistance.append(value)
-
-    recent_rows = (item.get("daily_kline") or [])[-20:]
-    lows = [get_kline_value(row, "low_price", "Low", "low") for row in recent_rows]
-    highs = [get_kline_value(row, "high_price", "High", "high") for row in recent_rows]
-    lows = [value for value in lows if value > 0]
-    highs = [value for value in highs if value > 0]
-    if lows:
-        support.append(min(lows))
-    if highs:
-        resistance.append(max(highs))
-    return sorted({round(value, 2) for value in support}, reverse=True)[:4], sorted({round(value, 2) for value in resistance})[:4]
-
-
-def calculate_trend_signal(today_quote, ma_values, volume_status, macd_status):
-    """计算控制台展示用趋势、信号、理由和风险。"""
-    score = 50
-    reasons = []
-    risks = []
-    current_price = safe_float(today_quote.get("current_price"))
-    ma20 = safe_float(ma_values.get("ma20"))
-
-    if current_price > ma20 > 0:
-        score += 10
-        reasons.append("价格站上MA20")
-    else:
-        score -= 10
-        risks.append("价格未站上MA20")
-
-    if macd_status.get("status") in {"金叉", "多头"}:
-        score += 10
-        reasons.append(f"MACD{macd_status.get('status')}")
-    elif macd_status.get("status") in {"死叉", "空头"}:
-        score -= 10
-        risks.append(f"MACD{macd_status.get('status')}")
-
-    if volume_status in {"温和放量", "明显放量"}:
-        score += 5
-        reasons.append(volume_status)
-    elif volume_status == "缩量":
-        score -= 5
-        risks.append("缩量")
-
-    if safe_float(today_quote.get("price_change_pct")) > 7:
-        risks.append("短线涨幅较大")
-    if safe_float(today_quote.get("amplitude")) > 8:
-        risks.append("日内振幅较大")
-
-    score = max(0, min(100, score))
-    if score >= 80:
-        buy_signal = "可关注"
-    elif score >= 60:
-        buy_signal = "观察"
-    elif score >= 40:
-        buy_signal = "谨慎观察"
-    else:
-        buy_signal = "暂不参与"
-
-    if score >= 75:
-        trend_status = "强势上涨"
-    elif score >= 60:
-        trend_status = "震荡上行"
-    elif score >= 40:
-        trend_status = "震荡"
-    else:
-        trend_status = "弱势下跌"
-
-    return trend_status, score, buy_signal, reasons, risks
+        mapped_type = row.get("mapped_type") or map_relation_type(row.get("BlockType"))
+        if mapped_type == "industry" and block_name not in industries:
+            industries.append(block_name)
+        elif mapped_type == "concept" and block_name not in concepts:
+            concepts.append(block_name)
+    return "、".join(industries), concepts
 
 
 def format_report_item(item):
-    """格式化单个 report item，风格对齐旧 cassa.py report。"""
+    """格式化单个 report item，业务判断口径对齐旧 cassa.py report。"""
     relation = item.get("relation") or []
     industry, concepts = extract_industry_and_concepts(relation)
     today = calculate_today_quote(item)
     current_price = safe_float(today.get("current_price"))
-    ma_values = calculate_moving_average(item, current_price)
-    macd_status = calculate_macd_status(item)
-    support, resistance = calculate_support_resistance(item, current_price, ma_values)
+    closes = extract_close_values(item)
+    ma5_series = calculate_sma(closes, 5)
+    ma10_series = calculate_sma(closes, 10)
+    ma20_series = calculate_sma(closes, 20)
+    ma60_series = calculate_sma(closes, 60)
+
+    ma5 = ma5_series[-1] if ma5_series else 0.0
+    ma10 = ma10_series[-1] if ma10_series else 0.0
+    ma20 = ma20_series[-1] if ma20_series else 0.0
+    ma60 = ma60_series[-1] if ma60_series else 0.0
+    bias_ma5, bias_ma10, bias_ma20 = calculate_bias(current_price, ma5, ma10, ma20)
+
+    trend_status, ma_alignment, trend_strength = judge_trend_status(ma5_series, ma10_series, ma20_series)
+
     more_info = item.get("more_info") or {}
     stock_info = item.get("stock_info") or {}
     volume_ratio = safe_float(more_info.get("fLianB"))
     turnover_rate = safe_float(more_info.get("fHSL"))
+    volume_status, volume_ratio, volume_trend = judge_volume_status(closes, volume_ratio)
 
-    if volume_ratio >= 2.0:
-        volume_status = "明显放量"
-    elif volume_ratio >= 1.2:
-        volume_status = "温和放量"
-    elif 0 < volume_ratio < 0.8:
-        volume_status = "缩量"
-    else:
-        volume_status = "平量"
-
-    trend_status, score, buy_signal, reasons, risks = calculate_trend_signal(
-        today, ma_values, volume_status, macd_status
+    support_ma5, support_ma10, support_levels, resistance_levels = judge_support_resistance(
+        item, ma5, ma10, ma20, current_price
     )
+
+    macd_dif, macd_dea, macd_bar, macd_status, macd_signal = judge_macd_status(item)
+
+    rsi_6_series = calculate_rsi(closes, 6)
+    rsi_12_series = calculate_rsi(closes, 12)
+    rsi_24_series = calculate_rsi(closes, 24)
+    rsi_6 = rsi_6_series[-1] if rsi_6_series else 50.0
+    rsi_12 = rsi_12_series[-1] if rsi_12_series else 50.0
+    rsi_24 = rsi_24_series[-1] if rsi_24_series else 50.0
+    rsi_status, rsi_signal = judge_rsi_status(rsi_6, rsi_12, rsi_24)
+
+    signal_score, signal_reasons, risk_factors = calculate_signal_score(
+        trend_status,
+        trend_strength,
+        bias_ma5,
+        volume_status,
+        support_ma5,
+        support_ma10,
+        macd_status,
+        macd_signal,
+        rsi_status,
+        rsi_signal,
+    )
+    buy_signal = judge_buy_signal(signal_score, trend_status)
 
     total_shares = safe_float(stock_info.get("J_zgb"))
     market_cap = total_shares * current_price / 10000 if total_shares > 0 and current_price > 0 else 0.0
 
-    lines = [f"=== {item.get('code', '')} {item.get('name', '')} ===".rstrip()]
+    lines = [f"=== {strip_code_suffix(item.get('code', ''))} {item.get('name', '')} ===".rstrip()]
     info_parts = []
     if industry:
         info_parts.append(f"行业: {industry}")
@@ -538,21 +739,21 @@ def format_report_item(item):
         lines.append("  ".join(info_parts))
 
     lines.append(
-        f"当日: 开{format_number(today['today_open'])} 高{format_number(today['today_high'])} "
-        f"低{format_number(today['today_low'])} 收{format_number(today['current_price'])} "
-        f"{format_signed_percent(today['price_change_pct'])} 振幅{format_number(today['amplitude'])}%"
+        f"当日: 开{today['today_open']:.2f} 高{today['today_high']:.2f} "
+        f"低{today['today_low']:.2f} 收{today['current_price']:.2f} "
+        f"{today['price_change_pct']:+.2f}% 振幅{today['amplitude']:.2f}%"
     )
-    lines.append(f"趋势: {trend_status} ({score}/100)    信号: {buy_signal} ({score}分)")
+    lines.append(f"趋势: {trend_status} ({trend_strength:.0f}/100)    信号: {buy_signal} ({signal_score}分)")
     lines.append(
-        f"现价: {format_number(current_price)}  "
-        f"MA5: {format_number(ma_values['ma5'])}({format_signed_percent(ma_values['bias_ma5'])})  "
-        f"MA10: {format_number(ma_values['ma10'])}({format_signed_percent(ma_values['bias_ma10'])})  "
-        f"MA20: {format_number(ma_values['ma20'])}({format_signed_percent(ma_values['bias_ma20'])})"
+        f"现价: {current_price:.2f}  "
+        f"MA5: {ma5:.2f}({bias_ma5:+.1f}%)  "
+        f"MA10: {ma10:.2f}({bias_ma10:+.1f}%)  "
+        f"MA20: {ma20:.2f}({bias_ma20:+.1f}%)"
     )
     turnover_text = f"  换手: {turnover_rate:.1f}%" if turnover_rate > 0 else ""
     lines.append(
         f"量能: {volume_status} ({volume_ratio:.2f})      "
-        f"MACD: {macd_status['status']}    RSI: 待接入"
+        f"MACD: {macd_status}    RSI: {rsi_status}({rsi_12:.0f})"
         f"{turnover_text}"
     )
 
@@ -573,14 +774,14 @@ def format_report_item(item):
     if net_buy_amount != 0 or main_net_inflow != 0:
         lines.append(f"资金: 主买净额{net_buy_amount:.0f}万  主力净流入{main_net_inflow:.0f}万")
 
-    support_text = ", ".join(format_number(value) for value in support) if support else "无"
-    resistance_text = ", ".join(format_number(value) for value in resistance) if resistance else "无"
+    support_text = ", ".join(f"{value:.2f}" for value in support_levels) if support_levels else "无"
+    resistance_text = ", ".join(f"{value:.2f}" for value in resistance_levels) if resistance_levels else "无"
     lines.append(f"支撑: {support_text}  压力: {resistance_text}")
 
-    if reasons:
-        lines.append(f"理由: {'  '.join(reasons)}")
-    if risks:
-        lines.append(f"风险: {'  '.join(risks)}")
+    if signal_reasons:
+        lines.append(f"理由: {'  '.join(signal_reasons)}")
+    if risk_factors:
+        lines.append(f"风险: {'  '.join(risk_factors)}")
     return "\n".join(lines)
 
 
