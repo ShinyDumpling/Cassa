@@ -5,10 +5,17 @@ Cassa 业务逻辑脚本。
 业务入口由 Agent Skill 控制，本脚本只负责返回 JSON 结构化数据。
 """
 
+from __future__ import annotations
+
 import argparse
 import json
+import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+from py_mini_racer import MiniRacer
 
 import data
 
@@ -30,13 +37,142 @@ TREND_BIAS_THRESHOLD = 5.0
 TREND_STRONG_BULL_BIAS_RELAX = 1.5
 TREND_STRONG_BULL_STRENGTH_THRESHOLD = 70
 
+CYQ_JS_CODE = r"""
+// @ts-nocheck
+function CYQCalculator(index, klinedata) {
+    var maxprice = 0;
+    var minprice = 0;
+    var factor = 150;
+    var start = this.range ? Math.max(0, index - this.range + 1) : 0;
+    var kdata = klinedata.slice(start, Math.max(1, index + 1));
+    if (kdata.length === 0) throw 'invaild index';
+    for (var i = 0; i < kdata.length; i++) {
+        var elements = kdata[i];
+        maxprice = !maxprice ? elements.high : Math.max(maxprice, elements.high);
+        minprice = !minprice ? elements.low : Math.min(minprice, elements.low);
+    }
 
-def safe_float(value, default=0.0):
-    """把接口返回值尽量转换成 float。"""
-    if value is None or value == "":
-        return default
+    var accuracy = Math.max(0.01, (maxprice - minprice) / (factor - 1));
+    var yrange = [];
+    for (var i = 0; i < factor; i++) {
+        yrange.push((minprice + accuracy * i).toFixed(2) / 1);
+    }
+    var xdata = createNumberArray(factor);
+
+    for (var i = 0; i < kdata.length; i++) {
+        var eles = kdata[i];
+        var open = eles.open,
+            close = eles.close,
+            high = eles.high,
+            low = eles.low,
+            avg = (open + close + high + low) / 4,
+            turnoverRate = Math.min(1, eles.hsl / 100 || 0);
+
+        var H = Math.floor((high - minprice) / accuracy),
+            L = Math.ceil((low - minprice) / accuracy),
+            GPoint = [high == low ? factor - 1 : 2 / (high - low), Math.floor((avg - minprice) / accuracy)];
+        for (var n = 0; n < xdata.length; n++) {
+            xdata[n] *= (1 - turnoverRate);
+        }
+
+        if (high == low) {
+            xdata[GPoint[1]] += GPoint[0] * turnoverRate / 2;
+        } else {
+            for (var j = L; j <= H; j++) {
+                var curprice = minprice + accuracy * j;
+                if (curprice <= avg) {
+                    if (Math.abs(avg - low) < 1e-8) {
+                        xdata[j] += GPoint[0] * turnoverRate;
+                    } else {
+                        xdata[j] += (curprice - low) / (avg - low) * GPoint[0] * turnoverRate;
+                    }
+                } else {
+                    if (Math.abs(high - avg) < 1e-8) {
+                        xdata[j] += GPoint[0] * turnoverRate;
+                    } else {
+                        xdata[j] += (high - curprice) / (high - avg) * GPoint[0] * turnoverRate;
+                    }
+                }
+            }
+        }
+    }
+
+    var currentprice = klinedata[index].close;
+    var totalChips = 0;
+    for (var i = 0; i < factor; i++) {
+        var x = xdata[i].toPrecision(12) / 1;
+        totalChips += x;
+    }
+    var result = new CYQData();
+    result.x = xdata;
+    result.y = yrange;
+    result.benefitPart = result.getBenefitPart(currentprice);
+    result.avgCost = getCostByChip(totalChips * 0.5).toFixed(2);
+    result.percentChips = {
+        '90': result.computePercentChips(0.9),
+        '70': result.computePercentChips(0.7)
+    };
+    return result;
+
+    function getCostByChip(chip) {
+        var result = 0, sum = 0;
+        for (var i = 0; i < factor; i++) {
+            var x = xdata[i].toPrecision(12) / 1;
+            if (sum + x > chip) {
+                result = minprice + i * accuracy;
+                break;
+            }
+            sum += x;
+        }
+        return result;
+    }
+
+    function CYQData() {
+        this.x = arguments[0];
+        this.y = arguments[1];
+        this.benefitPart = arguments[2];
+        this.avgCost = arguments[3];
+        this.percentChips = arguments[4];
+        this.computePercentChips = function (percent) {
+            if (percent > 1 || percent < 0) throw 'argument "percent" out of range';
+            var ps = [(1 - percent) / 2, (1 + percent) / 2];
+            var pr = [getCostByChip(totalChips * ps[0]), getCostByChip(totalChips * ps[1])];
+            return {
+                priceRange: [pr[0].toFixed(2), pr[1].toFixed(2)],
+                concentration: pr[0] + pr[1] === 0 ? 0 : (pr[1] - pr[0]) / (pr[0] + pr[1])
+            };
+        };
+        this.getBenefitPart = function (price) {
+            var below = 0;
+            for (var i = 0; i < factor; i++) {
+                var x = xdata[i].toPrecision(12) / 1;
+                if (price >= minprice + i * accuracy) {
+                    below += x;
+                }
+            }
+            return totalChips == 0 ? 0 : below / totalChips;
+        };
+    }
+}
+
+function createNumberArray(count) {
+    var array = [];
+    for (var i = 0; i < count; i++) {
+        array.push(0);
+    }
+    return array;
+}
+"""
+
+
+def safe_float(value, default=None):
     try:
-        return float(value)
+        if value is None or value == "":
+            return default
+        result = float(value)
+        if pd.isna(result):
+            return default
+        return result
     except (TypeError, ValueError):
         return default
 
@@ -246,34 +382,6 @@ def collect_macd_for_report(code, count=REPORT_WITH_REALTIME_COUNT):
         return_date=True,
     )
     return convert_macd_result_to_array(raw_macd, code)
-
-
-def create_chip_placeholder():
-    """返回筹码分布 TODO 占位。"""
-    return {
-        "status": "todo",
-        "data": None,
-        "note": "筹码分布待接入",
-    }
-
-
-def collect_report_item(target):
-    """采集单个 report 目标的结构化数据。"""
-    code = target["code"]
-    realtime_data = collect_realtime_report_data(code)
-    return {
-        "raw_code": target.get("raw_code", ""),
-        "target_type": target.get("target_type", ""),
-        "code": code,
-        "name": realtime_data["name"] or target.get("name", ""),
-        "market_snapshot": realtime_data["market_snapshot"],
-        "stock_info": realtime_data["stock_info"],
-        "more_info": realtime_data["more_info"],
-        "relation": realtime_data["relation"],
-        "daily_kline": collect_daily_kline_for_report(code),
-        "macd": collect_macd_for_report(code),
-        "chip": create_chip_placeholder(),
-    }
 
 
 def build_report_data(codes):
@@ -670,6 +778,369 @@ def extract_industry_and_concepts(relation_rows):
         elif mapped_type == "concept" and block_name not in concepts:
             concepts.append(block_name)
     return "、".join(industries), concepts
+
+
+def normalize_trade_date(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y%m%d")
+    text = str(value).strip()
+    if not text:
+        return None
+    digits = re.sub(r"\D", "", text)
+    if len(digits) >= 8:
+        return digits[:8]
+    return None
+
+
+def fetch_gb_history(code: str, daily_kline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """通过 data.py 获取历史股本信息，business.py 不直接调用 tqcenter。"""
+    dates = [normalize_trade_date(row.get("date")) for row in daily_kline if isinstance(row, dict)]
+    dates = [date for date in dates if date]
+    if not dates:
+        return []
+
+    try:
+        result = data.get_gb_info_by_date(
+            stock_code=code,
+            start_date=min(dates),
+            end_date=max(dates),
+        )
+    except Exception:
+        return []
+
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        if isinstance(result.get("Value"), list):
+            return [item for item in result["Value"] if isinstance(item, dict)]
+        return [result]
+    return []
+
+
+def pick_effective_float_capital(record: Dict[str, Any]) -> Optional[float]:
+    candidate_keys = [
+        "ActiveCapital",
+        "activecapital",
+        "Ltgb",
+        "ltgb",
+        "Ltg",
+        "LTG",
+        "ltg",
+        "liutongguben",
+        "流通股本",
+        "流通股",
+        "流通股本数",
+    ]
+    for key in candidate_keys:
+        value = safe_float(record.get(key))
+        if value and value > 0:
+            return float(value)
+    return None
+
+
+def pick_effective_date(record: Dict[str, Any]) -> Optional[str]:
+    candidate_keys = [
+        "Date",
+        "date",
+        "Rq",
+        "RQ",
+        "EndDate",
+        "end_date",
+        "StartDate",
+        "start_date",
+        "GQDJR",
+        "BGRQ",
+    ]
+    for key in candidate_keys:
+        normalized = normalize_trade_date(record.get(key))
+        if normalized:
+            return normalized
+    return None
+
+
+def infer_turnover_scale(
+    daily_kline: List[Dict[str, Any]],
+    current_turnover_rate,
+    reference_float_capital,
+    snapshot_volume,
+) -> float:
+    turnover = safe_float(current_turnover_rate)
+    float_capital = safe_float(reference_float_capital)
+    if not turnover or turnover <= 0 or not float_capital or float_capital <= 0:
+        return 100.0
+
+    latest_daily_volume = None
+    if daily_kline:
+        latest_daily_volume = safe_float(daily_kline[-1].get("volume") or daily_kline[-1].get("Volume"))
+
+    for candidate in (latest_daily_volume, safe_float(snapshot_volume)):
+        if not candidate or candidate <= 0:
+            continue
+        raw_ratio = float(candidate) / float(float_capital)
+        if raw_ratio <= 0:
+            continue
+        scale = float(turnover) / raw_ratio
+        if 0.000001 < scale < 1000000:
+            return float(scale)
+    return 100.0
+
+
+def compute_daily_turnover_history(
+    daily_kline: List[Dict[str, Any]],
+    gb_history: List[Dict[str, Any]],
+    current_float_capital,
+    current_turnover_rate,
+    snapshot_volume,
+) -> Dict[str, Any]:
+    records = []
+    for item in gb_history:
+        effective_date = pick_effective_date(item)
+        float_capital = pick_effective_float_capital(item)
+        if effective_date and float_capital:
+            records.append({"date": effective_date, "float_capital": float_capital})
+    records.sort(key=lambda item: item["date"])
+
+    fallback_float_capital = safe_float(current_float_capital)
+    reference_float_capital = records[-1]["float_capital"] if records else fallback_float_capital
+    scale = infer_turnover_scale(
+        daily_kline=daily_kline,
+        current_turnover_rate=current_turnover_rate,
+        reference_float_capital=reference_float_capital,
+        snapshot_volume=snapshot_volume,
+    )
+
+    history = []
+    record_idx = 0
+    active_float_capital = fallback_float_capital
+
+    for row in daily_kline:
+        trade_date = normalize_trade_date(row.get("date") or row.get("Date"))
+        volume = safe_float(row.get("volume") or row.get("Volume"))
+        if not trade_date:
+            continue
+
+        while record_idx < len(records) and records[record_idx]["date"] <= trade_date:
+            active_float_capital = records[record_idx]["float_capital"]
+            record_idx += 1
+
+        turnover_rate = None
+        if volume is not None and active_float_capital and active_float_capital > 0:
+            turnover_rate = round(float(volume) / float(active_float_capital) * scale, 4)
+
+        history.append(
+            {
+                "date": trade_date,
+                "volume": round(float(volume), 4) if volume is not None else None,
+                "float_capital": round(float(active_float_capital), 4)
+                if active_float_capital is not None
+                else None,
+                "turnover_rate": turnover_rate,
+            }
+        )
+
+    return {
+        "daily_turnover_history": history,
+        "daily_turnover_meta": {
+            "formula": "turnover_rate = volume / float_capital * scale",
+            "scale": round(scale, 6),
+            "gb_record_count": len(records),
+            "fallback_float_capital": fallback_float_capital,
+        },
+    }
+
+
+def build_cyq_kline_records(
+    daily_kline: List[Dict[str, Any]],
+    daily_turnover_history: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    turnover_map = {
+        item.get("date"): item.get("turnover_rate")
+        for item in daily_turnover_history.get("daily_turnover_history", [])
+        if isinstance(item, dict) and item.get("date")
+    }
+
+    records = []
+    prev_close = None
+    for row in daily_kline:
+        trade_date = normalize_trade_date(row.get("date") or row.get("Date"))
+        open_price = safe_float(row.get("open") or row.get("Open"))
+        high_price = safe_float(row.get("high") or row.get("High"))
+        low_price = safe_float(row.get("low") or row.get("Low"))
+        close_price = safe_float(row.get("close") or row.get("Close"))
+        volume = safe_float(row.get("volume") or row.get("Volume"))
+        amount = safe_float(row.get("amount") or row.get("Amount"))
+        hsl = safe_float(turnover_map.get(trade_date))
+
+        values = [open_price, high_price, low_price, close_price, volume, amount, hsl]
+        if not trade_date or not all(isinstance(value, (int, float)) for value in values):
+            prev_close = close_price if isinstance(close_price, (int, float)) else prev_close
+            continue
+
+        amplitude = 0.0
+        change_pct = 0.0
+        change_amount = 0.0
+        if prev_close and prev_close != 0:
+            amplitude = (float(high_price) - float(low_price)) / float(prev_close) * 100.0
+            change_pct = (float(close_price) / float(prev_close) - 1.0) * 100.0
+            change_amount = float(close_price) - float(prev_close)
+
+        records.append(
+            {
+                "date": trade_date,
+                "open": round(float(open_price), 4),
+                "close": round(float(close_price), 4),
+                "high": round(float(high_price), 4),
+                "low": round(float(low_price), 4),
+                "volume": round(float(volume), 4),
+                "amount": round(float(amount), 4),
+                "zf": round(float(amplitude), 4),
+                "zdf": round(float(change_pct), 4),
+                "zde": round(float(change_amount), 4),
+                "hsl": round(float(hsl), 4),
+            }
+        )
+        prev_close = float(close_price)
+
+    return records
+
+
+def compute_profit_ratio_from_distribution(current_price, x_values, y_values):
+    price_now = safe_float(current_price)
+    if price_now is None or not x_values or not y_values:
+        return None
+
+    total = 0.0
+    below = 0.0
+    for chip, price in zip(x_values, y_values):
+        chip_value = safe_float(chip)
+        price_value = safe_float(price)
+        if chip_value is None or price_value is None:
+            continue
+        total += float(chip_value)
+        if float(price_value) <= float(price_now):
+            below += float(chip_value)
+
+    if total <= 0:
+        return None
+    return round(below / total, 6)
+
+
+def chip_status_from_concentration(concentration_90):
+    if concentration_90 is None:
+        return "未知"
+    if concentration_90 < 0.08:
+        return "高度集中"
+    if concentration_90 < 0.15:
+        return "较集中"
+    if concentration_90 < 0.25:
+        return "中等"
+    return "较分散"
+
+
+def create_chip_unavailable(note: str) -> Dict[str, Any]:
+    return {
+        "status": "todo",
+        "data": None,
+        "note": note,
+    }
+
+
+def compute_chip_distribution(
+    daily_kline: List[Dict[str, Any]],
+    daily_turnover_history: Dict[str, Any],
+    current_price,
+) -> Dict[str, Any]:
+    records = build_cyq_kline_records(daily_kline, daily_turnover_history)
+    if len(records) < 30:
+        return create_chip_unavailable("筹码分布暂无法计算：有效日线/换手率样本不足 30 条。")
+
+    js_engine = MiniRacer()
+    js_engine.eval(CYQ_JS_CODE)
+    result = js_engine.call("CYQCalculator", len(records) - 1, records)
+
+    price_now = safe_float(current_price, safe_float(records[-1].get("close")))
+    profit_ratio = compute_profit_ratio_from_distribution(
+        price_now,
+        result.get("x", []),
+        result.get("y", []),
+    )
+    if profit_ratio is None:
+        profit_ratio = safe_float(result.get("benefitPart"))
+
+    percent_90 = result.get("percentChips", {}).get("90", {})
+    percent_70 = result.get("percentChips", {}).get("70", {})
+    price_range_90 = percent_90.get("priceRange") or [None, None]
+    price_range_70 = percent_70.get("priceRange") or [None, None]
+    concentration_90 = safe_float(percent_90.get("concentration"))
+    concentration_70 = safe_float(percent_70.get("concentration"))
+
+    return {
+        "profit_ratio": round(float(profit_ratio), 6) if profit_ratio is not None else None,
+        "avg_cost": safe_float(result.get("avgCost")),
+        "cost_90_low": safe_float(price_range_90[0]),
+        "cost_90_high": safe_float(price_range_90[1]),
+        "concentration_90": round(float(concentration_90), 6)
+        if concentration_90 is not None
+        else None,
+        "cost_70_low": safe_float(price_range_70[0]),
+        "cost_70_high": safe_float(price_range_70[1]),
+        "concentration_70": round(float(concentration_70), 6)
+        if concentration_70 is not None
+        else None,
+        "chip_status": chip_status_from_concentration(concentration_90),
+        "sample_count": len(records),
+    }
+
+
+def collect_chip_for_report(item: Dict[str, Any]) -> Dict[str, Any]:
+    """计算 report 筹码分布；只消费 item 中的数据，并通过 data.py 补历史股本。"""
+    code = item.get("code")
+    daily_kline = item.get("daily_kline") or []
+    market_snapshot = item.get("market_snapshot") or {}
+    more_info = item.get("more_info") or {}
+    stock_info = item.get("stock_info") or {}
+
+    if not code:
+        return create_chip_unavailable("筹码分布暂无法计算：缺少股票代码。")
+    if not daily_kline:
+        return create_chip_unavailable("筹码分布暂无法计算：缺少日 K 数据。")
+
+    gb_history = fetch_gb_history(code, daily_kline)
+    daily_turnover_history = compute_daily_turnover_history(
+        daily_kline=daily_kline,
+        gb_history=gb_history,
+        current_float_capital=stock_info.get("ActiveCapital"),
+        current_turnover_rate=more_info.get("fHSL"),
+        snapshot_volume=market_snapshot.get("Volume"),
+    )
+    return compute_chip_distribution(
+        daily_kline=daily_kline,
+        daily_turnover_history=daily_turnover_history,
+        current_price=market_snapshot.get("Now"),
+    )
+
+
+def collect_report_item(target):
+    """采集单个 report 目标的结构化数据。"""
+    code = target["code"]
+    realtime_data = collect_realtime_report_data(code)
+    item = {
+        "raw_code": target.get("raw_code", ""),
+        "target_type": target.get("target_type", ""),
+        "code": code,
+        "name": realtime_data["name"] or target.get("name", ""),
+        "market_snapshot": realtime_data["market_snapshot"],
+        "stock_info": realtime_data["stock_info"],
+        "more_info": realtime_data["more_info"],
+        "relation": realtime_data["relation"],
+        "daily_kline": collect_daily_kline_for_report(code),
+        "macd": collect_macd_for_report(code),
+        "chip": None,
+    }
+    item["chip"] = collect_chip_for_report(item)
+    return item
 
 
 def format_report_item(item):

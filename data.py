@@ -88,6 +88,15 @@ def get_relation(stock_code):
     return tq.get_relation(stock_code=stock_code)
 
 
+def get_gb_info_by_date(stock_code, start_date, end_date):
+    """获取指定日期区间内的历史股本信息。"""
+    return tq.get_gb_info_by_date(
+        stock_code=stock_code,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
 def get_stock_list():
     """获取全市场股票列表。"""
     return tq.get_stock_list()
@@ -860,6 +869,11 @@ def main():
         help="每处理多少个对象打印一次进度，默认 500",
     )
 
+    gb_info_parser = subparsers.add_parser("get_gb_info_by_date")
+    gb_info_parser.add_argument("--code", required=True)
+    gb_info_parser.add_argument("--start-date", required=True)
+    gb_info_parser.add_argument("--end-date", required=True)
+
     args = parser.parse_args()
 
     initialize(Path(__file__))
@@ -890,6 +904,14 @@ def main():
         print_json(load_daily_kline([args.code], args.count))
     elif args.command == "archive-snapshot":
         print_json(archive_snapshot(args.progress_interval))
+    elif args.command == "get_gb_info_by_date":
+        print_json(
+            get_gb_info_by_date(
+                stock_code=args.code,
+                start_date=args.start_date,
+                end_date=args.end_date,
+            )
+        )
 
 
 if __name__ == "__main__":
