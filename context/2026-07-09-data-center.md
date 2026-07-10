@@ -1732,6 +1732,127 @@ def formula_process_mul_zb(
 
 第一版不在 `data.py` 中做分批、不合并批次结果、不解释某个公式的输出线含义。
 
+## 当前最新补充：历史股本接口
+
+### 背景
+
+`business.py report` 后续要接入筹码分布计算。筹码分布需要把日 K 成交量还原成每日换手率：
+
+```text
+turnover_rate = volume / float_capital * scale
+```
+
+其中 `float_capital` 需要尽可能使用历史流通股本。这个能力属于数据中心，不应放在业务层。
+
+Sentinel 旧方案中曾在业务脚本里直接传 `tq` 对象：
+
+```python
+tq.get_gb_info_by_date(...)
+```
+
+Cassa 的分层约定是：
+
+```text
+business.py -> data.py -> tqcenter
+```
+
+因此 `get_gb_info_by_date` 必须先封装到 `data.py`，再由 `business.py` 调用 `data.get_gb_info_by_date(...)`。
+
+### data.py 接口方案
+
+新增薄封装函数：
+
+```python
+def get_gb_info_by_date(stock_code, start_date, end_date):
+    """获取指定日期区间内的历史股本信息。
+
+    Args:
+        stock_code: 通达信格式股票代码，例如 "600360.SH"。
+        start_date: 开始日期，建议使用 "YYYYMMDD"。
+        end_date: 结束日期，建议使用 "YYYYMMDD"。
+
+    Returns:
+        通达信 tq.get_gb_info_by_date 的原始返回结果。
+    """
+    return tq.get_gb_info_by_date(
+        stock_code=stock_code,
+        start_date=start_date,
+        end_date=end_date,
+    )
+```
+
+第一版保持原始返回，不在 `data.py` 中解释字段、不做业务兜底、不计算换手率。
+
+### data.py 完整代码插入点
+
+放在行情/基础接口附近，建议放到 `get_relation` 后、`get_stock_list` 前：
+
+```python
+def get_relation(stock_code):
+    """获取股票所属板块关系。"""
+    return tq.get_relation(stock_code=stock_code)
+
+
+def get_gb_info_by_date(stock_code, start_date, end_date):
+    """获取指定日期区间内的历史股本信息。"""
+    return tq.get_gb_info_by_date(
+        stock_code=stock_code,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+def get_stock_list():
+    """获取全市场股票列表。"""
+    return tq.get_stock_list()
+```
+
+### data.py CLI 自测草案
+
+自测入口新增命令：
+
+```python
+gb_info_parser = subparsers.add_parser("get_gb_info_by_date")
+gb_info_parser.add_argument("--code", required=True)
+gb_info_parser.add_argument("--start-date", required=True)
+gb_info_parser.add_argument("--end-date", required=True)
+```
+
+分发逻辑新增：
+
+```python
+elif args.command == "get_gb_info_by_date":
+    print_json(
+        get_gb_info_by_date(
+            stock_code=args.code,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+    )
+```
+
+验证命令：
+
+```powershell
+python data.py get_gb_info_by_date --code 600360.SH --start-date 20260101 --end-date 20260709
+```
+
+### 与业务层的边界
+
+`data.py` 只负责：
+
+1. 调用 `tq.get_gb_info_by_date`。
+2. 返回原始结构。
+3. 提供 CLI 自测入口。
+
+`business.py` 负责：
+
+1. 根据 `daily_kline` 推导 `start_date/end_date`。
+2. 调用 `data.get_gb_info_by_date`。
+3. 从原始返回中挑选有效日期和流通股本字段。
+4. 用历史股本、当前 `ActiveCapital`、当前 `fHSL` 计算每日换手率。
+5. 继续进行筹码分布计算。
+
 ## `data.py` 自测入口代码写法草案
 
 `data.py` 文件末尾可以带一个自测入口，只用于验证本模块接口，不承载正式业务判断。

@@ -916,7 +916,7 @@ def compute_daily_turnover_history(
     active_float_capital = fallback_float_capital
 
     for row in daily_kline:
-        trade_date = normalize_trade_date(row.get("date") or row.get("Date"))
+        trade_date = normalize_trade_date(row.get("date") or row.get("Date") or row.get("trade_date"))
         volume = safe_float(row.get("volume") or row.get("Volume"))
         if not trade_date:
             continue
@@ -964,11 +964,11 @@ def build_cyq_kline_records(
     records = []
     prev_close = None
     for row in daily_kline:
-        trade_date = normalize_trade_date(row.get("date") or row.get("Date"))
-        open_price = safe_float(row.get("open") or row.get("Open"))
-        high_price = safe_float(row.get("high") or row.get("High"))
-        low_price = safe_float(row.get("low") or row.get("Low"))
-        close_price = safe_float(row.get("close") or row.get("Close"))
+        trade_date = normalize_trade_date(row.get("date") or row.get("Date") or row.get("trade_date"))
+        open_price = safe_float(row.get("open") or row.get("Open") or row.get("open_price"))
+        high_price = safe_float(row.get("high") or row.get("High") or row.get("high_price"))
+        low_price = safe_float(row.get("low") or row.get("Low") or row.get("low_price"))
+        close_price = safe_float(row.get("close") or row.get("Close") or row.get("close_price"))
         volume = safe_float(row.get("volume") or row.get("Volume"))
         amount = safe_float(row.get("amount") or row.get("Amount"))
         hsl = safe_float(turnover_map.get(trade_date))
