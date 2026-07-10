@@ -536,18 +536,19 @@ def load_breakout_kline(
     stock_list,
     box_days=20,
     breakout_date="",
+    extra_days=0,
     batch_size=BREAKOUT_KLINE_BATCH_SIZE,
 ):
     """读取放量突破选股所需 K 线。
 
-    返回每只股票 box_days + 1 根 K 线：
-    前 box_days 根用于箱体判断，最后 1 根用于突破判断。
+    默认返回每只股票 box_days + 1 根 K 线；extra_days 用于需要
+    突破后继续观察的策略，例如突破后回踩 MA5。
     """
     today = datetime.now().strftime("%Y-%m-%d")
     target_date = breakout_date or today
     intraday = target_date == today and is_a_share_intraday()
     mode_text = "盘中" if intraday else "非盘中"
-    count = int(box_days) + 1
+    count = int(box_days) + 1 + int(extra_days)
 
     print(f"[数据] 突破日期：{target_date}")
     print(f"[数据] 当前模式：{mode_text}")

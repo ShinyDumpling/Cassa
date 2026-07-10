@@ -1,6 +1,6 @@
 ---
 name: cassa-screen
-description: 使用 Cassa 现有 screen.py CLI 执行选股，不修改代码。Use when 用户要求选择放量突破股票、查找箱体震荡股票、运行 Cassa 选股、解释选股结果、调整选股参数如 box-days/range-max/volume-ratio-min/breakout-date，或要求通过 skill 控制 Cassa 选股策略。
+description: 使用 Cassa 现有 screen.py CLI 执行选股，不修改代码。Use when 用户要求选择放量突破股票、查找箱体震荡股票、查找放量突破后回踩 MA5 且 MA5/MA10/MA20 多头排列的股票、运行 Cassa 选股、解释选股结果、调整选股参数如 box-days/range-max/volume-ratio-min/breakout-date/pullback-date/high-above-ma-ratio，或要求通过 skill 控制 Cassa 选股策略。
 ---
 
 # Cassa 选股 Skill
@@ -44,6 +44,19 @@ python screen.py scan-box
 python screen.py scan-breakout
 ```
 
+查找放量突破后回踩 MA5，且目标日 MA5/MA10/MA20 多头排列的股票：
+
+```powershell
+python screen.py scan-breakout-pullback-ma5
+```
+
+该入口中的“回踩”定义为：
+
+```text
+目标日最高价 >= MA5 * (1 + high-above-ma-ratio)
+目标日收盘价在 MA5 正负 ma-tolerance 内
+```
+
 查看单只股票箱体判断：
 
 当前没有单股判断 CLI。不要调用 `box` 或 `breakout` 命令。
@@ -62,6 +75,12 @@ python screen.py scan-breakout
 python screen.py scan-box
 ```
 
+当用户说“找放量突破后回踩 MA5 的股票”“突破后几天回踩 MA5”“今天回踩 MA5 的突破票”“突破回踩且均线多头”时，执行：
+
+```powershell
+python screen.py scan-breakout-pullback-ma5
+```
+
 当用户指定历史日期，例如“找 2026-07-10 放量突破的股票”，执行：
 
 ```powershell
@@ -78,6 +97,12 @@ python screen.py scan-box --box-days 30
 
 - `--box-days`：箱体 K 线数量，默认 20。
 - `--breakout-date`：观察日或突破日；不传则由数据中心按今天处理。
+- `--pullback-date`：回踩观察日；不传则由数据中心按今天处理，仅用于 `scan-breakout-pullback-ma5`。
+- `--pullback-days`：突破后几日内允许回踩，默认 3，仅用于 `scan-breakout-pullback-ma5`。
+- `--ma-days`：回踩均线天数，默认 5，仅用于 `scan-breakout-pullback-ma5`。
+- `--high-above-ma-ratio`：回踩日最高价高于 MA 的最小比例，默认 0.03，仅用于 `scan-breakout-pullback-ma5`。
+- `--ma-tolerance`：收盘价距离 MA 的容忍比例，默认 0.02，仅用于 `scan-breakout-pullback-ma5`。
+- `scan-breakout-pullback-ma5` 固定要求回踩观察日满足 `MA5 > MA10 > MA20`。
 - `--range-max`：箱体振幅上限，默认 0.30。
 - `--volume-ratio-min`：放量倍数下限，默认 1.5，仅用于 `scan-breakout`。
 - `--batch-size`：每批处理股票数量，默认 500。

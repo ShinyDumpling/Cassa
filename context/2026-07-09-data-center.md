@@ -2524,3 +2524,75 @@ def load_breakout_kline(
    - 不在 `data.py` 自动修复。
    - 控制台通过最后日期分布暴露。
    - 后续筛选层会因为 K 线不足 `box_days + 1` 自动跳过。
+
+## 2026-07-10 第四次更新：支持突破后回踩策略多取 K 线
+
+### 背景
+
+新增“放量突破后回踩 MA5”选股时，选股日不是突破日，而是回踩观察日。
+
+因此数据中心不能只返回：
+
+```text
+box_days + 1
+```
+
+还需要支持突破后的观察天数：
+
+```text
+box_days + 1 + extra_days
+```
+
+### 修改函数
+
+修改 `load_breakout_kline()`，新增参数：
+
+```python
+extra_days=0
+```
+
+当前签名：
+
+```python
+def load_breakout_kline(
+    stock_list,
+    box_days=20,
+    breakout_date="",
+    extra_days=0,
+    batch_size=BREAKOUT_KLINE_BATCH_SIZE,
+):
+```
+
+实际读取数量：
+
+```python
+count = int(box_days) + 1 + int(extra_days)
+```
+
+### 行为说明
+
+1. `extra_days=0` 时，行为保持原样。
+2. `scan-box` 和 `scan-breakout` 不受影响。
+3. `scan-breakout-pullback-ma5` 会传入：
+
+```python
+extra_days=pullback_days
+```
+
+从而拿到：
+
+```text
+box_days + 1 + pullback_days
+```
+
+根 K 线。
+
+### 命名说明
+
+当前参数名 `breakout_date` 在数据中心沿用旧命名，但在回踩策略中它承载的是“目标观察日 / 回踩日”。
+
+后续如果数据中心稳定下来，可以再统一重命名为更中性的：
+
+```text
+target_date
+```
