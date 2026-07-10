@@ -58,7 +58,7 @@
 | T042 | doing | 数据中心拆分第一阶段：通达信接口模块 | 从 `main` 切出 `feat/data-center-split`，在不改动原 `cassa.py` 的前提下，先新增 `data.py` 普通函数模块接入通达信行情类与板块类接口，并用 `main.py` 作为验证入口 | 本阶段先整理方案和 context；代码写法要求保持普通函数，不使用 `TdxClient` 类，不做静默调用、不吞异常、不围绕 screener 设计 |
 | T043 | todo | 新版 business.py report 结构化数据包与控制台输出 | 新增 / 调整 `business.py`，由 Skill 作为业务入口调用；`business.py report` 接收股票或板块 code，默认按旧 `cassa.py report` 风格打印控制台输出，并支持 `--debug` 追加完整 JSON | 最新方案见 `context/2026-07-09-bussiness.md`：不使用 `computed` 字段，控制台输出直接从原始 JSON 取数；业务判断算法需对齐旧 `cassa.py report`，包括趋势、量能、支撑压力、MACD、RSI、综合评分和买入信号 |
 | T044 | dropped | 新版 report.py 控制台展示脚本 | 暂不新增独立 `report.py` | 最新方案改为由 `business.py report` 直接负责控制台输出；文件报告和独立格式脚本后续再单独讨论 |
-| T045 | doing | 新版 screen.py 选股层与 Skill 编排方案 | 新增选股层入口 `screen.py`，选股条件以“一层一个函数”的 Python 方式表达；稳定条件可沉淀到策略脚本，临时条件由 Skill 在本次执行中临时构造并调用，不写入正式策略 py | 当前已落地第一版：`data.load_breakout_kline()` 按盘中/非盘中读取放量突破所需 K 线；`screen.py scan-breakout` 从全部 A 股出发，前 N 根判断箱体，最后 1 根判断放量突破 |
+| T045 | doing | 新版 screen.py 选股层与 Skill 编排方案 | 新增选股层入口 `screen.py`，选股条件以“一层一个函数”的 Python 方式表达；稳定条件可沉淀到策略脚本，临时条件由 Skill 在本次执行中临时构造并调用，不写入正式策略 py | 当前已落地第一版：`data.load_breakout_kline()` 按盘中/非盘中读取选股所需 K 线；`screen.py` 已提供 `scan-box` 和 `scan-breakout` 两个全 A 股入口；`skills/cassa-screen/SKILL.md` 已约束 skill 只调用现有 CLI、不修改代码 |
 
 ## 待整理 / 收件箱
 

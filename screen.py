@@ -1,7 +1,7 @@
 """
 Cassa 选股脚本。
 
-第一版先实现箱体判断、放量突破判断，以及从全部 A 股出发的放量突破扫描入口。
+第一版先实现箱体判断、放量突破判断，以及从全部 A 股出发的选股扫描入口。
 放量突破选股通过 data.load_breakout_kline 获取 K 线。
 """
 
@@ -124,16 +124,6 @@ def analyze_volume_breakout_from_box(
     }
 
 
-def load_single_stock_kline(stock_code, count, breakout_date=""):
-    """读取单只股票 K 线，并返回该股票的 K 线列表。"""
-    kline_map = data.load_breakout_kline(
-        stock_list=[stock_code],
-        box_days=count - 1,
-        breakout_date=breakout_date,
-    )
-    return kline_map.get(stock_code, [])
-
-
 def get_all_a_share_codes():
     """获取全部 A 股股票代码。"""
     stock_rows = data.get_stock_list()
@@ -151,6 +141,27 @@ def filter_box_consolidation(stock_codes, kline_map, box_days, range_max=DEFAULT
             passed_codes.append(stock_code)
 
     return passed_codes
+
+
+def filter_current_box_consolidation(stock_codes, kline_map, box_days, range_max=DEFAULT_BOX_RANGE_MAX):
+    """从股票列表中筛出最近 box_days 根 K 线处于箱体的股票。"""
+    passed_codes = []
+    box_detail_map = {}
+
+    for stock_code in stock_codes:
+        kline_bars = kline_map.get(stock_code, [])
+        if len(kline_bars) < box_days:
+            continue
+
+        box_kline_bars = kline_bars[-box_days:]
+        if is_box_consolidation(box_kline_bars, range_max=range_max):
+            passed_codes.append(stock_code)
+            box_detail_map[stock_code] = analyze_box_consolidation(
+                box_kline_bars,
+                range_max=range_max,
+            )
+
+    return passed_codes, box_detail_map
 
 
 def filter_volume_breakout(
@@ -210,6 +221,63 @@ def run_layer(layer_name, input_codes, filter_func, layer_records):
     )
 
     return output_codes
+
+
+def screen_box_consolidation(
+    box_days=DEFAULT_BOX_DAYS,
+    breakout_date="",
+    range_max=DEFAULT_BOX_RANGE_MAX,
+    batch_size=DEFAULT_BATCH_SIZE,
+):
+    """从全部 A 股中筛选当前仍处于箱体震荡的股票。"""
+    all_stock_codes = get_all_a_share_codes()
+    if not all_stock_codes:
+        raise RuntimeError("未获取到全部 A 股股票列表")
+
+    layer_records = []
+    print(f"[选股] 初始股票池：{len(all_stock_codes)}")
+    kline_map = data.load_breakout_kline(
+        stock_list=all_stock_codes,
+        box_days=box_days,
+        breakout_date=breakout_date,
+        batch_size=batch_size,
+    )
+
+    box_codes, box_detail_map = filter_current_box_consolidation(
+        stock_codes=all_stock_codes,
+        kline_map=kline_map,
+        box_days=box_days,
+        range_max=range_max,
+    )
+    final_codes = run_layer(
+        layer_name="箱体震荡筛选",
+        input_codes=all_stock_codes,
+        filter_func=lambda codes: box_codes,
+        layer_records=layer_records,
+    )
+
+    print(f"[选股] 最终入选：{len(final_codes)}")
+
+    selected_items = []
+    for stock_code in final_codes:
+        item = {
+            "code": stock_code,
+            "breakout_date": breakout_date or "",
+        }
+        item.update(box_detail_map.get(stock_code, {}))
+        selected_items.append(item)
+
+    return {
+        "strategy": "box_consolidation",
+        "breakout_date": breakout_date or "",
+        "box_days": int(box_days),
+        "range_max": float(range_max),
+        "initial_count": len(all_stock_codes),
+        "selected_count": len(final_codes),
+        "selected_codes": final_codes,
+        "selected_items": selected_items,
+        "layers": layer_records,
+    }
 
 
 def screen_volume_breakout(
@@ -286,60 +354,11 @@ def screen_volume_breakout(
 
 
 def main():
-    """手工验证箱体与放量突破，并支持全 A 股扫描。"""
+    """支持全 A 股箱体震荡和放量突破扫描。"""
     parser = argparse.ArgumentParser(
-        description="Cassa 选股脚本：支持单股验证，也支持从全部 A 股扫描放量突破箱体。",
+        description="Cassa 选股脚本：从全部 A 股扫描箱体震荡和放量突破。",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    box_parser = subparsers.add_parser(
-        "box",
-        help="判断一段 K 线是否为箱体",
-        description="读取某只股票截至指定交易日的最近 N 根 K 线，并判断这段区间是否属于箱体。",
-    )
-    box_parser.add_argument("--code", required=True, help="通达信格式股票代码，例如 000001.SZ")
-    box_parser.add_argument("--count", type=int, required=True, help="箱体区间的 K 线根数")
-    box_parser.add_argument(
-        "--breakout-date",
-        default="",
-        help="最后一根 K 线的交易日，格式 YYYY-MM-DD；不传则使用最新 K 线",
-    )
-    box_parser.add_argument(
-        "--range-max",
-        type=float,
-        default=DEFAULT_BOX_RANGE_MAX,
-        help=f"箱体振幅上限，默认 {DEFAULT_BOX_RANGE_MAX}",
-    )
-
-    breakout_parser = subparsers.add_parser(
-        "breakout",
-        help="判断某根 K 线是否放量突破前面箱体",
-        description="读取某只股票截至指定交易日的最近 N+1 根 K 线，前 N 根作为箱体，最后一根作为突破 K。",
-    )
-    breakout_parser.add_argument("--code", required=True, help="通达信格式股票代码，例如 000001.SZ")
-    breakout_parser.add_argument(
-        "--box-days",
-        type=int,
-        default=DEFAULT_BOX_DAYS,
-        help=f"箱体区间的 K 线根数，默认 {DEFAULT_BOX_DAYS}",
-    )
-    breakout_parser.add_argument(
-        "--breakout-date",
-        default="",
-        help="突破 K 的交易日，格式 YYYY-MM-DD；不传则使用最新 K 线",
-    )
-    breakout_parser.add_argument(
-        "--range-max",
-        type=float,
-        default=DEFAULT_BOX_RANGE_MAX,
-        help=f"箱体振幅上限，默认 {DEFAULT_BOX_RANGE_MAX}",
-    )
-    breakout_parser.add_argument(
-        "--volume-ratio-min",
-        type=float,
-        default=DEFAULT_VOLUME_RATIO_MIN,
-        help=f"放量倍数下限，默认 {DEFAULT_VOLUME_RATIO_MIN}",
-    )
 
     scan_breakout_parser = subparsers.add_parser(
         "scan-breakout",
@@ -379,45 +398,37 @@ def main():
         help=f"每批拉取多少只股票 K 线，默认 {DEFAULT_BATCH_SIZE}",
     )
 
+    scan_box_parser = subparsers.add_parser(
+        "scan-box",
+        help="从全部 A 股扫描当前仍处于箱体震荡的股票",
+        description="从全部 A 股出发，筛出最近 N 根 K 线仍处于箱体震荡的股票。",
+    )
+    scan_box_parser.add_argument(
+        "--box-days",
+        type=int,
+        default=DEFAULT_BOX_DAYS,
+        help=f"箱体区间的 K 线根数，默认 {DEFAULT_BOX_DAYS}",
+    )
+    scan_box_parser.add_argument(
+        "--breakout-date",
+        default="",
+        help="观察日，格式 YYYY-MM-DD；不传则使用今天/最新 K 线",
+    )
+    scan_box_parser.add_argument(
+        "--range-max",
+        type=float,
+        default=DEFAULT_BOX_RANGE_MAX,
+        help=f"箱体振幅上限，默认 {DEFAULT_BOX_RANGE_MAX}",
+    )
+    scan_box_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"每批拉取多少只股票 K 线，默认 {DEFAULT_BATCH_SIZE}",
+    )
+
     args = parser.parse_args()
     data.initialize(Path(__file__))
-
-    if args.command == "box":
-        kline_bars = load_single_stock_kline(
-            stock_code=args.code,
-            count=args.count,
-            breakout_date=args.breakout_date,
-        )
-        result = analyze_box_consolidation(kline_bars, range_max=args.range_max)
-        result["code"] = args.code
-        result["breakout_date"] = args.breakout_date or ""
-        print_json(result)
-        return
-
-    if args.command == "breakout":
-        kline_bars = load_single_stock_kline(
-            stock_code=args.code,
-            count=args.box_days + 1,
-            breakout_date=args.breakout_date,
-        )
-        if len(kline_bars) < args.box_days + 1:
-            raise RuntimeError(
-                f"{args.code} 在 {args.breakout_date or '最新'} 之前的 K 线不足 {args.box_days + 1} 根，"
-                f"实际只有 {len(kline_bars)} 根"
-            )
-
-        box_kline_bars = kline_bars[:-1]
-        breakout_kline = kline_bars[-1]
-        result = analyze_volume_breakout_from_box(
-            box_kline_bars=box_kline_bars,
-            breakout_kline=breakout_kline,
-            range_max=args.range_max,
-            volume_ratio_min=args.volume_ratio_min,
-        )
-        result["code"] = args.code
-        result["breakout_date"] = args.breakout_date or ""
-        print_json(result)
-        return
 
     if args.command == "scan-breakout":
         result = screen_volume_breakout(
@@ -425,6 +436,16 @@ def main():
             breakout_date=args.breakout_date,
             range_max=args.range_max,
             volume_ratio_min=args.volume_ratio_min,
+            batch_size=args.batch_size,
+        )
+        print_json(result)
+        return
+
+    if args.command == "scan-box":
+        result = screen_box_consolidation(
+            box_days=args.box_days,
+            breakout_date=args.breakout_date,
+            range_max=args.range_max,
             batch_size=args.batch_size,
         )
         print_json(result)
