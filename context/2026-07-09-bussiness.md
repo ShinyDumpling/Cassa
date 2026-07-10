@@ -3935,13 +3935,270 @@ def collect_report_item(target):
 
 ### 控制台输出建议
 
-第一版可以不强行加入控制台摘要，避免影响和旧 `cassa.py report` 对齐。
+控制台必须打印筹码分布摘要。
 
-如果后续需要展示，可在基本面/资金之后增加一行：
+可计算时，在基本面/资金之后、支撑压力之前增加一行：
 
 ```text
 筹码: 获利盘85.6%  平均成本13.42  90集中度0.128  状态: 较集中
 ```
+
+不可计算时也打印：
+
+```text
+筹码: 不可计算（有效日线/换手率样本不足 30 条）
+```
+
+如果没有具体原因，则打印：
+
+```text
+筹码: 不可计算
+```
+
+## 当前最新补充：report 计算价格与筹码控制台输出
+
+### 背景
+
+`market_snapshot.Now` 在盘前可能是 0。
+
+如果用 `Now=0` 计算乖离率、支撑压力、总市值或筹码获利比例，会出现类似：
+
+```text
+MA5: 22.65(-100.0%)
+风险: 乖离率过大(-100.0%)
+```
+
+用户确认：当日行情展示暂时不改，仍然来自 `market_snapshot`；但业务计算中的乖离率等指标要使用最新 K 线收盘价。
+
+### 最新规则
+
+`data.load_daily_kline()` 已在数据层按交易时段决定是否拼接实时K：
+
+```text
+盘中/午间：拼接实时K，最新K线 close_price 等于实时价
+盘前/盘后/休市：不拼接实时K，最新K线 close_price 是最近有效收盘价
+```
+
+因此 `business.py report` 的计算价格统一取：
+
+```text
+calc_price = 最新有效 daily_kline.close_price
+```
+
+用于：
+
+```text
+乖离率
+支撑压力
+总市值估算
+筹码获利比例
+```
+
+继续使用 `market_snapshot` 的地方：
+
+```text
+当日: Open / Max / Min / Now / LastClose
+现价: Now
+```
+
+也就是说：展示价格和计算价格可以不同。第一版先保障计算结果正确，不改当日行情展示。
+
+### 完整修改代码
+
+以下代码后续替换/补充到 `business.py` 中。
+
+#### 新增：最新有效K线收盘价
+
+```python
+def get_latest_kline_close(item, default=0.0):
+    """取最新有效日K收盘价，作为 report 计算用价格。"""
+    closes = extract_close_values(item)
+    if closes:
+        return closes[-1]
+    return safe_float(default)
+```
+
+#### 新增：筹码控制台格式化
+
+```python
+def simplify_chip_unavailable_note(note):
+    """把筹码不可计算原因压缩成控制台可读文本。"""
+    text = str(note or "").strip()
+    if not text:
+        return ""
+    prefix = "筹码分布暂无法计算："
+    if text.startswith(prefix):
+        text = text[len(prefix):]
+    return text.strip("。")
+
+
+def format_chip_line(chip):
+    """格式化筹码分布控制台输出。"""
+    if not isinstance(chip, dict) or not chip:
+        return "筹码: 不可计算"
+
+    if chip.get("status") == "todo":
+        reason = simplify_chip_unavailable_note(chip.get("note"))
+        if reason:
+            return f"筹码: 不可计算（{reason}）"
+        return "筹码: 不可计算"
+
+    profit_ratio = safe_float(chip.get("profit_ratio"))
+    avg_cost = safe_float(chip.get("avg_cost"))
+    concentration_90 = safe_float(chip.get("concentration_90"))
+    chip_status = str(chip.get("chip_status") or "未知")
+
+    parts = []
+    if profit_ratio > 0:
+        parts.append(f"获利盘{profit_ratio * 100:.1f}%")
+    if avg_cost > 0:
+        parts.append(f"平均成本{avg_cost:.2f}")
+    if concentration_90 > 0:
+        parts.append(f"90集中度{concentration_90:.3f}")
+    parts.append(f"状态: {chip_status}")
+
+    if len(parts) == 1 and chip_status == "未知":
+        return "筹码: 不可计算"
+    return f"筹码: {'  '.join(parts)}"
+```
+
+#### 替换：collect_chip_for_report 中的 current_price
+
+旧逻辑：
+
+```python
+return compute_chip_distribution(
+    daily_kline=daily_kline,
+    daily_turnover_history=daily_turnover_history,
+    current_price=market_snapshot.get("Now"),
+)
+```
+
+新逻辑：
+
+```python
+calc_price = get_latest_kline_close(item, default=market_snapshot.get("Now"))
+return compute_chip_distribution(
+    daily_kline=daily_kline,
+    daily_turnover_history=daily_turnover_history,
+    current_price=calc_price,
+)
+```
+
+完整函数：
+
+```python
+def collect_chip_for_report(item: Dict[str, Any]) -> Dict[str, Any]:
+    """计算 report 筹码分布；只消费 item 中的数据，并通过 data.py 补历史股本。"""
+    code = item.get("code")
+    daily_kline = item.get("daily_kline") or []
+    market_snapshot = item.get("market_snapshot") or {}
+    more_info = item.get("more_info") or {}
+    stock_info = item.get("stock_info") or {}
+
+    if not code:
+        return create_chip_unavailable("筹码分布暂无法计算：缺少股票代码。")
+    if not daily_kline:
+        return create_chip_unavailable("筹码分布暂无法计算：缺少日 K 数据。")
+
+    gb_history = fetch_gb_history(code, daily_kline)
+    daily_turnover_history = compute_daily_turnover_history(
+        daily_kline=daily_kline,
+        gb_history=gb_history,
+        current_float_capital=stock_info.get("ActiveCapital"),
+        current_turnover_rate=more_info.get("fHSL"),
+        snapshot_volume=market_snapshot.get("Volume"),
+    )
+    calc_price = get_latest_kline_close(item, default=market_snapshot.get("Now"))
+    return compute_chip_distribution(
+        daily_kline=daily_kline,
+        daily_turnover_history=daily_turnover_history,
+        current_price=calc_price,
+    )
+```
+
+#### 修改：format_report_item 中的价格口径
+
+`format_report_item()` 开头价格部分调整为：
+
+```python
+today = calculate_today_quote(item)
+display_price = safe_float(today.get("current_price"))
+calc_price = get_latest_kline_close(item, default=display_price)
+closes = extract_close_values(item)
+ma5_series = calculate_sma(closes, 5)
+ma10_series = calculate_sma(closes, 10)
+ma20_series = calculate_sma(closes, 20)
+ma60_series = calculate_sma(closes, 60)
+
+ma5 = ma5_series[-1] if ma5_series else 0.0
+ma10 = ma10_series[-1] if ma10_series else 0.0
+ma20 = ma20_series[-1] if ma20_series else 0.0
+ma60 = ma60_series[-1] if ma60_series else 0.0
+bias_ma5, bias_ma10, bias_ma20 = calculate_bias(calc_price, ma5, ma10, ma20)
+```
+
+支撑压力改为：
+
+```python
+support_ma5, support_ma10, support_levels, resistance_levels = judge_support_resistance(
+    item, ma5, ma10, ma20, calc_price
+)
+```
+
+总市值估算改为：
+
+```python
+market_cap = total_shares * calc_price / 10000 if total_shares > 0 and calc_price > 0 else 0.0
+```
+
+控制台展示仍用 `display_price`：
+
+```python
+lines.append(
+    f"现价: {display_price:.2f}  "
+    f"MA5: {ma5:.2f}({bias_ma5:+.1f}%)  "
+    f"MA10: {ma10:.2f}({bias_ma10:+.1f}%)  "
+    f"MA20: {ma20:.2f}({bias_ma20:+.1f}%)"
+)
+```
+
+资金后增加筹码行：
+
+```python
+lines.append(format_chip_line(item.get("chip")))
+```
+
+推荐放置位置：
+
+```python
+net_buy_amount = safe_float(more_info.get("Zjl"))
+main_net_inflow = safe_float(more_info.get("Zjl_HB"))
+if net_buy_amount != 0 or main_net_inflow != 0:
+    lines.append(f"资金: 主买净额{net_buy_amount:.0f}万  主力净流入{main_net_inflow:.0f}万")
+
+lines.append(format_chip_line(item.get("chip")))
+
+support_text = ", ".join(f"{value:.2f}" for value in support_levels) if support_levels else "无"
+resistance_text = ", ".join(f"{value:.2f}" for value in resistance_levels) if resistance_levels else "无"
+lines.append(f"支撑: {support_text}  压力: {resistance_text}")
+```
+
+### 验证建议
+
+盘前运行：
+
+```powershell
+python business.py report --codes 002185
+```
+
+预期：
+
+1. `当日` 和 `现价` 仍按 `market_snapshot` 打印。
+2. `MA5/MA10/MA20` 后面的乖离率不再出现 `-100.0%`。
+3. `支撑/压力` 不再因为 `Now=0` 被污染。
+4. 控制台出现 `筹码:` 行。
+5. 筹码不可计算时打印 `筹码: 不可计算（...）`。
 
 ## 字段 mapping 文件
 

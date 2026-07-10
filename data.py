@@ -447,30 +447,88 @@ def merge_realtime_kline_rows(db_rows, realtime_rows):
     return merged_rows
 
 
+def get_a_share_market_phase(now=None):
+    """按 A 股常规交易时间判断当前市场阶段。"""
+    current = now or datetime.now()
+    if current.weekday() >= 5:
+        return "closed"
+
+    minutes = current.hour * 60 + current.minute
+    morning_open = 9 * 60 + 30
+    morning_close = 11 * 60 + 30
+    afternoon_open = 13 * 60
+    afternoon_close = 15 * 60
+
+    if minutes < morning_open:
+        return "pre_market"
+    if morning_open <= minutes <= morning_close:
+        return "intraday"
+    if morning_close < minutes < afternoon_open:
+        return "midday"
+    if afternoon_open <= minutes <= afternoon_close:
+        return "intraday"
+    return "post_market"
+
+
+def should_merge_realtime_daily_kline(phase):
+    """只有盘中和午间才拼接实时日 K。"""
+    return phase in ("intraday", "midday")
+
+
+def get_daily_kline_numeric_value(row, *keys):
+    """从不同命名风格的日 K 行中读取数值。"""
+    for key in keys:
+        if key in row:
+            value = row.get(key)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def is_valid_daily_kline_row(row):
+    """判断日 K 是否有效，过滤未开盘或异常的 0 值 K 线。"""
+    open_price = get_daily_kline_numeric_value(row, "open_price", "Open", "open")
+    high_price = get_daily_kline_numeric_value(row, "high_price", "High", "high")
+    low_price = get_daily_kline_numeric_value(row, "low_price", "Low", "low")
+    close_price = get_daily_kline_numeric_value(row, "close_price", "Close", "close")
+    return open_price > 0 and high_price > 0 and low_price > 0 and close_price > 0
+
+
 def load_daily_kline(stock_list, count=120):
-    """读取日 K，并用通达信最新日 K 对返回数据做临时拼接或覆盖。
+    """读取日 K，并按交易时段决定是否拼接通达信实时日 K。
 
     这个函数是业务层统一读取入口：
     1. 先读本地数据库历史 K 线。
-    2. 再调用通达信拉最近几根日 K。
+    2. 只有盘中/午间才调用通达信拉最近几根日 K。
     3. 同日期则用通达信数据覆盖返回结果。
     4. 新日期则追加到返回结果末尾。
     5. 覆盖和追加只发生在返回值中，不写数据库。
     """
     result = {}
-    realtime_data = get_market_data(
-        stock_list=stock_list,
-        period="1d",
-        count=DAILY_KLINE_REALTIME_DAYS,
-        field_list=["Open", "High", "Low", "Close", "Volume", "Amount"],
-        fill_data=True,
-    )
-    realtime_rows = market_data_to_daily_kline_rows(realtime_data, stock_list)
+    phase = get_a_share_market_phase()
     db_rows_by_code = load_daily_kline_rows_from_db(stock_list, count=count)
+    realtime_rows = []
+
+    if should_merge_realtime_daily_kline(phase):
+        realtime_data = get_market_data(
+            stock_list=stock_list,
+            period="1d",
+            count=DAILY_KLINE_REALTIME_DAYS,
+            field_list=["Open", "High", "Low", "Close", "Volume", "Amount"],
+            fill_data=True,
+        )
+        realtime_rows = market_data_to_daily_kline_rows(realtime_data, stock_list)
+        realtime_rows = [row for row in realtime_rows if is_valid_daily_kline_row(row)]
+
     for stock_code in stock_list:
         db_rows = db_rows_by_code.get(stock_code, [])
         stock_realtime_rows = [r for r in realtime_rows if r["code"] == stock_code]
-        merged_rows = merge_realtime_kline_rows(db_rows, stock_realtime_rows)
+        if stock_realtime_rows:
+            merged_rows = merge_realtime_kline_rows(db_rows, stock_realtime_rows)
+        else:
+            merged_rows = [dict(row) for row in db_rows]
 
         if count is not None and len(merged_rows) > count:
             merged_rows = merged_rows[-count:]

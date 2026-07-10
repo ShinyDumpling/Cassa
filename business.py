@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -37,132 +38,7 @@ TREND_BIAS_THRESHOLD = 5.0
 TREND_STRONG_BULL_BIAS_RELAX = 1.5
 TREND_STRONG_BULL_STRENGTH_THRESHOLD = 70
 
-CYQ_JS_CODE = r"""
-// @ts-nocheck
-function CYQCalculator(index, klinedata) {
-    var maxprice = 0;
-    var minprice = 0;
-    var factor = 150;
-    var start = this.range ? Math.max(0, index - this.range + 1) : 0;
-    var kdata = klinedata.slice(start, Math.max(1, index + 1));
-    if (kdata.length === 0) throw 'invaild index';
-    for (var i = 0; i < kdata.length; i++) {
-        var elements = kdata[i];
-        maxprice = !maxprice ? elements.high : Math.max(maxprice, elements.high);
-        minprice = !minprice ? elements.low : Math.min(minprice, elements.low);
-    }
-
-    var accuracy = Math.max(0.01, (maxprice - minprice) / (factor - 1));
-    var yrange = [];
-    for (var i = 0; i < factor; i++) {
-        yrange.push((minprice + accuracy * i).toFixed(2) / 1);
-    }
-    var xdata = createNumberArray(factor);
-
-    for (var i = 0; i < kdata.length; i++) {
-        var eles = kdata[i];
-        var open = eles.open,
-            close = eles.close,
-            high = eles.high,
-            low = eles.low,
-            avg = (open + close + high + low) / 4,
-            turnoverRate = Math.min(1, eles.hsl / 100 || 0);
-
-        var H = Math.floor((high - minprice) / accuracy),
-            L = Math.ceil((low - minprice) / accuracy),
-            GPoint = [high == low ? factor - 1 : 2 / (high - low), Math.floor((avg - minprice) / accuracy)];
-        for (var n = 0; n < xdata.length; n++) {
-            xdata[n] *= (1 - turnoverRate);
-        }
-
-        if (high == low) {
-            xdata[GPoint[1]] += GPoint[0] * turnoverRate / 2;
-        } else {
-            for (var j = L; j <= H; j++) {
-                var curprice = minprice + accuracy * j;
-                if (curprice <= avg) {
-                    if (Math.abs(avg - low) < 1e-8) {
-                        xdata[j] += GPoint[0] * turnoverRate;
-                    } else {
-                        xdata[j] += (curprice - low) / (avg - low) * GPoint[0] * turnoverRate;
-                    }
-                } else {
-                    if (Math.abs(high - avg) < 1e-8) {
-                        xdata[j] += GPoint[0] * turnoverRate;
-                    } else {
-                        xdata[j] += (high - curprice) / (high - avg) * GPoint[0] * turnoverRate;
-                    }
-                }
-            }
-        }
-    }
-
-    var currentprice = klinedata[index].close;
-    var totalChips = 0;
-    for (var i = 0; i < factor; i++) {
-        var x = xdata[i].toPrecision(12) / 1;
-        totalChips += x;
-    }
-    var result = new CYQData();
-    result.x = xdata;
-    result.y = yrange;
-    result.benefitPart = result.getBenefitPart(currentprice);
-    result.avgCost = getCostByChip(totalChips * 0.5).toFixed(2);
-    result.percentChips = {
-        '90': result.computePercentChips(0.9),
-        '70': result.computePercentChips(0.7)
-    };
-    return result;
-
-    function getCostByChip(chip) {
-        var result = 0, sum = 0;
-        for (var i = 0; i < factor; i++) {
-            var x = xdata[i].toPrecision(12) / 1;
-            if (sum + x > chip) {
-                result = minprice + i * accuracy;
-                break;
-            }
-            sum += x;
-        }
-        return result;
-    }
-
-    function CYQData() {
-        this.x = arguments[0];
-        this.y = arguments[1];
-        this.benefitPart = arguments[2];
-        this.avgCost = arguments[3];
-        this.percentChips = arguments[4];
-        this.computePercentChips = function (percent) {
-            if (percent > 1 || percent < 0) throw 'argument "percent" out of range';
-            var ps = [(1 - percent) / 2, (1 + percent) / 2];
-            var pr = [getCostByChip(totalChips * ps[0]), getCostByChip(totalChips * ps[1])];
-            return {
-                priceRange: [pr[0].toFixed(2), pr[1].toFixed(2)],
-                concentration: pr[0] + pr[1] === 0 ? 0 : (pr[1] - pr[0]) / (pr[0] + pr[1])
-            };
-        };
-        this.getBenefitPart = function (price) {
-            var below = 0;
-            for (var i = 0; i < factor; i++) {
-                var x = xdata[i].toPrecision(12) / 1;
-                if (price >= minprice + i * accuracy) {
-                    below += x;
-                }
-            }
-            return totalChips == 0 ? 0 : below / totalChips;
-        };
-    }
-}
-
-function createNumberArray(count) {
-    var array = [];
-    for (var i = 0; i < count; i++) {
-        array.push(0);
-    }
-    return array;
-}
-"""
+CYQ_JS_PATH = PROJECT_ROOT / "cyq_calculator.js"
 
 
 def safe_float(value, default=None):
@@ -175,6 +51,11 @@ def safe_float(value, default=None):
         return result
     except (TypeError, ValueError):
         return default
+
+
+def load_cyq_js_code():
+    """读取独立保存的筹码分布 JS 算法文件。"""
+    return CYQ_JS_PATH.read_text(encoding="utf-8")
 
 
 def has_market_suffix(code):
@@ -764,6 +645,14 @@ def calculate_today_quote(item):
     }
 
 
+def get_latest_kline_close(item, default=0.0):
+    """取最新有效日 K 收盘价，作为 report 计算用价格。"""
+    closes = extract_close_values(item)
+    if closes:
+        return closes[-1]
+    return safe_float(default, 0.0)
+
+
 def extract_industry_and_concepts(relation_rows):
     """从所属板块数组中提取行业和概念名称。"""
     industries = []
@@ -1057,7 +946,7 @@ def compute_chip_distribution(
         return create_chip_unavailable("筹码分布暂无法计算：有效日线/换手率样本不足 30 条。")
 
     js_engine = MiniRacer()
-    js_engine.eval(CYQ_JS_CODE)
+    js_engine.eval(load_cyq_js_code())
     result = js_engine.call("CYQCalculator", len(records) - 1, records)
 
     price_now = safe_float(current_price, safe_float(records[-1].get("close")))
@@ -1115,10 +1004,11 @@ def collect_chip_for_report(item: Dict[str, Any]) -> Dict[str, Any]:
         current_turnover_rate=more_info.get("fHSL"),
         snapshot_volume=market_snapshot.get("Volume"),
     )
+    calc_price = get_latest_kline_close(item, default=market_snapshot.get("Now"))
     return compute_chip_distribution(
         daily_kline=daily_kline,
         daily_turnover_history=daily_turnover_history,
-        current_price=market_snapshot.get("Now"),
+        current_price=calc_price,
     )
 
 
@@ -1143,12 +1033,54 @@ def collect_report_item(target):
     return item
 
 
+def simplify_chip_unavailable_note(note):
+    """把筹码不可计算原因压缩成控制台可读文本。"""
+    text = str(note or "").strip()
+    if not text:
+        return ""
+    prefix = "筹码分布暂无法计算："
+    if text.startswith(prefix):
+        text = text[len(prefix):]
+    return text.strip("。")
+
+
+def format_chip_line(chip):
+    """格式化筹码分布控制台输出。"""
+    if not isinstance(chip, dict) or not chip:
+        return "筹码: 不可计算"
+
+    if chip.get("status") == "todo":
+        reason = simplify_chip_unavailable_note(chip.get("note"))
+        if reason:
+            return f"筹码: 不可计算（{reason}）"
+        return "筹码: 不可计算"
+
+    profit_ratio = safe_float(chip.get("profit_ratio"), 0.0)
+    avg_cost = safe_float(chip.get("avg_cost"), 0.0)
+    concentration_90 = safe_float(chip.get("concentration_90"), 0.0)
+    chip_status = str(chip.get("chip_status") or "未知")
+
+    parts = []
+    if profit_ratio > 0:
+        parts.append(f"获利盘{profit_ratio * 100:.1f}%")
+    if avg_cost > 0:
+        parts.append(f"平均成本{avg_cost:.2f}")
+    if concentration_90 > 0:
+        parts.append(f"90集中度{concentration_90:.3f}")
+    parts.append(f"状态: {chip_status}")
+
+    if len(parts) == 1 and chip_status == "未知":
+        return "筹码: 不可计算"
+    return f"筹码: {'  '.join(parts)}"
+
+
 def format_report_item(item):
     """格式化单个 report item，业务判断口径对齐旧 cassa.py report。"""
     relation = item.get("relation") or []
     industry, concepts = extract_industry_and_concepts(relation)
     today = calculate_today_quote(item)
-    current_price = safe_float(today.get("current_price"))
+    display_price = safe_float(today.get("current_price"), 0.0)
+    calc_price = get_latest_kline_close(item, default=display_price)
     closes = extract_close_values(item)
     ma5_series = calculate_sma(closes, 5)
     ma10_series = calculate_sma(closes, 10)
@@ -1159,7 +1091,7 @@ def format_report_item(item):
     ma10 = ma10_series[-1] if ma10_series else 0.0
     ma20 = ma20_series[-1] if ma20_series else 0.0
     ma60 = ma60_series[-1] if ma60_series else 0.0
-    bias_ma5, bias_ma10, bias_ma20 = calculate_bias(current_price, ma5, ma10, ma20)
+    bias_ma5, bias_ma10, bias_ma20 = calculate_bias(calc_price, ma5, ma10, ma20)
 
     trend_status, ma_alignment, trend_strength = judge_trend_status(ma5_series, ma10_series, ma20_series)
 
@@ -1170,7 +1102,7 @@ def format_report_item(item):
     volume_status, volume_ratio, volume_trend = judge_volume_status(closes, volume_ratio)
 
     support_ma5, support_ma10, support_levels, resistance_levels = judge_support_resistance(
-        item, ma5, ma10, ma20, current_price
+        item, ma5, ma10, ma20, calc_price
     )
 
     macd_dif, macd_dea, macd_bar, macd_status, macd_signal = judge_macd_status(item)
@@ -1198,7 +1130,7 @@ def format_report_item(item):
     buy_signal = judge_buy_signal(signal_score, trend_status)
 
     total_shares = safe_float(stock_info.get("J_zgb"))
-    market_cap = total_shares * current_price / 10000 if total_shares > 0 and current_price > 0 else 0.0
+    market_cap = total_shares * calc_price / 10000 if total_shares > 0 and calc_price > 0 else 0.0
 
     lines = [f"=== {strip_code_suffix(item.get('code', ''))} {item.get('name', '')} ===".rstrip()]
     info_parts = []
@@ -1216,7 +1148,7 @@ def format_report_item(item):
     )
     lines.append(f"趋势: {trend_status} ({trend_strength:.0f}/100)    信号: {buy_signal} ({signal_score}分)")
     lines.append(
-        f"现价: {current_price:.2f}  "
+        f"现价: {display_price:.2f}  "
         f"MA5: {ma5:.2f}({bias_ma5:+.1f}%)  "
         f"MA10: {ma10:.2f}({bias_ma10:+.1f}%)  "
         f"MA20: {ma20:.2f}({bias_ma20:+.1f}%)"
@@ -1244,6 +1176,8 @@ def format_report_item(item):
     main_net_inflow = safe_float(more_info.get("Zjl_HB"))
     if net_buy_amount != 0 or main_net_inflow != 0:
         lines.append(f"资金: 主买净额{net_buy_amount:.0f}万  主力净流入{main_net_inflow:.0f}万")
+
+    lines.append(format_chip_line(item.get("chip")))
 
     support_text = ", ".join(f"{value:.2f}" for value in support_levels) if support_levels else "无"
     resistance_text = ", ".join(f"{value:.2f}" for value in resistance_levels) if resistance_levels else "无"
@@ -1292,6 +1226,9 @@ def run_report(args):
 
 def main():
     """业务脚本 CLI 入口。"""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="Cassa 业务逻辑脚本。")
     subparsers = parser.add_subparsers(dest="command", required=True)
 

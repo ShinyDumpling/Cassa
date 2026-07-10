@@ -1999,6 +1999,185 @@ data.py
 5. 是否逐步迁移旧 `cassa.py` 的调用方。
 6. 是否新增 `main.py` 作为正式业务入口，并让 `data.py` 回归纯数据接口模块。
 
+## 当前最新补充：日K按交易时段拼接实时K
+
+### 背景
+
+`business.py report` 在盘前运行时，通达信可能返回当天尚未开盘的日 K，OHLC 都是 0。
+
+如果 `data.load_daily_kline()` 无条件把这根实时 K 拼进业务数据，后续 MA、RSI、趋势、乖离率、筹码分布等计算都可能被污染。
+
+用户确认：日 K 拉取与拼接逻辑属于数据层，放在 `data.load_daily_kline()` 里处理，不在业务层过滤。
+
+### 最新规则
+
+`data.load_daily_kline()` 先判断当前 A 股时段：
+
+```text
+盘中      intraday     09:30 - 11:30, 13:00 - 15:00
+午间      midday       11:30 - 13:00，按盘中处理
+盘前      pre_market   09:30 之前
+盘后      post_market  15:00 之后
+休市      closed       周六/周日
+```
+
+拼接规则：
+
+```text
+intraday / midday:
+  走原来的逻辑：本地历史日K + 通达信最近实时日K拼接/覆盖
+
+pre_market / post_market / closed:
+  只读本地历史日K，不调用 get_market_data 拉实时日K，不拼接当日实时K
+```
+
+盘中即使拉实时 K，也要过滤无效 K：
+
+```text
+open_price > 0
+high_price > 0
+low_price > 0
+close_price > 0
+```
+
+### 完整修改代码
+
+以下代码后续替换/补充到 `data.py` 中。
+
+#### 新增：A 股时段判断
+
+```python
+def get_a_share_market_phase(now=None):
+    """按 A 股常规交易时间判断当前市场阶段。
+
+    第一版不接节假日表，只用工作日和时间判断。
+    """
+    current = now or datetime.now()
+    if current.weekday() >= 5:
+        return "closed"
+
+    minutes = current.hour * 60 + current.minute
+    morning_open = 9 * 60 + 30
+    morning_close = 11 * 60 + 30
+    afternoon_open = 13 * 60
+    afternoon_close = 15 * 60
+
+    if minutes < morning_open:
+        return "pre_market"
+    if morning_open <= minutes <= morning_close:
+        return "intraday"
+    if morning_close < minutes < afternoon_open:
+        return "midday"
+    if afternoon_open <= minutes <= afternoon_close:
+        return "intraday"
+    return "post_market"
+
+
+def should_merge_realtime_daily_kline(phase):
+    """只有盘中和午间才拼接实时日K。"""
+    return phase in ("intraday", "midday")
+```
+
+#### 新增：实时日K有效性判断
+
+```python
+def get_daily_kline_numeric_value(row, *keys):
+    """从不同命名风格的日K行中读取数值。"""
+    for key in keys:
+        if key in row:
+            value = row.get(key)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def is_valid_daily_kline_row(row):
+    """判断日K是否有效，过滤未开盘或异常的0值K线。"""
+    open_price = get_daily_kline_numeric_value(row, "open_price", "Open", "open")
+    high_price = get_daily_kline_numeric_value(row, "high_price", "High", "high")
+    low_price = get_daily_kline_numeric_value(row, "low_price", "Low", "low")
+    close_price = get_daily_kline_numeric_value(row, "close_price", "Close", "close")
+
+    return (
+        open_price > 0
+        and high_price > 0
+        and low_price > 0
+        and close_price > 0
+    )
+```
+
+#### 替换：load_daily_kline
+
+```python
+def load_daily_kline(stock_list, count=120):
+    """读取日 K，并按交易时段决定是否拼接通达信实时日K。
+
+    规则：
+    1. 盘中/午间：读取本地历史K线，再用通达信最近日K临时覆盖或追加。
+    2. 盘前/盘后/休市：只读取本地历史K线，不拼接实时K线。
+    3. 盘中拼接前仍过滤 OHLC <= 0 的无效K线。
+    4. 覆盖和追加只发生在返回值中，不写数据库。
+    """
+    result = {}
+    phase = get_a_share_market_phase()
+    db_rows_by_code = load_daily_kline_rows_from_db(stock_list, count=count)
+
+    realtime_rows = []
+    if should_merge_realtime_daily_kline(phase):
+        realtime_data = get_market_data(
+            stock_list=stock_list,
+            period="1d",
+            count=DAILY_KLINE_REALTIME_DAYS,
+            field_list=["Open", "High", "Low", "Close", "Volume", "Amount"],
+            fill_data=True,
+        )
+        realtime_rows = market_data_to_daily_kline_rows(realtime_data, stock_list)
+        realtime_rows = [row for row in realtime_rows if is_valid_daily_kline_row(row)]
+
+    for stock_code in stock_list:
+        db_rows = db_rows_by_code.get(stock_code, [])
+        stock_realtime_rows = [row for row in realtime_rows if row["code"] == stock_code]
+
+        if stock_realtime_rows:
+            merged_rows = merge_realtime_kline_rows(db_rows, stock_realtime_rows)
+        else:
+            merged_rows = [dict(row) for row in db_rows]
+
+        if count is not None and len(merged_rows) > count:
+            merged_rows = merged_rows[-count:]
+        result[stock_code] = merged_rows
+
+    return result
+```
+
+### 验证建议
+
+盘前验证：
+
+```powershell
+python data.py load-daily-kline --code 002185.SZ --count 120
+```
+
+预期：
+
+1. 不调用实时日K拼接。
+2. 返回最后一根本地历史有效 K。
+3. 不出现当天 OHLC 全 0 的 K 线。
+
+盘中验证：
+
+```powershell
+python data.py load-daily-kline --code 002185.SZ --count 120
+```
+
+预期：
+
+1. 调用通达信最近日K。
+2. 当天实时日K有效时覆盖/追加到返回值。
+3. 当天实时日K OHLC 为 0 时被过滤。
+
 ## 来源会话
 
 来源：2026-07-09 当前会话。
