@@ -162,6 +162,19 @@ TREND_STRONG_BULL_BIAS_RELAX = 1.5
 TREND_STRONG_BULL_STRENGTH_THRESHOLD = 70
 TREND_MIN_KLINE_COUNT = 60
 
+# 板块选股常量
+SECTOR_PICK_KLINES_LOOKBACK = 120
+SECTOR_PICK_MIN_TREND_DAYS = 3
+SECTOR_PICK_TREND_BREAK_DAYS = 2
+SECTOR_PICK_VOL_MA_PERIOD = 5
+SECTOR_PICK_VOL_EXPAND_RATIO = 1.2
+SECTOR_PICK_TOP_GAINER_N = 5
+SECTOR_PICK_TOP_GAINER_MIN_HITS = 3
+SECTOR_PICK_ELASTICITY_RATIO = 0.6
+SECTOR_PICK_VOLUME_TOP_N = 5
+SECTOR_PICK_VOL_LOOKBACK = 20   # filter_trends_by_volume 回溯窗口
+SECTOR_PICK_VOL_MIN_RATIO = 1.0  # filter_trends_by_volume 放量比率阈值
+
 
 # ============================================================================
 # 第三层：数据结构层
@@ -339,6 +352,57 @@ class TrendAnalysisResult:
     # TODO: 筹码分布（获利比例/平均成本/集中度）—— 暂无数据源
     # TODO: 舆情/新闻/公告 —— 暂无数据源
     # TODO: 考虑把所有通达信接口的数据都接入（stock_info / more_info / snapshot 等全量字段）
+
+@dataclass
+class TrendPeriod:
+    """一次上涨趋势的起止区间。
+
+    Attributes:
+        start_date: 趋势启动日期 YYYY-MM-DD。
+        end_date: 趋势结束日期 YYYY-MM-DD。
+        is_active: 趋势是否仍在进行中。
+        start_index: 在 K 线序列中的起始索引（0-based）。
+        end_index: 在 K 线序列中的结束索引（0-based）。
+    """
+    start_date: str
+    end_date: str
+    is_active: bool
+    start_index: int
+    end_index: int
+
+
+@dataclass
+class SectorPickResult:
+    """板块内选股的输出结果：五个并行集合，允许股票跨集合出现。
+
+    Attributes:
+        block_code: 板块纯数字代码。
+        block_name: 板块名称。
+        block_trend: 板块当前的上涨趋势区间，None 表示板块不在上涨趋势中。
+        leading_starters: 领先启动股票代码列表（纯数字）。
+        lagging_catchers: 滞后补涨股票代码列表（纯数字）。
+        top_gainers: 涨幅前列股票代码列表（纯数字）。
+        high_elasticity: 高弹性股票代码列表（纯数字）。
+        volume_top5: 成交量 TOP5 股票代码列表（纯数字）。
+        stock_names: 股票代码到名称的映射。
+    """
+    block_code: str
+    block_name: str
+    block_trend: TrendPeriod | None = None
+    leading_starters: list[str] = field(default_factory=list)
+    lagging_catchers: list[str] = field(default_factory=list)
+    top_gainers: list[str] = field(default_factory=list)
+    high_elasticity: list[str] = field(default_factory=list)
+    volume_top5: list[str] = field(default_factory=list)
+    stock_names: dict[str, str] = field(default_factory=dict)
+    # 以下为打印用的元数据
+    stock_trend_dates: dict[str, str] = field(default_factory=dict)  # code -> start_date
+    gainer_hits: dict[str, int] = field(default_factory=dict)        # code -> hit count
+    elasticity_info: dict[str, float] = field(default_factory=dict)  # code -> hit_ratio
+    stock_volumes: dict[str, float] = field(default_factory=dict)    # code -> 最新成交量
+    stock_avg_gains: dict[str, float] = field(default_factory=dict)   # code -> 趋势期内日均涨幅%
+    stock_total_changes: dict[str, float] = field(default_factory=dict)  # code -> 趋势期内累计涨跌幅%
+    sector_total_change: float = 0.0  # 板块趋势期内累计涨跌幅%
 
 
 # ============================================================================
@@ -2327,6 +2391,450 @@ def collect_key_sector_member_snapshot(client: TdxClient, key_blocks: list[dict[
 
 
 # ============================================================================
+# 第六层补充续：板块选股模块 —— 趋势识别 + 四维分类 + 成交量筛选
+# ============================================================================
+
+
+def detect_trend_up_conditions(
+    kline_bars: list[KlineBar],
+    macd: MacdResult,
+    vol_ma_period: int = SECTOR_PICK_VOL_MA_PERIOD,
+    vol_expand_ratio: float = SECTOR_PICK_VOL_EXPAND_RATIO,
+    debug: bool = False,
+) -> list[bool]:
+    """对每一天逐一判断是否满足"趋势涨"条件，返回与 K 线等长的 bool 序列。
+
+    趋势涨判断规则：
+      1. 均线多头：MA5 > MA10 > MA20
+      2. 价格位置：收盘价 >= MA20
+      3. MACD 多头：DIF > DEA
+      4. 量能放量：当日成交量 > MA(VOL, 5) × 倍数
+
+    前 20 根 K 线因 MA20 未充分计算而统一标记为 False。
+
+    Args:
+        kline_bars: 按日期升序排列的 K 线列表。
+        macd: 与 K 线已对齐的 MACD 结果。
+        vol_ma_period: 均量周期。
+        vol_expand_ratio: 放量倍数阈值。
+        debug: 是否打印逐日条件判断细节。
+
+    Returns:
+        与 kline_bars 等长的 bool 列表，True 表示该日满足全部趋势涨条件。
+    """
+    if len(kline_bars) < 21:
+        return [False] * len(kline_bars)
+
+    closes = [bar.close_price for bar in kline_bars]
+    volumes = [bar.volume for bar in kline_bars]
+
+    ma5 = calculate_sma(closes, 5)
+    ma10 = calculate_sma(closes, 10)
+    ma20 = calculate_sma(closes, 20)
+    vol_ma5 = calculate_sma(volumes, vol_ma_period)
+
+    result: list[bool] = []
+    true_count = 0
+    for i in range(len(kline_bars)):
+        if i < 20:
+            result.append(False)
+            continue
+
+        date_str = kline_bars[i].trade_date
+        close = kline_bars[i].close_price
+        reasons: list[str] = []
+
+        # 条件1：均线多头 MA5 > MA10 > MA20
+        cond1 = ma5[i] > 0 and ma10[i] > 0 and ma20[i] > 0 and ma5[i] > ma10[i] > ma20[i]
+        if not cond1:
+            reasons.append(f"MA5={ma5[i]:.2f} MA10={ma10[i]:.2f} MA20={ma20[i]:.2f}")
+
+        # 条件2：收盘 >= MA20
+        cond2 = close >= ma20[i]
+        if not cond2:
+            reasons.append(f"close={close:.2f} < MA20={ma20[i]:.2f}")
+
+        # 条件3：MACD 多头 DIF > DEA
+        cond3 = i < len(macd.dif) and i < len(macd.dea) and macd.dif[i] > macd.dea[i]
+        if not cond3:
+            dif = macd.dif[i] if i < len(macd.dif) else 0
+            dea = macd.dea[i] if i < len(macd.dea) else 0
+            reasons.append(f"DIF={dif:.4f} DEA={dea:.4f}")
+
+        # 条件4：量能改为后置过滤（见 filter_trends_by_volume），此处直接通过
+        cond4 = True
+
+        all_pass = cond1 and cond2 and cond3 and cond4
+        result.append(all_pass)
+
+        if all_pass:
+            true_count += 1
+            if debug and (true_count <= 10 or true_count % 20 == 0):
+                print(f"  [TRUE #{true_count}] {date_str} close={close:.2f} MA5={ma5[i]:.2f} MA10={ma10[i]:.2f} MA20={ma20[i]:.2f} DIF={macd.dif[i]:.4f} DEA={macd.dea[i]:.4f}")
+        elif debug and i >= len(kline_bars) - 5:
+            # 打印最后 5 天的失败原因
+            print(f"  [FALSE] {date_str} close={close:.2f} | {' | '.join(reasons)}")
+
+    if debug:
+        print(f"  趋势涨天数: {true_count}/{len(kline_bars)}")
+
+    return result
+
+
+def extract_trend_periods(
+    is_trend_up: list[bool],
+    dates: list[str],
+    min_trend_days: int = SECTOR_PICK_MIN_TREND_DAYS,
+    break_days: int = SECTOR_PICK_TREND_BREAK_DAYS,
+) -> list[TrendPeriod]:
+    """从逐日 bool 序列中提取连续的上涨趋势区间。
+
+    扫描规则：
+      - 连续 True 段长度 >= min_trend_days 才记为有效趋势。
+      - 连续 break_days 个 False 视为趋势结束。
+      - is_active：最后一段趋势若最后一根 K 线为 True，则标记为活跃。
+
+    Args:
+        is_trend_up: detect_trend_up_conditions 的输出，与 K 线等长的 bool 列表。
+        dates: 与 is_trend_up 等长的日期序列 YYYY-MM-DD。
+        min_trend_days: 最少连续天数才构成一段趋势。
+        break_days: 连续几天不满足才认定趋势结束。
+
+    Returns:
+        按时间先后排列的 TrendPeriod 列表。
+    """
+    total = len(is_trend_up)
+    if total == 0:
+        return []
+
+    periods: list[TrendPeriod] = []
+    false_streak = 0
+    start_idx: int | None = None
+
+    for i in range(total):
+        if is_trend_up[i]:
+            false_streak = 0
+            if start_idx is None:
+                start_idx = i
+        else:
+            false_streak += 1
+            if start_idx is not None:
+                end_idx = i - 1
+                if end_idx - start_idx + 1 >= min_trend_days:
+                    periods.append(TrendPeriod(
+                        start_date=dates[start_idx],
+                        end_date=dates[end_idx],
+                        is_active=False,
+                        start_index=start_idx,
+                        end_index=end_idx,
+                    ))
+                start_idx = None
+            # 连续 break_days 天不满足，后续才能开启新趋势
+            if false_streak >= break_days:
+                start_idx = None
+
+    # 末尾未闭合的趋势
+    if start_idx is not None:
+        end_idx = total - 1
+        if end_idx - start_idx + 1 >= min_trend_days:
+            periods.append(TrendPeriod(
+                start_date=dates[start_idx],
+                end_date=dates[end_idx],
+                is_active=is_trend_up[-1],
+                start_index=start_idx,
+                end_index=end_idx,
+            ))
+
+    return periods
+
+
+def find_latest_trend_period(periods: list[TrendPeriod]) -> TrendPeriod | None:
+    """从趋势区间列表中取出最近的一个。
+
+    优先返回活跃趋势（is_active=True），否则返回按结束日期最晚的那个。
+
+    Args:
+        periods: extract_trend_periods 的输出。
+
+    Returns:
+        最近的一段 TrendPeriod，列表为空时返回 None。
+    """
+    if not periods:
+        return None
+
+    # 优先活跃趋势（最后一个为 True 的）
+    for period in reversed(periods):
+        if period.is_active:
+            return period
+
+    # 否则取最后一个（按结束日期最晚）
+    return periods[-1]
+
+
+def filter_trends_by_volume(
+    periods: list[TrendPeriod],
+    kline_bars: list[KlineBar],
+    lookback: int = SECTOR_PICK_VOL_LOOKBACK,
+    ratio: float = SECTOR_PICK_VOL_MIN_RATIO,
+) -> list[TrendPeriod]:
+    """筛掉日均成交量未放大的趋势段。
+
+    对每段趋势，计算段内日均成交量，与趋势启动前 lookback 天的日均量比较。
+    段内日均量 > 前期日均量 × ratio 才保留。
+
+    Args:
+        periods: 候选趋势区间列表。
+        kline_bars: 按日期升序的 K 线列表，需与 periods 的 index 对齐。
+        lookback: 回溯窗口（天），用于计算趋势前基准均量。
+        ratio: 放量比率阈值。1.0 表示只需高于前期均量。
+
+    Returns:
+        通过量能过滤的趋势区间列表。
+    """
+    if not periods or len(kline_bars) < lookback:
+        return periods
+
+    volumes = [bar.volume for bar in kline_bars]
+    result: list[TrendPeriod] = []
+
+    for p in periods:
+        seg_len = p.end_index - p.start_index + 1
+        seg_avg_vol = sum(volumes[p.start_index:p.end_index + 1]) / seg_len
+
+        pre_start = max(0, p.start_index - lookback)
+        pre_len = p.start_index - pre_start
+        if pre_len == 0:
+            continue
+        pre_avg_vol = sum(volumes[pre_start:p.start_index]) / pre_len
+
+        if pre_avg_vol > 0 and seg_avg_vol > pre_avg_vol * ratio:
+            result.append(p)
+
+    return result
+
+def _compute_daily_changes(bars: list[KlineBar]) -> list[float]:
+    """计算每根 K 线相对于前一根的涨跌幅百分比。
+
+    Args:
+        bars: 按日期升序排列的 K 线列表。
+
+    Returns:
+        与 bars 等长的涨跌幅列表，bar[0] 的涨跌幅为 0.0。
+    """
+    changes: list[float] = []
+    for i in range(len(bars)):
+        if i == 0 or bars[i - 1].close_price <= 0:
+            changes.append(0.0)
+        else:
+            changes.append(
+                (bars[i].close_price - bars[i - 1].close_price)
+                / bars[i - 1].close_price
+                * 100
+            )
+    return changes
+
+
+def classify_leading_starters(
+    stock_codes: list[str],
+    stock_trends: dict[str, TrendPeriod],
+    sector_trend_start: str,
+) -> list[str]:
+    """找出趋势启动早于板块的股票（领先启动）。
+
+    判断依据：股票的上涨趋势启动日严格早于板块的上涨趋势启动日。
+
+    Args:
+        stock_codes: 所有有效成分股代码。
+        stock_trends: 每只股票已有的趋势区间（无趋势的股票不在字典中）。
+        sector_trend_start: 板块趋势启动日 YYYY-MM-DD。
+
+    Returns:
+        领先启动的股票代码列表（纯数字，无序集合）。
+    """
+    result: list[str] = []
+    for code in stock_codes:
+        trend = stock_trends.get(code)
+        if trend is not None and trend.start_date < sector_trend_start:
+            result.append(code)
+    return result
+
+
+def classify_lagging_catchers(
+    stock_codes: list[str],
+    stock_trends: dict[str, TrendPeriod],
+    sector_trend_start: str,
+) -> list[str]:
+    """找出趋势启动晚于板块的股票（滞后补涨）。
+
+    判断依据：股票的上涨趋势启动日严格晚于板块的上涨趋势启动日。
+
+    Args:
+        stock_codes: 所有有效成分股代码。
+        stock_trends: 每只股票已有的趋势区间。
+        sector_trend_start: 板块趋势启动日 YYYY-MM-DD。
+
+    Returns:
+        滞后补涨的股票代码列表（纯数字，无序集合）。
+    """
+    result: list[str] = []
+    for code in stock_codes:
+        trend = stock_trends.get(code)
+        if trend is not None and trend.start_date > sector_trend_start:
+            result.append(code)
+    return result
+
+
+def classify_top_gainers(
+    stock_daily_changes: dict[str, list[float]],
+    stock_codes: list[str],
+    sector_trend: TrendPeriod,
+    top_n: int = SECTOR_PICK_TOP_GAINER_N,
+    min_hits: int = SECTOR_PICK_TOP_GAINER_MIN_HITS,
+) -> tuple[list[str], dict[str, int]]:
+    """找出板块趋势区间内频繁进入每日涨幅前列的股票。
+
+    在板块上涨趋势的每一天（从 start_index 到 end_index），
+    取涨幅前 top_n 名，记录命中次数。命中次数 >= min_hits 的股票入选。
+
+    Args:
+        stock_daily_changes: 每只股票日涨跌幅序列，与板块 K 线对齐。
+        stock_codes: 所有有效成分股代码。
+        sector_trend: 板块当前上涨趋势区间。
+        top_n: 每天取涨幅前几。
+        min_hits: 趋势期内至少进入多少次。
+
+    Returns:
+        (股票代码列表, 命中次数映射) 的元组。
+    """
+    if not stock_codes:
+        return []
+
+    hit_counter: dict[str, int] = {code: 0 for code in stock_codes}
+    start_i = sector_trend.start_index
+    end_i = sector_trend.end_index
+
+    # 排除 changes 序列长度不足的股票
+    valid_codes: set[str] = set()
+    for code in stock_codes:
+        changes = stock_daily_changes.get(code)
+        if changes is not None and len(changes) > end_i:
+            valid_codes.add(code)
+
+    if not valid_codes:
+        return []
+
+    for day_i in range(start_i, end_i + 1):
+        day_scores: list[tuple[str, float]] = []
+        for code in valid_codes:
+            changes = stock_daily_changes[code]
+            day_scores.append((code, changes[day_i]))
+        day_scores.sort(key=lambda x: x[1], reverse=True)
+        for code, _ in day_scores[:top_n]:
+            hit_counter[code] += 1
+
+    result: list[str] = []
+    for code, count in hit_counter.items():
+        if count >= min_hits:
+            result.append(code)
+    return result, hit_counter
+
+
+def classify_high_elasticity(
+    sector_changes: list[float],
+    stock_daily_changes: dict[str, list[float]],
+    stock_codes: list[str],
+    sector_trend: TrendPeriod,
+    threshold_ratio: float = SECTOR_PICK_ELASTICITY_RATIO,
+) -> tuple[list[str], dict[str, float]]:
+    """找出高弹性股票：板块涨时涨更多，板块跌时跌更狠。
+
+    在板块趋势区间内遍历每一天：
+      - 板块上涨日（sector_change > 0）：股票涨幅 >= 板块涨幅 -> 命中
+      - 板块下跌日（sector_change < 0）：股票跌幅 >= 板块跌幅（更负）-> 命中
+      - 板块平盘日（sector_change == 0）：跳过不计
+
+    命中率 = 命中天数 /（板块上涨日 + 板块下跌日）
+    命中率 >= threshold_ratio 即视为高弹性。
+
+    Args:
+        sector_changes: 板块日涨跌幅序列。
+        stock_daily_changes: 每只股票日涨跌幅序列，与 sector_changes 同长。
+        stock_codes: 待判断的股票代码列表。
+        sector_trend: 板块趋势区间。
+        threshold_ratio: 命中率阈值。
+
+    Returns:
+        (股票代码列表, 命中率映射) 的元组。
+    """
+    eligible_days: list[int] = []
+    day_directions: list[str] = []
+
+    start_i = sector_trend.start_index
+    end_i = sector_trend.end_index
+
+    for i in range(start_i, min(end_i + 1, len(sector_changes))):
+        change = sector_changes[i]
+        if change > 0:
+            eligible_days.append(i)
+            day_directions.append("up")
+        elif change < 0:
+            eligible_days.append(i)
+            day_directions.append("down")
+
+    if not eligible_days:
+        return []
+
+    result: list[str] = []
+    hit_ratios: dict[str, float] = {}
+    for code in stock_codes:
+        changes = stock_daily_changes.get(code)
+        if changes is None or len(changes) <= end_i:
+            continue
+
+        hit_count = 0
+        for day_idx, direction in zip(eligible_days, day_directions):
+            stock_change = changes[day_idx]
+            sector_change = sector_changes[day_idx]
+
+            if direction == "up" and stock_change >= sector_change:
+                hit_count += 1
+            elif direction == "down" and stock_change <= sector_change:
+                hit_count += 1
+
+        ratio = hit_count / len(eligible_days)
+        hit_ratios[code] = ratio
+        if ratio >= threshold_ratio:
+            result.append(code)
+
+    return result, hit_ratios
+
+
+def filter_volume_top5(
+    stock_volumes: dict[str, float],
+    top_n: int = SECTOR_PICK_VOLUME_TOP_N,
+) -> list[str]:
+    """按最新交易日成交量（股数）排序，取前 top_n 名。
+
+    用成交量而非成交额衡量人气，消除股价绝对值对排名的扭曲。
+
+    Args:
+        stock_volumes: 股票代码到最新日成交量（股）的映射。
+        top_n: 取前几名。
+
+    Returns:
+        成交量前 top_n 的股票代码列表（纯数字，无序集合）。
+    """
+    if not stock_volumes:
+        return []
+
+    sorted_codes = sorted(
+        stock_volumes.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    return [code for code, _ in sorted_codes[:top_n]]
+
+
 # 第六层补充：选股模块 —— 公共数据中心 + SQLite 读取 + MACD 计算 + 筛选逻辑
 # ============================================================================
 
@@ -3686,6 +4194,165 @@ def run_llm_text(args: argparse.Namespace, client: TdxClient) -> None:
     print(result["text"])
 
 
+
+
+def print_sector_pick_result(result: SectorPickResult) -> None:
+    """打印板块内选股的控制台摘要。
+
+    Args:
+        result: 板块选股完整结果。
+    """
+    print("\n" + "=" * 72)
+    if result.block_trend is None:
+        print(f"板块内选股结果：{result.block_name}({result.block_code})")
+        print("板块当前无上涨趋势，以下结果显示最近一段趋势或默认排序。")
+    else:
+        trend_label = "活跃中" if result.block_trend.is_active else "已结束"
+        total_days = result.block_trend.end_index - result.block_trend.start_index + 1
+        print(f"板块内选股结果：{result.block_name}({result.block_code})")
+        print(f"板块趋势区间：{result.block_trend.start_date} ~ {result.block_trend.end_date}（{trend_label}，共 {total_days} 个交易日）")
+    print("=" * 72)
+
+    def _name(code: str) -> str:
+        stock_name = result.stock_names.get(code, "")
+        return f"{stock_name}({code})" if stock_name else code
+
+    # 一、领先启动
+    print("\n【一、领先启动】（股票趋势先于板块启动）")
+    if result.leading_starters:
+        for code in result.leading_starters:
+            start = result.stock_trend_dates.get(code, "?")
+            print(f"  {_name(code)}  — 启动 {start}")
+    else:
+        print("  （无）")
+
+    # 二、滞后补涨
+    print("\n【二、滞后补涨】（板块启动后股票才跟上）")
+    if result.lagging_catchers:
+        for code in result.lagging_catchers:
+            start = result.stock_trend_dates.get(code, "?")
+            print(f"  {_name(code)}  — 启动 {start}")
+    else:
+        print("  （无）")
+
+    # 三、涨幅前列
+    print(f"\n【三、涨幅前列】（趋势期内进入日涨幅前{SECTOR_PICK_TOP_GAINER_N} >= {SECTOR_PICK_TOP_GAINER_MIN_HITS} 次）")
+    if result.top_gainers:
+        sorted_gainers = sorted(result.top_gainers, key=lambda c: result.gainer_hits.get(c, 0), reverse=True)
+        for code in sorted_gainers:
+            hits = result.gainer_hits.get(code, 0)
+            avg_gain = result.stock_avg_gains.get(code, 0)
+            total_change = result.stock_total_changes.get(code, 0)
+            print(f"  {_name(code)}  — 命中 {hits} 次，趋势期内日均涨幅 {avg_gain:+.2f}%，累计 {total_change:+.2f}%")
+    else:
+        print("  （无）")
+
+    # 四、高弹性
+    print(f"\n【四、高弹性】（板块涨时涨更多，板块跌时跌更狠，命中率 >= {SECTOR_PICK_ELASTICITY_RATIO * 100:.0f}%）")
+    if result.high_elasticity:
+        print(f"  板块趋势期内累计涨跌幅: {result.sector_total_change:+.2f}%")
+        for code in result.high_elasticity:
+            ratio = result.elasticity_info.get(code, 0) * 100
+            total_change = result.stock_total_changes.get(code, 0)
+            print(f"  {_name(code)}  — 命中率 {ratio:.0f}%，个股累计 {total_change:+.2f}%")
+    else:
+        print("  （无）")
+
+    # 五、成交量 TOP5
+    print(f"\n【五、成交量 TOP{SECTOR_PICK_VOLUME_TOP_N}】（最新交易日成交量排序）")
+    if result.volume_top5:
+        for code in result.volume_top5:
+            vol = result.stock_volumes.get(code, 0)
+            if vol >= 1e8:
+                vol_str = f"{vol / 1e8:.2f}亿股"
+            elif vol >= 1e4:
+                vol_str = f"{vol / 1e4:.0f}万股"
+            else:
+                vol_str = f"{vol:.0f}股"
+            print(f"  {_name(code)}  — {vol_str}")
+    else:
+        print("  （无）")
+
+    # 跨集合统计
+    all_sets: dict[str, set[str]] = {
+        "领先启动": set(result.leading_starters),
+        "滞后补涨": set(result.lagging_catchers),
+        "涨幅前列": set(result.top_gainers),
+        "高弹性": set(result.high_elasticity),
+        "成交量TOP5": set(result.volume_top5),
+    }
+    code_set_count: dict[str, int] = {}
+    code_set_names: dict[str, list[str]] = {}
+    for set_name, codes in all_sets.items():
+        for code in codes:
+            code_set_count[code] = code_set_count.get(code, 0) + 1
+            code_set_names.setdefault(code, []).append(set_name)
+
+    print("\n" + "=" * 72)
+    print("跨集合统计：")
+    for min_count in [3, 2]:
+        multi_codes = [
+            (code, count, code_set_names.get(code, []))
+            for code, count in code_set_count.items()
+            if count >= min_count and (min_count == 3 or count == 2)
+        ]
+        if multi_codes:
+            label = ">= 3" if min_count == 3 else "2"
+            print(f"  同时出现在 {label} 个集合：")
+            for code, count, names in sorted(multi_codes, key=lambda x: x[1], reverse=True):
+                print(f"    {_name(code)}  ({', '.join(names)})")
+
+    print("=" * 72)
+
+
+def write_sector_pick_json(result: SectorPickResult) -> None:
+    """将板块选股结果写入 result/ 目录的 JSON 文件。
+
+    Args:
+        result: 板块选股完整结果。
+    """
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    result_path = RESULT_DIR / f"sector_pick_{result.block_code}_{timestamp}.json"
+
+    output = {
+        "scan_time": timestamp,
+        "block_code": result.block_code,
+        "block_name": result.block_name,
+        "block_trend": {
+            "start_date": result.block_trend.start_date,
+            "end_date": result.block_trend.end_date,
+            "is_active": result.block_trend.is_active,
+            "total_days": result.block_trend.end_index - result.block_trend.start_index + 1,
+        } if result.block_trend else None,
+        "sector_total_change": result.sector_total_change,
+        "leading_starters": [
+            {"code": code, "name": result.stock_names.get(code, ""), "start_date": result.stock_trend_dates.get(code, "")}
+            for code in result.leading_starters
+        ],
+        "lagging_catchers": [
+            {"code": code, "name": result.stock_names.get(code, ""), "start_date": result.stock_trend_dates.get(code, "")}
+            for code in result.lagging_catchers
+        ],
+        "top_gainers": [
+            {"code": code, "name": result.stock_names.get(code, ""), "hits": result.gainer_hits.get(code, 0), "avg_gain": result.stock_avg_gains.get(code, 0), "total_change": result.stock_total_changes.get(code, 0)}
+            for code in result.top_gainers
+        ],
+        "high_elasticity": [
+            {"code": code, "name": result.stock_names.get(code, ""), "hit_ratio": result.elasticity_info.get(code, 0), "total_change": result.stock_total_changes.get(code, 0)}
+            for code in result.high_elasticity
+        ],
+        "volume_top5": [
+            {"code": code, "name": result.stock_names.get(code, ""), "volume": result.stock_volumes.get(code, 0)}
+            for code in result.volume_top5
+        ],
+        "stock_names": result.stock_names,
+    }
+
+    with result_path.open("w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    print(f"\n结果已保存到: {result_path}")
+
+
 def print_screener_summary(results: list[ScreenResult], strategy_name: str) -> None:
     """
     打印选股结果摘要表格。
@@ -3736,6 +4403,289 @@ def print_screener_summary(results: list[ScreenResult], strategy_name: str) -> N
                 stage = "未知"
             reason = r.fail_reason[:50] if r.fail_reason else ""
             print(f"{r.code:<8} {r.kline_count:>4} {stage:<8} {reason}")
+
+
+
+
+def run_sector_pick(args: argparse.Namespace, client: TdxClient) -> None:
+    """执行板块内选股主流程：趋势识别 + 四维分类 + 成交量筛选。
+
+    整体流程：
+      1. 拉取板块日K数据
+      2. 构造板块 KlineBar 列表 + 计算 MACD
+      3. 检测板块上涨趋势区间（detect_trend_up_conditions + extract_trend_periods）
+      4. 获取板块成分股列表
+      5. 逐只拉取个股日K + MACD + 趋势检测 + 涨跌幅
+      6. 四维分类（领先启动 / 滞后补涨 / 涨幅前列 / 高弹性）
+      7. 成交量 TOP5
+      8. 控制台打印 + JSON 落盘
+
+    Args:
+        args: 命令行参数对象，需包含 block_code 和 debug。
+        client: 通达信客户端包装器。
+
+    Returns:
+        无返回值。
+    """
+    t0_total = time.perf_counter()
+    debug = args.debug
+    block_code_raw: str = args.block_code
+
+    # 1. 从 get_sector_list 查找板块代码（不自行推断后缀，对齐 collect_sector_heat_snapshot 写法）
+    block_code_pure = strip_tdx_suffix(block_code_raw)
+    all_sectors = client.get_sector_list(list_type=1)
+    matched_code: str | None = None
+    matched_name: str = ""
+    for item in all_sectors:
+        if strip_tdx_suffix(item.get("Code", "")) == block_code_pure:
+            matched_code = item["Code"]
+            matched_name = item.get("Name", "")
+            break
+    if matched_code is None:
+        print(f"未在板块列表中找到代码 {block_code_pure}，退出。")
+        return
+
+    sector_stock_code = StockCode(
+        raw_code=matched_code,
+        internal_code=block_code_pure,
+        market_suffix=matched_code.split(".")[-1],
+        tdx_code=matched_code,
+    )
+    print(f"\n板块: {matched_name}（{matched_code}）")
+
+    sector_market_data = client.get_market_data(
+        stock_codes=[sector_stock_code],
+        period="1d",
+        count=SECTOR_PICK_KLINES_LOOKBACK,
+        dividend_type="none",
+        field_list=["Open", "High", "Low", "Close", "Volume", "Amount"],
+    )
+    if sector_market_data is None:
+        print("板块日K数据为空，退出。")
+        return
+
+    close_data = sector_market_data.get("Close")
+    if close_data is None or matched_code not in close_data.columns:
+        print("板块日K未包含 Close 数据，退出。")
+        return
+
+    close_series = close_data[matched_code].sort_index().dropna()
+    if len(close_series) < 21:
+        print(f"板块日K数据不足（{len(close_series)} 条，需要至少 21 条），退出。")
+        return
+
+    # 2. 构造板块 KlineBar 列表
+    sector_dates = close_series.index.tolist()
+    close_values = close_series.values
+    open_data = sector_market_data.get("Open")
+    high_data = sector_market_data.get("High")
+    low_data = sector_market_data.get("Low")
+    volume_data = sector_market_data.get("Volume")
+    amount_data = sector_market_data.get("Amount")
+
+    sector_bars: list[KlineBar] = []
+    for i, date_obj in enumerate(sector_dates):
+        # 统一转成 YYYY-MM-DD（pandas Timestamp 的 str() 带 00:00:00，需截断）
+        date_str = date_obj.strftime("%Y-%m-%d") if hasattr(date_obj, "strftime") else str(date_obj)
+        date_str = date_str[:10]  # 只保留前 10 位
+        sector_bars.append(KlineBar(
+            trade_date=date_str,
+            open_price=float(open_data[matched_code].iloc[i]) if open_data is not None else 0.0,
+            high_price=float(high_data[matched_code].iloc[i]) if high_data is not None else 0.0,
+            low_price=float(low_data[matched_code].iloc[i]) if low_data is not None else 0.0,
+            close_price=float(close_values[i]),
+            volume=float(volume_data[matched_code].iloc[i]) if volume_data is not None else 0.0,
+            amount=float(amount_data[matched_code].iloc[i]) if amount_data is not None else 0.0,
+        ))
+
+    sector_dates_str = [bar.trade_date for bar in sector_bars]
+    sector_start_date = sector_dates_str[0]
+    sector_end_date = sector_dates_str[-1]
+
+    # 3. 板块 MACD
+    macd_raw = client.calculate_macd_batch(
+        tdx_codes=[matched_code],
+        count=SECTOR_PICK_KLINES_LOOKBACK,
+        chunk_size=1,
+    )
+    sector_macd = align_macd_with_kline(sector_bars, macd_raw.get(matched_code, {}))
+    if sector_macd is None:
+        print("板块 MACD 数据缺失，退出。")
+        return
+
+    # 4. 板块趋势检测
+    is_up = detect_trend_up_conditions(sector_bars, sector_macd, debug=debug)
+    periods = extract_trend_periods(is_up, sector_dates_str)
+    periods = filter_trends_by_volume(periods, sector_bars)
+    sector_trend = find_latest_trend_period(periods)
+    if sector_trend is None:
+        print(f"板块 {matched_name}（{matched_code}）在过去 {SECTOR_PICK_KLINES_LOOKBACK} 个交易日内无上涨趋势，退出。")
+        return
+
+    print(f"板块趋势: {sector_trend.start_date} ~ {sector_trend.end_date}"
+          f"（{'活跃' if sector_trend.is_active else '已结束'}）")
+
+    # 5. 成分股列表
+    member_rows = client.get_stock_list_in_sector(block_code=matched_code, list_type=1) or []
+    member_codes_tdx: list[str] = []
+    member_names_raw: dict[str, str] = {}
+    for row in member_rows:
+        if isinstance(row, dict):
+            code = row.get("Code")
+            name = row.get("Name")
+            if isinstance(code, str) and code:
+                member_codes_tdx.append(code)
+                if isinstance(name, str) and name:
+                    member_names_raw[code] = name
+
+    if not member_codes_tdx:
+        print("板块成分股为空，退出。")
+        return
+
+    member_codes = [strip_tdx_suffix(c) for c in member_codes_tdx]
+    print(f"成分股总数: {len(member_codes)}")
+
+    # 6. 批量 MACD
+    data_center = CassaDataCenter(client)
+    try:
+        macd_batch = data_center.calculate_macd_batch(member_codes)
+    except RuntimeError as exc:
+        print(f"批量 MACD 计算失败: {exc}")
+        return
+
+    # 7. 逐只处理
+    stock_trends: dict[str, TrendPeriod] = {}
+    stock_daily_changes: dict[str, list[float]] = {}
+    stock_names: dict[str, str] = {}
+    stock_volumes: dict[str, float] = {}
+    skipped_kline = 0
+    skipped_macd = 0
+
+    for idx, code in enumerate(member_codes):
+        if idx % 50 == 0 and idx > 0:
+            print(f"  进度: {idx}/{len(member_codes)}...")
+
+        # 取日K
+        bars = data_center.get_daily_klines(code, SECTOR_PICK_KLINES_LOOKBACK)
+        if bars is None:
+            skipped_kline += 1
+            continue
+
+        # 截断到板块K线的日期范围
+        truncated: list[KlineBar] = []
+        for bar in bars:
+            if sector_start_date <= bar.trade_date <= sector_end_date:
+                truncated.append(bar)
+        if len(truncated) < SECTOR_PICK_MIN_TREND_DAYS:
+            skipped_kline += 1
+            continue
+
+        # MACD 对齐
+        tdx_c = to_tdx_stock_code(code)
+        macd_raw_stock = macd_batch.get(tdx_c, {})
+        macd = align_macd_with_kline(truncated, macd_raw_stock)
+        if macd is None:
+            skipped_macd += 1
+            continue
+
+        # 趋势检测
+        is_up_s = detect_trend_up_conditions(truncated, macd, debug=debug)
+        dates_s = [bar.trade_date for bar in truncated]
+        periods_s = extract_trend_periods(is_up_s, dates_s)
+        stock_trend = find_latest_trend_period(periods_s)
+        if stock_trend:
+            stock_trends[code] = stock_trend
+
+        # 日涨跌幅
+        changes = _compute_daily_changes(truncated)
+        stock_daily_changes[code] = changes
+
+        # 成交量（取最近一根有量 K 线，避免盘中数据 volume=0）
+        vol = 0.0
+        for bar in reversed(truncated):
+            if bar.volume > 0:
+                vol = bar.volume
+                break
+        stock_volumes[code] = vol
+
+        # 名称：优先用成分股列表自带的，否则 TDX 查
+        tdx_name = member_names_raw.get(tdx_c, "")
+        if tdx_name:
+            stock_names[code] = tdx_name
+        else:
+            try:
+                stock_name = data_center.get_stock_name(code)
+                stock_names[code] = stock_name
+            except Exception:
+                stock_names[code] = ""
+
+    valid_count = len(stock_daily_changes)
+    print(f"有效成分股: {valid_count}（K线不足 {skipped_kline}，MACD缺失 {skipped_macd}）")
+    print(f"其中有上涨趋势的: {len(stock_trends)}")
+
+    # 8. 板块日涨跌幅
+    sector_changes = _compute_daily_changes(sector_bars)
+
+    # 9. 四维分类
+    valid_codes = list(stock_daily_changes.keys())
+    leading = classify_leading_starters(valid_codes, stock_trends, sector_trend.start_date)
+    lagging = classify_lagging_catchers(valid_codes, stock_trends, sector_trend.start_date)
+    top_gainers, gainer_hits = classify_top_gainers(stock_daily_changes, valid_codes, sector_trend)
+    elastic, elasticity_info = classify_high_elasticity(sector_changes, stock_daily_changes, valid_codes, sector_trend)
+    vol_top5 = filter_volume_top5(stock_volumes)
+
+    # 9.5 计算趋势期内日均涨幅和累计涨跌幅（用于输出）
+    stock_avg_gains: dict[str, float] = {}
+    stock_total_changes: dict[str, float] = {}
+    if sector_trend:
+        si, ei = sector_trend.start_index, sector_trend.end_index
+        # 板块累计涨跌幅（用收盘价直接算，更准确）
+        if si < len(sector_bars) and ei < len(sector_bars):
+            sector_start_close = sector_bars[si].close_price
+            sector_end_close = sector_bars[ei].close_price
+            sector_total_change = (sector_end_close - sector_start_close) / sector_start_close * 100 if sector_start_close > 0 else 0.0
+        else:
+            sector_total_change = 0.0
+
+        for code, changes in stock_daily_changes.items():
+            if len(changes) <= ei:
+                continue
+            seg = changes[si:ei + 1]
+            stock_avg_gains[code] = sum(seg) / len(seg)
+            # 复利累计
+            acc = 1.0
+            for c in seg:
+                acc *= (1 + c / 100)
+            stock_total_changes[code] = (acc - 1) * 100
+    else:
+        sector_total_change = 0.0
+
+    # 10. 输出
+    # 整理领先启动/滞后补涨的启动日期
+    stock_trend_dates: dict[str, str] = {code: t.start_date for code, t in stock_trends.items()}
+
+    pick_result = SectorPickResult(
+        block_code=block_code_pure,
+        block_name=matched_name,
+        block_trend=sector_trend,
+        leading_starters=leading,
+        lagging_catchers=lagging,
+        top_gainers=top_gainers,
+        high_elasticity=elastic,
+        volume_top5=vol_top5,
+        stock_names=stock_names,
+        stock_trend_dates=stock_trend_dates,
+        gainer_hits=gainer_hits,
+        elasticity_info=elasticity_info,
+        stock_volumes=stock_volumes,
+        stock_avg_gains=stock_avg_gains,
+        stock_total_changes=stock_total_changes,
+        sector_total_change=sector_total_change,
+    )
+    print_sector_pick_result(pick_result)
+    write_sector_pick_json(pick_result)
+
+    print(f"\n[总耗时 {time.perf_counter() - t0_total:.1f}s]")
 
 
 def run_screener(args: argparse.Namespace, client: TdxClient) -> None:
@@ -5068,6 +6018,12 @@ def parse_args() -> argparse.Namespace:
         help=f"选股策略，默认 {SCREENER_DEFAULT_STRATEGY}",
     )
     screener_parser.set_defaults(handler=run_screener)
+
+    sector_pick_parser = module_parsers.add_parser("sector_pick", help="板块内选股：四维分类 + 成交量TOP5")
+    sector_pick_parser.add_argument("--block-code", required=True, help="板块代码，例如 880491（行业）或 BK0738（概念）")
+    sector_pick_parser.add_argument("--debug", action="store_true", help="输出每只成分股的趋势检测细节")
+    sector_pick_parser.set_defaults(handler=run_sector_pick)
+
 
     stock_pool_parser = module_parsers.add_parser("stock_pool", help="股票池管理")
     stock_pool_subparsers = stock_pool_parser.add_subparsers(dest="stock_pool_action", required=True)

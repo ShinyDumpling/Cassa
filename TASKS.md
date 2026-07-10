@@ -59,6 +59,7 @@
 | T043 | todo | 新版 business.py report 结构化数据包与控制台输出 | 新增 / 调整 `business.py`，由 Skill 作为业务入口调用；`business.py report` 接收股票或板块 code，默认按旧 `cassa.py report` 风格打印控制台输出，并支持 `--debug` 追加完整 JSON | 最新方案见 `context/2026-07-09-bussiness.md`：不使用 `computed` 字段，控制台输出直接从原始 JSON 取数；业务判断算法需对齐旧 `cassa.py report`，包括趋势、量能、支撑压力、MACD、RSI、综合评分和买入信号 |
 | T044 | dropped | 新版 report.py 控制台展示脚本 | 暂不新增独立 `report.py` | 最新方案改为由 `business.py report` 直接负责控制台输出；文件报告和独立格式脚本后续再单独讨论 |
 | T045 | doing | 新版 screen.py 选股层与 Skill 编排方案 | 新增选股层入口 `screen.py`，选股条件以“一层一个函数”的 Python 方式表达；稳定条件可沉淀到策略脚本，临时条件由 Skill 在本次执行中临时构造并调用，不写入正式策略 py | 当前已落地第一版：`data.load_breakout_kline()` 按盘中/非盘中读取选股所需 K 线；`screen.py` 已提供 `scan-box` 和 `scan-breakout` 两个全 A 股入口；`skills/cassa-screen/SKILL.md` 已约束 skill 只调用现有 CLI、不修改代码 |
+| T046 | doing | 板块内选股第一版：sector_pick 四维分类 + 成交量 TOP5 | 在 `feat/sector-pick` 分支上实现 `python cassa.py sector_pick --block-code <code>` 命令；根据板块趋势区间对成分股做四维分类（领先启动/滞后补涨/涨幅前列/高弹性）+ 成交量 TOP5 | 代码已完成编写与多轮调试，并已随本次合并进入 `main`；上下文见 `context/2026-07-08-sector-pick.md` |
 
 ## 待整理 / 收件箱
 
