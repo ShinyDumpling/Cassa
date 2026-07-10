@@ -2181,3 +2181,346 @@ python data.py load-daily-kline --code 002185.SZ --count 120
 ## 来源会话
 
 来源：2026-07-09 当前会话。
+
+## 2026-07-10 已落地实现
+
+本文件中的日 K 读取方案已开始落地，当前实际实现调整为：
+
+```python
+def load_daily_kline_rows_from_db(code_list, count=None, end_date=None):
+    ...
+
+
+def load_daily_kline(stock_list, count=120, end_date=None):
+    ...
+```
+
+当前实际语义：
+
+1. `load_daily_kline` 只从本地 SQLite 读取日 K，不再自动按盘中/盘后拼接实时 K。
+2. `end_date` 表示最后一根 K 线的交易日，函数返回 `trade_date <= end_date` 的最近 `count` 根，并包含该日 K 线（如果数据库中存在）。
+3. 返回结果按股票代码分组，每只股票的 K 线按交易日升序排列。
+
+已验证命令：
+
+```powershell
+python data.py load-daily-kline --code 600289.SH --count 5 --end-date 2026-07-09
+```
+
+## 2026-07-10 第二次更新：为全 A 股选股补数据库分批读取
+
+### 背景
+
+在 `screen.py` 改造成“从全部 A 股出发做选股”后，`data.load_daily_kline()` 会开始接收成千上万只股票代码。
+
+如果 `load_daily_kline_rows_from_db()` 仍然把所有代码一次性拼成一个：
+
+```sql
+WHERE code IN (?, ?, ?, ...)
+```
+
+就可能撞上 SQLite 单条语句参数数量上限。
+
+所以这次在 `data.py` 做了一个很小但必要的配套修改：数据库查询按股票代码分批执行，再把结果合并回内存。
+
+### 修改位置
+
+修改函数：
+
+```python
+def load_daily_kline_rows_from_db(code_list, count=None, end_date=None):
+    ...
+```
+
+### 原来代码
+
+原来是一次性查询全部代码：
+
+```python
+conn = ensure_database()
+placeholders = ",".join(["?"] * len(code_list))
+sql = (
+    f"""
+    SELECT code, trade_date, open_price, high_price, low_price,
+           close_price, volume, amount
+    FROM daily_kline
+    WHERE code IN ({placeholders})
+    """
+)
+params = list(code_list)
+if end_date:
+    sql += " AND trade_date <= ?"
+    params.append(str(end_date).strip())
+sql += " ORDER BY code, trade_date ASC"
+try:
+    rows = conn.execute(sql, params).fetchall()
+finally:
+    conn.close()
+```
+
+### 现在代码
+
+现在改成按 900 只股票一批查询：
+
+```python
+conn = ensure_database()
+rows = []
+try:
+    for code_batch in chunk_list(code_list, 900):
+        placeholders = ",".join(["?"] * len(code_batch))
+        sql = (
+            f"""
+            SELECT code, trade_date, open_price, high_price, low_price,
+                   close_price, volume, amount
+            FROM daily_kline
+            WHERE code IN ({placeholders})
+            """
+        )
+        params = list(code_batch)
+        if end_date:
+            sql += " AND trade_date <= ?"
+            params.append(str(end_date).strip())
+        sql += " ORDER BY code, trade_date ASC"
+        rows.extend(conn.execute(sql, params).fetchall())
+finally:
+    conn.close()
+```
+
+### 这样改的目的
+
+1. 避免全 A 股一次性查询时超过 SQLite 参数上限。
+2. 不改变 `load_daily_kline()` 的对外行为。
+3. 不把“分批”细节泄露给 `screen.py`。
+4. 继续保持 `data.py` 是统一数据入口。
+
+### 当前影响
+
+这次改动不会影响单只股票读取，但能支撑：
+
+```python
+data.load_daily_kline(stock_list=all_a_share_codes, count=20, end_date="2026-07-09")
+```
+
+这种“全市场批量读取日 K”的选股场景。
+
+## 2026-07-10 第三次更新：放量突破选股 K 线读取口径
+
+### 背景
+
+放量突破选股不再每次全量调用通达信拉 21 根 K 线，因为全 A 股调用接口太慢。
+
+用户重新确认数据读取规则：
+
+```text
+1. 首先判断盘中/非盘中，午间不算盘中，并且控制台需要打印。
+2. CLI 传突破时间；如果不传或者传的是今天，再判断盘中/非盘中。
+   如果传了且不是今天，就是历史选股，即非盘中。
+3. 非盘中：直接从本地数据库取数据。如果数据不全，那就是本地数据库的问题；
+   控制台需要打印最后一根 K 线的日期。
+4. 盘中：先取本地数据库的数据，再取当日实时数据。
+   如果本地数据库最后一条日期和实时 K 日期相同，则替换；
+   否则拼接到最后。
+```
+
+### 新增常量
+
+```python
+BREAKOUT_KLINE_BATCH_SIZE = 500
+```
+
+### 新增：盘中判断
+
+```python
+def is_a_share_intraday(now=None):
+    """判断当前是否为 A 股盘中；午间不算盘中。"""
+    current = now or datetime.now()
+    if current.weekday() >= 5:
+        return False
+
+    minutes = current.hour * 60 + current.minute
+    morning_open = 9 * 60 + 30
+    morning_close = 11 * 60 + 30
+    afternoon_open = 13 * 60
+    afternoon_close = 15 * 60
+
+    return (
+        morning_open <= minutes <= morning_close
+        or afternoon_open <= minutes <= afternoon_close
+    )
+```
+
+当前盘中只包括：
+
+```text
+09:30 - 11:30
+13:00 - 15:00
+```
+
+午间 `11:30 - 13:00` 按非盘中处理。
+
+### 新增：日期分布打印
+
+为了避免全 A 股逐只打印，新增最后 K 线日期分布统计：
+
+```python
+def get_latest_trade_date_distribution(kline_map, stock_list):
+    """统计每只股票最后一根 K 线日期分布。"""
+    distribution = {}
+    for stock_code in stock_list:
+        rows = kline_map.get(stock_code, [])
+        latest_date = rows[-1]["trade_date"] if rows else "无数据"
+        distribution[latest_date] = distribution.get(latest_date, 0) + 1
+    return distribution
+
+
+def print_trade_date_distribution(title, distribution):
+    """打印 K 线最后日期分布。"""
+    print(f"[数据] {title}")
+    for trade_date in sorted(distribution):
+        print(f"[数据]   {trade_date}: {distribution[trade_date]}只")
+```
+
+示例输出：
+
+```text
+[数据] 本地K线最后日期分布：
+[数据]   2026-07-09: 5200只
+[数据]   无数据: 12只
+```
+
+### 新增：实时日 K 读取
+
+```python
+def daily_kline_rows_to_map(rows):
+    """把日 K 行列表整理成按股票代码分组的字典。"""
+    kline_map = {}
+    for row in rows:
+        stock_code = row["code"]
+        if stock_code not in kline_map:
+            kline_map[stock_code] = []
+        kline_map[stock_code].append(row)
+
+    for stock_code in kline_map:
+        kline_map[stock_code].sort(key=lambda item: item["trade_date"])
+
+    return kline_map
+
+
+def load_realtime_daily_kline(stock_list, batch_size=BREAKOUT_KLINE_BATCH_SIZE):
+    """通过通达信读取最新日 K，用于盘中临时覆盖或追加。"""
+    result = {}
+
+    for stock_batch in chunk_list(stock_list, batch_size):
+        market_data = get_market_data(
+            stock_list=stock_batch,
+            period="1d",
+            count=1,
+            field_list=["Open", "High", "Low", "Close", "Volume", "Amount"],
+            fill_data=True,
+        )
+        rows = market_data_to_daily_kline_rows(market_data, stock_batch)
+        result.update(daily_kline_rows_to_map(rows))
+
+    return result
+```
+
+### 新增：选股专用 K 线读取函数
+
+```python
+def load_breakout_kline(
+    stock_list,
+    box_days=20,
+    breakout_date="",
+    batch_size=BREAKOUT_KLINE_BATCH_SIZE,
+):
+    """读取放量突破选股所需 K 线。
+
+    返回每只股票 box_days + 1 根 K 线：
+    前 box_days 根用于箱体判断，最后 1 根用于突破判断。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    target_date = breakout_date or today
+    intraday = target_date == today and is_a_share_intraday()
+    mode_text = "盘中" if intraday else "非盘中"
+    count = int(box_days) + 1
+
+    print(f"[数据] 突破日期：{target_date}")
+    print(f"[数据] 当前模式：{mode_text}")
+
+    db_kline_map = load_daily_kline(
+        stock_list=stock_list,
+        count=count,
+        end_date=target_date,
+    )
+    print_trade_date_distribution(
+        "本地K线最后日期分布：",
+        get_latest_trade_date_distribution(db_kline_map, stock_list),
+    )
+
+    if not intraday:
+        return db_kline_map
+
+    realtime_kline_map = load_realtime_daily_kline(
+        stock_list=stock_list,
+        batch_size=batch_size,
+    )
+    print_trade_date_distribution(
+        "实时K线日期分布：",
+        get_latest_trade_date_distribution(realtime_kline_map, stock_list),
+    )
+
+    result = {}
+    replaced_count = 0
+    appended_count = 0
+    missing_realtime_count = 0
+
+    for stock_code in stock_list:
+        db_rows = [dict(row) for row in db_kline_map.get(stock_code, [])]
+        realtime_rows = realtime_kline_map.get(stock_code, [])
+
+        if not realtime_rows:
+            missing_realtime_count += 1
+            result[stock_code] = db_rows[-count:]
+            continue
+
+        realtime_row = dict(realtime_rows[-1])
+        if db_rows and db_rows[-1]["trade_date"] == realtime_row["trade_date"]:
+            db_rows[-1] = realtime_row
+            replaced_count += 1
+        else:
+            db_rows.append(realtime_row)
+            appended_count += 1
+
+        result[stock_code] = db_rows[-count:]
+
+    print(
+        f"[数据] 盘中合并完成：替换 {replaced_count}只，"
+        f"追加 {appended_count}只，无实时K {missing_realtime_count}只"
+    )
+    print_trade_date_distribution(
+        "合并后K线最后日期分布：",
+        get_latest_trade_date_distribution(result, stock_list),
+    )
+
+    return result
+```
+
+### 当前行为
+
+1. `breakout_date` 为空：
+   - 目标日期 = 今天。
+   - 如果当前在盘中窗口，则本地库 + 实时 K 覆盖/追加。
+   - 如果当前不在盘中窗口，则只读本地库。
+
+2. `breakout_date` 等于今天：
+   - 和空值一样，继续判断当前是否盘中。
+
+3. `breakout_date` 不是今天：
+   - 视为历史选股。
+   - 强制非盘中。
+   - 只读本地库。
+
+4. 数据不全：
+   - 不在 `data.py` 自动修复。
+   - 控制台通过最后日期分布暴露。
+   - 后续筛选层会因为 K 线不足 `box_days + 1` 自动跳过。
