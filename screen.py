@@ -13,6 +13,13 @@ import data
 
 
 DEFAULT_BOX_RANGE_MAX = 0.30
+DEFAULT_BOX_V2_TOP_QUANTILE = 0.90
+DEFAULT_BOX_V2_BOTTOM_QUANTILE = 0.10
+DEFAULT_BOX_V2_EDGE_TOUCH_RATIO = 0.02
+DEFAULT_BOX_V2_MIN_TOP_TOUCHES = 2
+DEFAULT_BOX_V2_MIN_BOTTOM_TOUCHES = 2
+DEFAULT_BOX_V2_INSIDE_RATIO_MIN = 0.80
+DEFAULT_BOX_V2_MID_DRIFT_MAX = 0.08
 DEFAULT_VOLUME_RATIO_MIN = 1.5
 DEFAULT_BOX_DAYS = 20
 DEFAULT_PULLBACK_DAYS = 3
@@ -21,11 +28,37 @@ DEFAULT_MA_TOLERANCE = 0.02
 DEFAULT_PULLBACK_HIGH_ABOVE_MA_RATIO = 0.03
 DEFAULT_BULLISH_MA_DAYS = (5, 10, 20)
 DEFAULT_BATCH_SIZE = 500
+DEFAULT_CONSOLE_CODE_LIMIT = 100
 
 
 def print_json(value):
     """按 JSON 打印结果。"""
     print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
+def print_screen_result(result, debug=False, code_limit=DEFAULT_CONSOLE_CODE_LIMIT):
+    """打印选股结果摘要，debug 模式下追加完整 JSON。"""
+    print("[结果] 策略：", result.get("strategy", ""))
+    print(f"[结果] 初始股票数：{result.get('initial_count', 0)}")
+    print(f"[结果] 入选股票数：{result.get('selected_count', 0)}")
+
+    selected_codes = result.get("selected_codes", [])
+    if selected_codes:
+        print("[结果] 入选代码：")
+        display_codes = selected_codes[:code_limit]
+        for index, stock_code in enumerate(display_codes, start=1):
+            print(f"[结果]   {index}. {stock_code}")
+        if len(selected_codes) > code_limit:
+            print(
+                f"[结果]   ... 还有 {len(selected_codes) - code_limit} 只，"
+                "使用 --debug 查看完整 JSON"
+            )
+    else:
+        print("[结果] 本次没有筛出符合条件的股票")
+
+    if debug:
+        print("[DEBUG] 完整 JSON：")
+        print_json(result)
 
 
 def calculate_box_metrics(kline_bars):
@@ -53,6 +86,102 @@ def calculate_box_metrics(kline_bars):
     }
 
 
+def calculate_percentile(values, percentile):
+    """计算分位数，percentile 取值 0 到 1。"""
+    if not values:
+        return 0.0
+
+    sorted_values = sorted(float(value) for value in values)
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+
+    rank = float(percentile) * (len(sorted_values) - 1)
+    lower_index = int(rank)
+    upper_index = min(lower_index + 1, len(sorted_values) - 1)
+    weight = rank - lower_index
+    return (
+        sorted_values[lower_index] * (1 - weight)
+        + sorted_values[upper_index] * weight
+    )
+
+
+def calculate_average_close(kline_bars):
+    """计算一段 K 线的平均收盘价。"""
+    if not kline_bars:
+        return 0.0
+
+    return (
+        sum(float(bar["close_price"]) for bar in kline_bars)
+        / len(kline_bars)
+    )
+
+
+def calculate_box_metrics_v2(
+    kline_bars,
+    top_quantile=DEFAULT_BOX_V2_TOP_QUANTILE,
+    bottom_quantile=DEFAULT_BOX_V2_BOTTOM_QUANTILE,
+    edge_touch_ratio=DEFAULT_BOX_V2_EDGE_TOUCH_RATIO,
+):
+    """计算增强版箱体指标，减少极端影线对上下沿的影响。"""
+    if not kline_bars:
+        return {
+            "bar_count": 0,
+            "top_price": 0.0,
+            "bottom_price": 0.0,
+            "range_pct": 0.0,
+            "average_volume": 0.0,
+            "top_touch_count": 0,
+            "bottom_touch_count": 0,
+            "inside_close_count": 0,
+            "inside_close_ratio": 0.0,
+            "mid_drift_pct": 0.0,
+        }
+
+    high_prices = [float(bar["high_price"]) for bar in kline_bars]
+    low_prices = [float(bar["low_price"]) for bar in kline_bars]
+    close_prices = [float(bar["close_price"]) for bar in kline_bars]
+    average_volume = sum(float(bar["volume"]) for bar in kline_bars) / len(kline_bars)
+
+    top_price = calculate_percentile(high_prices, top_quantile)
+    bottom_price = calculate_percentile(low_prices, bottom_quantile)
+    range_pct = ((top_price - bottom_price) / bottom_price) if bottom_price > 0 else 0.0
+
+    top_touch_line = top_price * (1 - float(edge_touch_ratio))
+    bottom_touch_line = bottom_price * (1 + float(edge_touch_ratio))
+    top_touch_count = sum(1 for price in high_prices if price >= top_touch_line)
+    bottom_touch_count = sum(1 for price in low_prices if price <= bottom_touch_line)
+    inside_close_count = sum(
+        1
+        for price in close_prices
+        if bottom_price <= price <= top_price
+    )
+    inside_close_ratio = inside_close_count / len(kline_bars)
+
+    middle_index = len(kline_bars) // 2
+    first_half = kline_bars[:middle_index]
+    second_half = kline_bars[middle_index:]
+    first_average_close = calculate_average_close(first_half)
+    second_average_close = calculate_average_close(second_half)
+    mid_drift_pct = (
+        abs(second_average_close - first_average_close) / first_average_close
+        if first_average_close > 0
+        else 0.0
+    )
+
+    return {
+        "bar_count": len(kline_bars),
+        "top_price": round(top_price, 4),
+        "bottom_price": round(bottom_price, 4),
+        "range_pct": round(range_pct, 6),
+        "average_volume": round(average_volume, 4),
+        "top_touch_count": top_touch_count,
+        "bottom_touch_count": bottom_touch_count,
+        "inside_close_count": inside_close_count,
+        "inside_close_ratio": round(inside_close_ratio, 6),
+        "mid_drift_pct": round(mid_drift_pct, 6),
+    }
+
+
 def is_box_consolidation(kline_bars, range_max=DEFAULT_BOX_RANGE_MAX):
     """判断一段 K 线是否是箱体。"""
     if len(kline_bars) < 2:
@@ -62,6 +191,37 @@ def is_box_consolidation(kline_bars, range_max=DEFAULT_BOX_RANGE_MAX):
     return metrics["range_pct"] <= float(range_max)
 
 
+def is_box_consolidation_v2(
+    kline_bars,
+    range_max=DEFAULT_BOX_RANGE_MAX,
+    top_quantile=DEFAULT_BOX_V2_TOP_QUANTILE,
+    bottom_quantile=DEFAULT_BOX_V2_BOTTOM_QUANTILE,
+    edge_touch_ratio=DEFAULT_BOX_V2_EDGE_TOUCH_RATIO,
+    min_top_touches=DEFAULT_BOX_V2_MIN_TOP_TOUCHES,
+    min_bottom_touches=DEFAULT_BOX_V2_MIN_BOTTOM_TOUCHES,
+    inside_ratio_min=DEFAULT_BOX_V2_INSIDE_RATIO_MIN,
+    mid_drift_max=DEFAULT_BOX_V2_MID_DRIFT_MAX,
+):
+    """增强版箱体判断：振幅、触边、内部比例和中轴漂移共同判断。"""
+    if len(kline_bars) < 2:
+        return False
+
+    metrics = calculate_box_metrics_v2(
+        kline_bars=kline_bars,
+        top_quantile=top_quantile,
+        bottom_quantile=bottom_quantile,
+        edge_touch_ratio=edge_touch_ratio,
+    )
+
+    return (
+        metrics["range_pct"] <= float(range_max)
+        and metrics["top_touch_count"] >= int(min_top_touches)
+        and metrics["bottom_touch_count"] >= int(min_bottom_touches)
+        and metrics["inside_close_ratio"] >= float(inside_ratio_min)
+        and metrics["mid_drift_pct"] <= float(mid_drift_max)
+    )
+
+
 def is_volume_breakout_from_box(
     box_kline_bars,
     breakout_kline,
@@ -69,13 +229,13 @@ def is_volume_breakout_from_box(
     volume_ratio_min=DEFAULT_VOLUME_RATIO_MIN,
 ):
     """判断第二个参数 K 线是否放量突破前面箱体。"""
-    if not is_box_consolidation(box_kline_bars, range_max=range_max):
+    if not is_box_consolidation_v2(box_kline_bars, range_max=range_max):
         return False
 
     if not breakout_kline:
         return False
 
-    metrics = calculate_box_metrics(box_kline_bars)
+    metrics = calculate_box_metrics_v2(box_kline_bars)
     breakout_close = float(breakout_kline["close_price"])
     breakout_volume = float(breakout_kline["volume"])
     average_volume = float(metrics["average_volume"])
@@ -90,10 +250,56 @@ def is_volume_breakout_from_box(
 
 def analyze_box_consolidation(kline_bars, range_max=DEFAULT_BOX_RANGE_MAX):
     """输出箱体判断结果和指标。"""
-    metrics = calculate_box_metrics(kline_bars)
+    detail = analyze_box_consolidation_v2(kline_bars, range_max=range_max)
+    detail["is_box"] = detail.pop("is_box_v2")
+    return detail
+
+
+def analyze_box_consolidation_v2(
+    kline_bars,
+    range_max=DEFAULT_BOX_RANGE_MAX,
+    top_quantile=DEFAULT_BOX_V2_TOP_QUANTILE,
+    bottom_quantile=DEFAULT_BOX_V2_BOTTOM_QUANTILE,
+    edge_touch_ratio=DEFAULT_BOX_V2_EDGE_TOUCH_RATIO,
+    min_top_touches=DEFAULT_BOX_V2_MIN_TOP_TOUCHES,
+    min_bottom_touches=DEFAULT_BOX_V2_MIN_BOTTOM_TOUCHES,
+    inside_ratio_min=DEFAULT_BOX_V2_INSIDE_RATIO_MIN,
+    mid_drift_max=DEFAULT_BOX_V2_MID_DRIFT_MAX,
+):
+    """输出增强版箱体判断结果和指标。"""
+    metrics = calculate_box_metrics_v2(
+        kline_bars=kline_bars,
+        top_quantile=top_quantile,
+        bottom_quantile=bottom_quantile,
+        edge_touch_ratio=edge_touch_ratio,
+    )
+    range_ok = metrics["range_pct"] <= float(range_max)
+    top_touch_ok = metrics["top_touch_count"] >= int(min_top_touches)
+    bottom_touch_ok = metrics["bottom_touch_count"] >= int(min_bottom_touches)
+    inside_ratio_ok = metrics["inside_close_ratio"] >= float(inside_ratio_min)
+    mid_drift_ok = metrics["mid_drift_pct"] <= float(mid_drift_max)
+
     return {
-        "is_box": is_box_consolidation(kline_bars, range_max=range_max),
+        "is_box_v2": (
+            range_ok
+            and top_touch_ok
+            and bottom_touch_ok
+            and inside_ratio_ok
+            and mid_drift_ok
+        ),
         "range_max": float(range_max),
+        "top_quantile": float(top_quantile),
+        "bottom_quantile": float(bottom_quantile),
+        "edge_touch_ratio": float(edge_touch_ratio),
+        "min_top_touches": int(min_top_touches),
+        "min_bottom_touches": int(min_bottom_touches),
+        "inside_ratio_min": float(inside_ratio_min),
+        "mid_drift_max": float(mid_drift_max),
+        "range_ok": range_ok,
+        "top_touch_ok": top_touch_ok,
+        "bottom_touch_ok": bottom_touch_ok,
+        "inside_ratio_ok": inside_ratio_ok,
+        "mid_drift_ok": mid_drift_ok,
         **metrics,
     }
 
@@ -105,14 +311,14 @@ def analyze_volume_breakout_from_box(
     volume_ratio_min=DEFAULT_VOLUME_RATIO_MIN,
 ):
     """输出放量突破判断结果和指标。"""
-    box_metrics = calculate_box_metrics(box_kline_bars)
+    box_metrics = analyze_box_consolidation(box_kline_bars, range_max=range_max)
     breakout_close = float(breakout_kline["close_price"]) if breakout_kline else 0.0
     breakout_volume = float(breakout_kline["volume"]) if breakout_kline else 0.0
     average_volume = float(box_metrics["average_volume"])
     breakout_volume_ratio = (breakout_volume / average_volume) if average_volume > 0 else 0.0
 
     return {
-        "is_box": is_box_consolidation(box_kline_bars, range_max=range_max),
+        "is_box": box_metrics["is_box"],
         "is_breakout": is_volume_breakout_from_box(
             box_kline_bars=box_kline_bars,
             breakout_kline=breakout_kline,
@@ -242,7 +448,7 @@ def filter_box_consolidation(stock_codes, kline_map, box_days, range_max=DEFAULT
         kline_bars = kline_map.get(stock_code, [])
         if len(kline_bars) < box_days + 1:
             continue
-        if is_box_consolidation(kline_bars[:-1], range_max=range_max):
+        if is_box_consolidation_v2(kline_bars[:-1], range_max=range_max):
             passed_codes.append(stock_code)
 
     return passed_codes
@@ -259,12 +465,10 @@ def filter_current_box_consolidation(stock_codes, kline_map, box_days, range_max
             continue
 
         box_kline_bars = kline_bars[-box_days:]
-        if is_box_consolidation(box_kline_bars, range_max=range_max):
+        detail = analyze_box_consolidation(box_kline_bars, range_max=range_max)
+        if detail["is_box"]:
             passed_codes.append(stock_code)
-            box_detail_map[stock_code] = analyze_box_consolidation(
-                box_kline_bars,
-                range_max=range_max,
-            )
+            box_detail_map[stock_code] = detail
 
     return passed_codes, box_detail_map
 
@@ -715,7 +919,7 @@ def main():
         "scan-breakout",
         help="从全部 A 股扫描放量突破箱体的股票",
         description=(
-            "从全部 A 股出发，先筛出处于箱体区间的股票，"
+            "从全部 A 股出发，先用增强箱体规则筛出处于箱体区间的股票，"
             "再筛出最后一根 K 线放量突破箱体上沿的股票。"
         ),
     )
@@ -748,11 +952,19 @@ def main():
         default=DEFAULT_BATCH_SIZE,
         help=f"每批拉取多少只股票 K 线，默认 {DEFAULT_BATCH_SIZE}",
     )
+    scan_breakout_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="输出完整 JSON 调试信息",
+    )
 
     scan_box_parser = subparsers.add_parser(
         "scan-box",
         help="从全部 A 股扫描当前仍处于箱体震荡的股票",
-        description="从全部 A 股出发，筛出最近 N 根 K 线仍处于箱体震荡的股票。",
+        description=(
+            "从全部 A 股出发，筛出最近 N 根 K 线仍处于箱体震荡的股票。"
+            "箱体判断会综合分位数上下沿、触边次数、收盘价内部比例和中轴漂移。"
+        ),
     )
     scan_box_parser.add_argument(
         "--box-days",
@@ -776,6 +988,11 @@ def main():
         type=int,
         default=DEFAULT_BATCH_SIZE,
         help=f"每批拉取多少只股票 K 线，默认 {DEFAULT_BATCH_SIZE}",
+    )
+    scan_box_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="输出完整 JSON 调试信息",
     )
 
     pullback_parser = subparsers.add_parser(
@@ -839,6 +1056,11 @@ def main():
         default=DEFAULT_BATCH_SIZE,
         help=f"每批拉取多少只股票 K 线，默认 {DEFAULT_BATCH_SIZE}",
     )
+    pullback_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="输出完整 JSON 调试信息",
+    )
 
     args = parser.parse_args()
     data.initialize(Path(__file__))
@@ -851,7 +1073,7 @@ def main():
             volume_ratio_min=args.volume_ratio_min,
             batch_size=args.batch_size,
         )
-        print_json(result)
+        print_screen_result(result, debug=args.debug)
         return
 
     if args.command == "scan-box":
@@ -861,7 +1083,7 @@ def main():
             range_max=args.range_max,
             batch_size=args.batch_size,
         )
-        print_json(result)
+        print_screen_result(result, debug=args.debug)
         return
 
     if args.command == "scan-breakout-pullback-ma5":
@@ -876,7 +1098,8 @@ def main():
             volume_ratio_min=args.volume_ratio_min,
             batch_size=args.batch_size,
         )
-        print_json(result)
+        print_screen_result(result, debug=args.debug)
+        return
 
 
 if __name__ == "__main__":

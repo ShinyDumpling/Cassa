@@ -97,6 +97,7 @@ python screen.py scan-box --box-days 30
 
 - `--box-days`：箱体 K 线数量，默认 20。
 - `--breakout-date`：观察日或突破日；不传则由数据中心按今天处理。
+- 当前箱体判断会综合分位数上下沿、触边次数、收盘价内部比例和中轴漂移。
 - `--pullback-date`：回踩观察日；不传则由数据中心按今天处理，仅用于 `scan-breakout-pullback-ma5`。
 - `--pullback-days`：突破后几日内允许回踩，默认 3，仅用于 `scan-breakout-pullback-ma5`。
 - `--ma-days`：回踩均线天数，默认 5，仅用于 `scan-breakout-pullback-ma5`。
@@ -106,14 +107,16 @@ python screen.py scan-box --box-days 30
 - `--range-max`：箱体振幅上限，默认 0.30。
 - `--volume-ratio-min`：放量倍数下限，默认 1.5，仅用于 `scan-breakout`。
 - `--batch-size`：每批处理股票数量，默认 500。
+- `--debug`：输出完整 JSON；默认不输出 JSON，只打印控制台摘要。
 
 ## 执行流程
 
 1. 识别用户要查的是“箱体震荡”还是“放量突破”。
 2. 把用户提到的日期、箱体天数、振幅上限、放量倍数转换为 CLI 参数。
 3. 在项目根目录运行对应 `python screen.py ...` 命令。
-4. 读取控制台输出中的分层统计、数据日期分布和最终 JSON。
+4. 读取控制台输出中的分层统计、数据日期分布和结果摘要。
 5. 用简短中文汇总结果：初始数量、每层通过数量、最终入选数量、入选股票代码。
+6. 只有用户要求完整字段、调试信息或 JSON 时，才追加 `--debug`。
 
 ## 输出要求
 
@@ -122,6 +125,7 @@ python screen.py scan-box --box-days 30
 - 再说明每层筛选通过和淘汰数量。
 - 最后给出最终入选股票代码。
 - 如果没有入选股票，明确说本次没有筛出符合条件的股票。
+- 默认不要要求或复述完整 JSON；需要完整明细时重新用 `--debug` 执行。
 
 ## 异常处理
 
