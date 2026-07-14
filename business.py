@@ -1036,11 +1036,17 @@ def collect_report_item(target):
 def collect_thises_data(target):
     """收集 thises 量价分析所需的日 K 数据。"""
     code = target["code"]
+    name = str(target.get("name", "") or "").strip()
+    if not name:
+        stock_info = data.get_stock_info(code, field_list=[])
+        if isinstance(stock_info, dict):
+            name = str(stock_info.get("Name", "") or "").strip()
+
     return {
         "raw_code": target.get("raw_code", ""),
         "target_type": target.get("target_type", ""),
         "code": code,
-        "name": target.get("name", ""),
+        "name": name,
         "daily_kline": collect_daily_kline_for_report(code),
     }
 
