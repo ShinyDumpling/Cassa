@@ -1033,6 +1033,46 @@ def collect_report_item(target):
     return item
 
 
+def collect_thises_data(target):
+    """收集 thises 量价分析所需的日 K 数据。"""
+    code = target["code"]
+    return {
+        "raw_code": target.get("raw_code", ""),
+        "target_type": target.get("target_type", ""),
+        "code": code,
+        "name": target.get("name", ""),
+        "daily_kline": collect_daily_kline_for_report(code),
+    }
+
+
+def build_thises_data(codes):
+    """根据股票或板块 code 批量构建 thises 日 K 数据。"""
+    targets = resolve_report_codes(codes)
+    items = []
+    errors = []
+
+    for target in targets:
+        try:
+            items.append(collect_thises_data(target))
+        except Exception as exc:
+            errors.append(
+                {
+                    "raw_code": target.get("raw_code", ""),
+                    "code": target.get("code", ""),
+                    "target_type": target.get("target_type", ""),
+                    "error": str(exc),
+                }
+            )
+
+    return {
+        "task": "thises",
+        "data_type": "daily_kline",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "items": items,
+        "errors": errors,
+    }
+
+
 def simplify_chip_unavailable_note(note):
     """把筹码不可计算原因压缩成控制台可读文本。"""
     text = str(note or "").strip()
@@ -1224,6 +1264,12 @@ def run_report(args):
         print_json(payload)
 
 
+def run_thises(args):
+    """执行 thises 子命令。"""
+    codes = [code.strip() for code in args.codes.split(",") if code.strip()]
+    print_json(build_thises_data(codes))
+
+
 def main():
     """业务脚本 CLI 入口。"""
     if hasattr(sys.stdout, "reconfigure"):
@@ -1240,6 +1286,14 @@ def main():
     )
     report_parser.add_argument("--debug", action="store_true", help="追加打印完整 JSON")
     report_parser.set_defaults(handler=run_report)
+
+    thises_parser = subparsers.add_parser("thises", help="收集 thises 所需数据")
+    thises_parser.add_argument(
+        "--codes",
+        required=True,
+        help="股票或板块代码，多个用逗号分隔，例如 600519,000001,880675.SH",
+    )
+    thises_parser.set_defaults(handler=run_thises)
 
     args = parser.parse_args()
     data.initialize(Path(__file__))
