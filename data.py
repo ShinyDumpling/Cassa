@@ -464,6 +464,48 @@ def merge_realtime_kline_rows(db_rows, realtime_rows):
     return merged_rows
 
 
+def should_merge_realtime_daily_kline(end_date=None):
+    """判断 load_daily_kline 是否应该合并盘中实时日 K。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    target_date = str(end_date).strip() if end_date else today
+    return target_date == today and is_a_share_intraday()
+
+
+def merge_realtime_daily_kline_map(db_kline_map, realtime_kline_map, stock_list, count):
+    """把实时日 K 合并到 DB 日 K map 中，并按 count 截断。"""
+    result = {}
+    replaced_count = 0
+    appended_count = 0
+    missing_realtime_count = 0
+
+    for stock_code in stock_list:
+        db_rows = [dict(row) for row in db_kline_map.get(stock_code, [])]
+        realtime_rows = realtime_kline_map.get(stock_code, [])
+
+        if not realtime_rows:
+            missing_realtime_count += 1
+            result[stock_code] = db_rows[-count:] if count is not None else db_rows
+            continue
+
+        before_latest_date = db_rows[-1]["trade_date"] if db_rows else ""
+        merged_rows = merge_realtime_kline_rows(db_rows, realtime_rows)
+        after_latest_date = merged_rows[-1]["trade_date"] if merged_rows else ""
+
+        if before_latest_date and before_latest_date == after_latest_date:
+            replaced_count += 1
+        else:
+            appended_count += 1
+
+        result[stock_code] = merged_rows[-count:] if count is not None else merged_rows
+
+    return {
+        "kline_map": result,
+        "replaced_count": replaced_count,
+        "appended_count": appended_count,
+        "missing_realtime_count": missing_realtime_count,
+    }
+
+
 def is_a_share_intraday(now=None):
     """判断当前是否为 A 股盘中；午间不算盘中。"""
     current = now or datetime.now()
@@ -546,88 +588,59 @@ def load_breakout_kline(
     """
     today = datetime.now().strftime("%Y-%m-%d")
     target_date = breakout_date or today
-    intraday = target_date == today and is_a_share_intraday()
+    intraday = should_merge_realtime_daily_kline(target_date)
     mode_text = "盘中" if intraday else "非盘中"
     count = int(box_days) + 1 + int(extra_days)
 
     print(f"[数据] 突破日期：{target_date}")
     print(f"[数据] 当前模式：{mode_text}")
 
-    db_kline_map = load_daily_kline(
+    kline_map = load_daily_kline(
         stock_list=stock_list,
         count=count,
         end_date=target_date,
+        batch_size=batch_size,
     )
     print_trade_date_distribution(
-        "本地K线最后日期分布：",
-        get_latest_trade_date_distribution(db_kline_map, stock_list),
+        "K线最后日期分布：",
+        get_latest_trade_date_distribution(kline_map, stock_list),
     )
 
-    if not intraday:
+    return kline_map
+
+
+def load_daily_kline(stock_list, count=120, end_date=None, batch_size=BREAKOUT_KLINE_BATCH_SIZE):
+    """按截止交易日读取日 K；盘中自动合并实时日 K。
+
+    Args:
+        stock_list: 带后缀通达信股票代码列表。
+        count: 每只股票返回最近多少根 K 线，默认 120。
+        end_date: 最后一根 K 线的交易日，格式 YYYY-MM-DD。历史日期不合并实时 K。
+        batch_size: 盘中读取实时日 K 的批大小。
+
+    Returns:
+        按股票代码分组的日 K 字典，K 线按交易日升序排列。
+    """
+    db_kline_map = load_daily_kline_rows_from_db(
+        code_list=stock_list,
+        count=count,
+        end_date=end_date,
+    )
+
+    if not should_merge_realtime_daily_kline(end_date):
         return db_kline_map
 
     realtime_kline_map = load_realtime_daily_kline(
         stock_list=stock_list,
         batch_size=batch_size,
     )
-    print_trade_date_distribution(
-        "实时K线日期分布：",
-        get_latest_trade_date_distribution(realtime_kline_map, stock_list),
-    )
-
-    result = {}
-    replaced_count = 0
-    appended_count = 0
-    missing_realtime_count = 0
-
-    for stock_code in stock_list:
-        db_rows = [dict(row) for row in db_kline_map.get(stock_code, [])]
-        realtime_rows = realtime_kline_map.get(stock_code, [])
-
-        if not realtime_rows:
-            missing_realtime_count += 1
-            result[stock_code] = db_rows[-count:]
-            continue
-
-        realtime_row = dict(realtime_rows[-1])
-        if db_rows and db_rows[-1]["trade_date"] == realtime_row["trade_date"]:
-            db_rows[-1] = realtime_row
-            replaced_count += 1
-        else:
-            db_rows.append(realtime_row)
-            appended_count += 1
-
-        result[stock_code] = db_rows[-count:]
-
-    print(
-        f"[数据] 盘中合并完成：替换 {replaced_count}只，"
-        f"追加 {appended_count}只，无实时K {missing_realtime_count}只"
-    )
-    print_trade_date_distribution(
-        "合并后K线最后日期分布：",
-        get_latest_trade_date_distribution(result, stock_list),
-    )
-
-    return result
-
-
-def load_daily_kline(stock_list, count=120, end_date=None):
-    """按截止交易日从本地数据库读取日 K。
-
-    Args:
-        stock_list: 带后缀通达信股票代码列表。
-        count: 每只股票返回最近多少根 K 线，默认 120。
-        end_date: 最后一根 K 线的交易日，格式 YYYY-MM-DD。返回结果包含
-            该日期对应的 K 线（如果数据库中存在）。
-
-    Returns:
-        按股票代码分组的日 K 字典，K 线按交易日升序排列。
-    """
-    return load_daily_kline_rows_from_db(
-        code_list=stock_list,
+    merge_result = merge_realtime_daily_kline_map(
+        db_kline_map=db_kline_map,
+        realtime_kline_map=realtime_kline_map,
+        stock_list=stock_list,
         count=count,
-        end_date=end_date,
     )
+    return merge_result["kline_map"]
 
 
 def write_jsonl_line(file_obj, value):

@@ -2596,3 +2596,330 @@ box_days + 1 + pullback_days
 ```text
 target_date
 ```
+
+## 2026-07-14 第五次更新：修复 load_daily_kline 未拼接盘中实时 K 的问题
+
+### Bug 信息
+
+当前发现 `data.py` 中两个日 K 读取入口口径不一致：
+
+```python
+def load_breakout_kline(
+    stock_list,
+    box_days=20,
+    breakout_date="",
+    extra_days=0,
+    batch_size=BREAKOUT_KLINE_BATCH_SIZE,
+):
+```
+
+和：
+
+```python
+def load_daily_kline(stock_list, count=120, end_date=None):
+```
+
+其中 `load_breakout_kline()` 内部有盘中 / 非盘中判断，并在盘中读取通达信实时日 K 后替换或追加到本地 DB 日 K。
+
+但 `load_daily_kline()` 当前只读本地 DB：
+
+```python
+return load_daily_kline_rows_from_db(
+    code_list=stock_list,
+    count=count,
+    end_date=end_date,
+)
+```
+
+这会导致直接调用 `load_daily_kline()` 的业务拿不到盘中实时 K。
+
+### 原因
+
+盘中实时 K 合并逻辑目前写在 `load_breakout_kline()` 内部。
+
+而 `load_daily_kline()` 作为通用日 K 入口，没有复用这段逻辑，只调用了纯 DB 函数：
+
+```python
+load_daily_kline_rows_from_db()
+```
+
+因此日 K 数据口径被拆成了两套：
+
+1. `screen.py` 通过 `load_breakout_kline()` 读取时，盘中会拼接实时 K。
+2. `business.py report`、`thises` 等通过 `load_daily_kline()` 读取时，盘中不会拼接实时 K。
+
+### 引起的问题
+
+这个问题会影响所有直接使用 `load_daily_kline()` 的业务。
+
+当前已知影响：
+
+1. `business.py report` 中的日 K 可能不是盘中最新口径。
+2. `thises` 后续输出给量价分析 skill 的日 K 可能缺少盘中实时 K。
+3. 技术指标、量价分析、趋势判断、筹码计算等依赖最新 K 线的结果可能落后。
+4. 项目中不同入口看到的同一只股票日 K 口径不一致。
+
+### 修改思路
+
+保留两个函数，不删除：
+
+```text
+load_daily_kline
+load_breakout_kline
+```
+
+但把“盘中是否拼接实时 K”的逻辑收敛到：
+
+```python
+load_daily_kline()
+```
+
+`load_breakout_kline()` 不再自己重复拼接实时 K，而是作为突破策略的薄包装：
+
+1. 计算 `target_date`
+2. 计算 `count = box_days + 1 + extra_days`
+3. 调用 `load_daily_kline(stock_list, count=count, end_date=target_date)`
+4. 返回结果
+
+这样真实的数据加载和实时 K 合并逻辑只保留一份。
+
+### 需要新增的代码
+
+新增：判断是否需要合并实时日 K。
+
+```python
+def should_merge_realtime_daily_kline(end_date=None):
+    """判断 load_daily_kline 是否应该合并盘中实时日 K。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    target_date = str(end_date).strip() if end_date else today
+    return target_date == today and is_a_share_intraday()
+```
+
+新增：批量合并实时日 K。
+
+```python
+def merge_realtime_daily_kline_map(db_kline_map, realtime_kline_map, stock_list, count):
+    """把实时日 K 合并到 DB 日 K map 中，并按 count 截断。"""
+    result = {}
+    replaced_count = 0
+    appended_count = 0
+    missing_realtime_count = 0
+
+    for stock_code in stock_list:
+        db_rows = [dict(row) for row in db_kline_map.get(stock_code, [])]
+        realtime_rows = realtime_kline_map.get(stock_code, [])
+
+        if not realtime_rows:
+            missing_realtime_count += 1
+            result[stock_code] = db_rows[-count:] if count is not None else db_rows
+            continue
+
+        before_latest_date = db_rows[-1]["trade_date"] if db_rows else ""
+        merged_rows = merge_realtime_kline_rows(db_rows, realtime_rows)
+        after_latest_date = merged_rows[-1]["trade_date"] if merged_rows else ""
+
+        if before_latest_date and before_latest_date == after_latest_date:
+            replaced_count += 1
+        else:
+            appended_count += 1
+
+        result[stock_code] = merged_rows[-count:] if count is not None else merged_rows
+
+    return {
+        "kline_map": result,
+        "replaced_count": replaced_count,
+        "appended_count": appended_count,
+        "missing_realtime_count": missing_realtime_count,
+    }
+```
+
+### 修改 `load_daily_kline`
+
+原来代码：
+
+```python
+def load_daily_kline(stock_list, count=120, end_date=None):
+    """按截止交易日从本地数据库读取日 K。
+
+    Args:
+        stock_list: 带后缀通达信股票代码列表。
+        count: 每只股票返回最近多少根 K 线，默认 120。
+        end_date: 最后一根 K 线的交易日，格式 YYYY-MM-DD。返回结果包含
+            该日期对应的 K 线（如果数据库中存在）。
+
+    Returns:
+        按股票代码分组的日 K 字典，K 线按交易日升序排列。
+    """
+    return load_daily_kline_rows_from_db(
+        code_list=stock_list,
+        count=count,
+        end_date=end_date,
+    )
+```
+
+修改后代码：
+
+```python
+def load_daily_kline(stock_list, count=120, end_date=None, batch_size=BREAKOUT_KLINE_BATCH_SIZE):
+    """按截止交易日读取日 K；盘中自动合并实时日 K。
+
+    Args:
+        stock_list: 带后缀通达信股票代码列表。
+        count: 每只股票返回最近多少根 K 线，默认 120。
+        end_date: 最后一根 K 线的交易日，格式 YYYY-MM-DD。历史日期不合并实时 K。
+        batch_size: 盘中读取实时日 K 的批大小。
+
+    Returns:
+        按股票代码分组的日 K 字典，K 线按交易日升序排列。
+    """
+    db_kline_map = load_daily_kline_rows_from_db(
+        code_list=stock_list,
+        count=count,
+        end_date=end_date,
+    )
+
+    if not should_merge_realtime_daily_kline(end_date):
+        return db_kline_map
+
+    realtime_kline_map = load_realtime_daily_kline(
+        stock_list=stock_list,
+        batch_size=batch_size,
+    )
+    merge_result = merge_realtime_daily_kline_map(
+        db_kline_map=db_kline_map,
+        realtime_kline_map=realtime_kline_map,
+        stock_list=stock_list,
+        count=count,
+    )
+    return merge_result["kline_map"]
+```
+
+### 修改 `load_breakout_kline`
+
+原来代码：
+
+```python
+def load_breakout_kline(
+    stock_list,
+    box_days=20,
+    breakout_date="",
+    extra_days=0,
+    batch_size=BREAKOUT_KLINE_BATCH_SIZE,
+):
+    """读取放量突破选股所需 K 线。
+
+    默认返回每只股票 box_days + 1 根 K 线；extra_days 用于需要
+    突破后继续观察的策略，例如突破后回踩 MA5。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    target_date = breakout_date or today
+    intraday = target_date == today and is_a_share_intraday()
+    mode_text = "盘中" if intraday else "非盘中"
+    count = int(box_days) + 1 + int(extra_days)
+
+    print(f"[数据] 突破日期：{target_date}")
+    print(f"[数据] 当前模式：{mode_text}")
+
+    db_kline_map = load_daily_kline(
+        stock_list=stock_list,
+        count=count,
+        end_date=target_date,
+    )
+    print_trade_date_distribution(
+        "本地K线最后日期分布：",
+        get_latest_trade_date_distribution(db_kline_map, stock_list),
+    )
+
+    if not intraday:
+        return db_kline_map
+
+    realtime_kline_map = load_realtime_daily_kline(
+        stock_list=stock_list,
+        batch_size=batch_size,
+    )
+    print_trade_date_distribution(
+        "实时K线日期分布：",
+        get_latest_trade_date_distribution(realtime_kline_map, stock_list),
+    )
+
+    result = {}
+    replaced_count = 0
+    appended_count = 0
+    missing_realtime_count = 0
+
+    for stock_code in stock_list:
+        db_rows = [dict(row) for row in db_kline_map.get(stock_code, [])]
+        realtime_rows = realtime_kline_map.get(stock_code, [])
+
+        if not realtime_rows:
+            missing_realtime_count += 1
+            result[stock_code] = db_rows[-count:]
+            continue
+
+        realtime_row = dict(realtime_rows[-1])
+        if db_rows and db_rows[-1]["trade_date"] == realtime_row["trade_date"]:
+            db_rows[-1] = realtime_row
+            replaced_count += 1
+        else:
+            db_rows.append(realtime_row)
+            appended_count += 1
+
+        result[stock_code] = db_rows[-count:]
+
+    print(
+        f"[数据] 盘中合并完成：替换 {replaced_count}只，"
+        f"追加 {appended_count}只，无实时K {missing_realtime_count}只"
+    )
+    print_trade_date_distribution(
+        "合并后K线最后日期分布：",
+        get_latest_trade_date_distribution(result, stock_list),
+    )
+
+    return result
+```
+
+修改后代码：
+
+```python
+def load_breakout_kline(
+    stock_list,
+    box_days=20,
+    breakout_date="",
+    extra_days=0,
+    batch_size=BREAKOUT_KLINE_BATCH_SIZE,
+):
+    """读取放量突破选股所需 K 线。
+
+    默认返回每只股票 box_days + 1 根 K 线；extra_days 用于需要
+    突破后继续观察的策略，例如突破后回踩 MA5。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    target_date = breakout_date or today
+    intraday = should_merge_realtime_daily_kline(target_date)
+    mode_text = "盘中" if intraday else "非盘中"
+    count = int(box_days) + 1 + int(extra_days)
+
+    print(f"[数据] 突破日期：{target_date}")
+    print(f"[数据] 当前模式：{mode_text}")
+
+    kline_map = load_daily_kline(
+        stock_list=stock_list,
+        count=count,
+        end_date=target_date,
+        batch_size=batch_size,
+    )
+    print_trade_date_distribution(
+        "K线最后日期分布：",
+        get_latest_trade_date_distribution(kline_map, stock_list),
+    )
+
+    return kline_map
+```
+
+### 注意事项
+
+1. `load_daily_kline_rows_from_db()` 继续保留为纯 DB 读取函数。
+2. `load_daily_kline()` 成为统一的日 K 对外入口。
+3. `load_breakout_kline()` 保留，不删除，但只作为突破策略语义包装。
+4. 后续 `report`、`thises`、`screen` 都通过 `load_daily_kline()` 获得统一口径。
+5. 历史日期 `end_date` 不会拼接今天实时 K，避免污染历史回测或历史选股。
