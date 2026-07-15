@@ -1057,12 +1057,29 @@ def add_volume_ratio_to_daily_kline(daily_kline):
     return result
 
 
+def apply_latest_official_volume_ratio(daily_kline, more_info):
+    """用通达信官方量比 fLianB 覆盖最新一根 K 线的 volume_ratio。"""
+    result = [dict(row) for row in daily_kline or []]
+    if not result:
+        return result
+
+    official_volume_ratio = safe_float((more_info or {}).get("fLianB"), 0.0)
+    if official_volume_ratio > 0:
+        result[-1]["volume_ratio"] = round(official_volume_ratio, 6)
+
+    return result
+
+
 def collect_thises_data(target):
     """收集 thises 量价分析所需的日 K 数据和筹码分布。"""
     code = target["code"]
     realtime_data = collect_realtime_report_data(code)
     daily_kline = add_volume_ratio_to_daily_kline(
         collect_daily_kline_for_report(code)
+    )
+    daily_kline = apply_latest_official_volume_ratio(
+        daily_kline,
+        realtime_data["more_info"],
     )
 
     item_for_chip = {
