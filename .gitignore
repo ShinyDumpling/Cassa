@@ -10,4 +10,5 @@ result/
 tmp/
 data/
 thises_*.json
+logs/
 

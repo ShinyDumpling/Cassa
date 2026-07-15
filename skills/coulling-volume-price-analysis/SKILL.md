@@ -93,7 +93,7 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 
 ### K 线引用一致性规则
 
-所有输出模块中的 `data[].kline` 和 `chip.data.kline_evidence[].kline` 必须从输入 `daily_kline` 中按原始对象整行复制，不允许手写、重算、四舍五入、拼接不同日期字段，或把某一天的 `trade_date` 与另一根 K 线的价格/成交量字段混用。
+所有输出模块中的 `data[].kline`、`stage.data[].evidence[].kline` 和 `chip.data.kline_evidence[].kline` 必须从输入 `daily_kline` 中按原始对象整行复制，不允许手写、重算、四舍五入、拼接不同日期字段，或把某一天的 `trade_date` 与另一根 K 线的价格/成交量字段混用。
 
 如果 `evidence` 或 `result` 中提到某个交易日，则同一条证据里的 `kline.trade_date` 必须等于该交易日，并且 `open_price`、`high_price`、`low_price`、`close_price`、`volume`、`amount`、`volume_ratio` 必须与输入中该 `trade_date` 的原始行完全一致。
 
@@ -201,18 +201,26 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
     "result": "",
     "data": [
       {
-        "kline": {
-          "code": "",
-          "trade_date": "",
-          "open_price": 0,
-          "high_price": 0,
-          "low_price": 0,
-          "close_price": 0,
-          "volume": 0,
-          "amount": 0,
-          "volume_ratio": 0
-        },
-        "evidence": ""
+        "stage": "吸筹",
+        "start_date": "",
+        "end_date": "",
+        "summary": "",
+        "evidence": [
+          {
+            "kline": {
+              "code": "",
+              "trade_date": "",
+              "open_price": 0,
+              "high_price": 0,
+              "low_price": 0,
+              "close_price": 0,
+              "volume": 0,
+              "amount": 0,
+              "volume_ratio": 0
+            },
+            "evidence": ""
+          }
+        ]
       }
     ],
     "refs": ["", "", ""]
@@ -318,13 +326,13 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 
 - `direction`：判断下一步更偏看多还是看空。
 - `truth`：判断目前价格运动是真实运动还是陷阱。
-- `stage`：判断当前处于吸筹、拉升、派筹、下跌中的哪个阶段。
+- `stage`：根据输入的历史 K 线，列出这一段 K 线中各阶段的开始时间和结束时间。阶段只能使用：吸筹、测试、拉升、派筹、下跌。
 - `smart_money`：判断聪明钱更像在买还是在卖。
 - `reversal`：判断趋势什么时候可能反转，以及接下来什么情况算异常、什么情况算确认。
 - `key_price`：根据日 K 数据分析关键支撑位和阻力位，说明哪些价位是关键战场以及强度如何。
 - `chip`：结合 120 日 K 数据和筹码分布数据，分析主力筹码大多在什么区间、是否存在套牢盘、套牢盘筹码大概在什么区间。
 
-普通模块（`direction` / `truth` / `stage` / `smart_money` / `reversal` / `key_price`）都必须包含：
+普通模块（`direction` / `truth` / `smart_money` / `reversal` / `key_price`）都必须包含：
 
 - `result`：分析结论。
 - `data`：支撑结论的数据，必须是数组。
@@ -334,6 +342,27 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 
 - `kline`：完整单根日 K 数据（从输入 `daily_kline` 中原样取出，字段和值必须完全一致）。
 - `evidence`：基于该 K 线得到的证据说明。
+
+`stage` 模块必须包含：
+
+- `result`：对整段历史 K 线阶段切分的总结。
+- `data`：阶段区间数组，按时间从早到晚排列。
+- `refs`：书中理论索引。
+
+`stage.data` 中的每一项都必须包含：
+
+- `stage`：阶段名称，只能是 `吸筹`、`测试`、`拉升`、`派筹`、`下跌` 之一。
+- `start_date`：该阶段开始日期，必须来自输入 `daily_kline[].trade_date`。
+- `end_date`：该阶段结束日期，必须来自输入 `daily_kline[].trade_date`。
+- `summary`：该阶段的判断摘要，说明为什么把这段 K 线划入该阶段。
+- `evidence`：支撑该阶段判断的 K 线证据数组。
+
+`stage.data[].evidence` 中的每一项都必须包含：
+
+- `kline`：完整单根日 K 数据（从输入 `daily_kline` 中原样取出，字段和值必须完全一致）。
+- `evidence`：基于该 K 线得到的阶段判断证据说明。
+
+如果某一段历史 K 线阶段不清晰，不能强行切分，必须在 `summary` 中说明“不足以明确判断”，并用最接近的阶段名称归类。
 
 `data` 示例：
 
