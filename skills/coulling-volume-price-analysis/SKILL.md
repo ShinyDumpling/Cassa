@@ -30,9 +30,22 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
       "low_price": 990.07,
       "close_price": 999.2,
       "volume": 20106216.0,
-      "amount": 2332839.25
+      "amount": 2332839.25,
+      "volume_ratio": 1.23
     }
-  ]
+  ],
+  "chip": {
+    "profit_ratio": 0.72,
+    "avg_cost": 29.8,
+    "cost_90_low": 27.5,
+    "cost_90_high": 32.2,
+    "concentration_90": 0.16,
+    "cost_70_low": 28.6,
+    "cost_70_high": 31.1,
+    "concentration_70": 0.1,
+    "chip_status": "较集中",
+    "sample_count": 120
+  }
 }
 ```
 
@@ -49,6 +62,23 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 - `daily_kline[].close_price`
 - `daily_kline[].volume`
 - `daily_kline[].amount`
+- `daily_kline[].volume_ratio`
+- `chip`
+
+`chip` 字段说明：
+
+- `profit_ratio`：获利盘比例，表示当前价格下估算有多少比例的筹码处于盈利状态。
+- `avg_cost`：平均成本，表示估算的市场平均持仓成本。
+- `cost_90_low`：90% 成本区间下沿。
+- `cost_90_high`：90% 成本区间上沿。
+- `concentration_90`：90% 成本集中度，数值越小表示筹码越集中，数值越大表示筹码越分散。
+- `cost_70_low`：70% 核心成本区间下沿。
+- `cost_70_high`：70% 核心成本区间上沿。
+- `concentration_70`：70% 核心成本集中度，数值越小表示核心筹码越集中。
+- `chip_status`：筹码状态，例如“高度集中”“较集中”“中等”“较分散”。
+- `sample_count`：参与筹码计算的有效 K 线数量。
+
+如果 `chip.status == "todo"`，说明筹码分布不可用，分析时不能强行使用筹码分布做判断，只能退回日 K 量价分析。
 
 ### 数据使用限制
 
@@ -66,12 +96,10 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 
 不得自行引入、计算或假设输入中不存在的数据，包括但不限于：
 
-- 量比
 - 换手率
 - `MACD`
 - `RSI`
 - `MA`
-- 筹码分布
 - 主力净流入
 - `PE / PB`
 - 新闻或消息面
@@ -99,7 +127,17 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
     "result": "",
     "data": [
       {
-        "trade_date": "",
+        "kline": {
+          "code": "",
+          "trade_date": "",
+          "open_price": 0,
+          "high_price": 0,
+          "low_price": 0,
+          "close_price": 0,
+          "volume": 0,
+          "amount": 0,
+          "volume_ratio": 0
+        },
         "evidence": ""
       }
     ],
@@ -109,7 +147,17 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
     "result": "",
     "data": [
       {
-        "trade_date": "",
+        "kline": {
+          "code": "",
+          "trade_date": "",
+          "open_price": 0,
+          "high_price": 0,
+          "low_price": 0,
+          "close_price": 0,
+          "volume": 0,
+          "amount": 0,
+          "volume_ratio": 0
+        },
         "evidence": ""
       }
     ],
@@ -119,7 +167,17 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
     "result": "",
     "data": [
       {
-        "trade_date": "",
+        "kline": {
+          "code": "",
+          "trade_date": "",
+          "open_price": 0,
+          "high_price": 0,
+          "low_price": 0,
+          "close_price": 0,
+          "volume": 0,
+          "amount": 0,
+          "volume_ratio": 0
+        },
         "evidence": ""
       }
     ],
@@ -129,7 +187,17 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
     "result": "",
     "data": [
       {
-        "trade_date": "",
+        "kline": {
+          "code": "",
+          "trade_date": "",
+          "open_price": 0,
+          "high_price": 0,
+          "low_price": 0,
+          "close_price": 0,
+          "volume": 0,
+          "amount": 0,
+          "volume_ratio": 0
+        },
         "evidence": ""
       }
     ],
@@ -139,7 +207,17 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
     "result": "",
     "data": [
       {
-        "trade_date": "",
+        "kline": {
+          "code": "",
+          "trade_date": "",
+          "open_price": 0,
+          "high_price": 0,
+          "low_price": 0,
+          "close_price": 0,
+          "volume": 0,
+          "amount": 0,
+          "volume_ratio": 0
+        },
         "evidence": ""
       }
     ],
@@ -149,10 +227,54 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
     "result": "",
     "data": [
       {
-        "trade_date": "",
+        "kline": {
+          "code": "",
+          "trade_date": "",
+          "open_price": 0,
+          "high_price": 0,
+          "low_price": 0,
+          "close_price": 0,
+          "volume": 0,
+          "amount": 0,
+          "volume_ratio": 0
+        },
         "evidence": ""
       }
     ],
+    "refs": ["", "", ""]
+  },
+  "chip": {
+    "result": "",
+    "data": {
+      "chip": {
+        "profit_ratio": 0,
+        "avg_cost": 0,
+        "cost_90_low": 0,
+        "cost_90_high": 0,
+        "concentration_90": 0,
+        "cost_70_low": 0,
+        "cost_70_high": 0,
+        "concentration_70": 0,
+        "chip_status": "",
+        "sample_count": 0
+      },
+      "kline_evidence": [
+        {
+          "kline": {
+            "code": "",
+            "trade_date": "",
+            "open_price": 0,
+            "high_price": 0,
+            "low_price": 0,
+            "close_price": 0,
+            "volume": 0,
+            "amount": 0,
+            "volume_ratio": 0
+          },
+          "evidence": ""
+        }
+      ]
+    },
     "refs": ["", "", ""]
   }
 }
@@ -166,23 +288,51 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 - `smart_money`：判断聪明钱更像在买还是在卖。
 - `reversal`：判断趋势什么时候可能反转，以及接下来什么情况算异常、什么情况算确认。
 - `key_price`：根据日 K 数据分析关键支撑位和阻力位，说明哪些价位是关键战场以及强度如何。
+- `chip`：结合 120 日 K 数据和筹码分布数据，分析主力筹码大多在什么区间、是否存在套牢盘、套牢盘筹码大概在什么区间。
 
-每一项都必须包含：
+普通模块（`direction` / `truth` / `stage` / `smart_money` / `reversal` / `key_price`）都必须包含：
 
 - `result`：分析结论。
-- `data`：支撑结论的数据。数组中的每一项都必须包含该 K 线对应的 `trade_date`，以及基于该 K 线数据得到的 `evidence`。
+- `data`：支撑结论的数据，必须是数组。
 - `refs`：书中理论索引。
+
+普通模块 `data` 中的每一项都必须包含：
+
+- `kline`：完整单根日 K 数据（从输入 `daily_kline` 中原样取出）。
+- `evidence`：基于该 K 线得到的证据说明。
 
 `data` 示例：
 
 ```json
 [
   {
-    "trade_date": "2026-07-14",
+    "kline": {
+      "code": "881394.SH",
+      "trade_date": "2026-07-14",
+      "open_price": 999.64,
+      "high_price": 1004.66,
+      "low_price": 990.07,
+      "close_price": 999.20,
+      "volume": 20106216.0,
+      "amount": 2332839.25,
+      "volume_ratio": 1.23
+    },
     "evidence": "收盘价 999.20，成交量 20106216.0，价格回落但成交量仍处于高位。"
   }
 ]
 ```
+
+`chip` 模块结构与其他模块不同，`data` 是对象，包含：
+
+- `data.chip`：直接透传输入中的筹码分布字段。
+- `data.kline_evidence`：数组，用来放筹码判断所引用的 K 线证据，每一项使用统一的 `{kline, evidence}` 结构。
+
+`chip` 模块注意事项：
+
+1. 筹码分布是模型估算的成本结构，不等同于真实账户持仓。
+2. 不要直接断言“主力真实持仓都在这里”。
+3. 可以表述为“主要成本区”“主力可能重点交换区”“可能的主力防守区”。
+4. 如果 `chip.status == "todo"`，必须在 `result` 中说明筹码分布不可用，不能猜测筹码结构。
 
 理论索引建议使用章节或框架名称，例如：
 

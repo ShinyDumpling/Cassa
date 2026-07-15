@@ -1033,26 +1033,58 @@ def collect_report_item(target):
     return item
 
 
+def add_volume_ratio_to_daily_kline(daily_kline):
+    """给日 K 增加 volume_ratio，口径为当日成交量 / 前 5 日平均成交量。"""
+    result = []
+    for index, row in enumerate(daily_kline or []):
+        item = dict(row)
+        current_volume = safe_float(item.get("volume"), 0.0)
+        previous_rows = daily_kline[max(0, index - 5):index]
+        previous_volumes = [
+            safe_float(previous_row.get("volume"), 0.0)
+            for previous_row in previous_rows
+            if safe_float(previous_row.get("volume"), 0.0) > 0
+        ]
+
+        if len(previous_volumes) < 5 or current_volume <= 0:
+            item["volume_ratio"] = None
+        else:
+            average_volume = sum(previous_volumes) / len(previous_volumes)
+            item["volume_ratio"] = round(current_volume / average_volume, 6) if average_volume > 0 else None
+
+        result.append(item)
+
+    return result
+
+
 def collect_thises_data(target):
-    """收集 thises 量价分析所需的日 K 数据。"""
+    """收集 thises 量价分析所需的日 K 数据和筹码分布。"""
     code = target["code"]
-    name = str(target.get("name", "") or "").strip()
-    if not name:
-        stock_info = data.get_stock_info(code, field_list=[])
-        if isinstance(stock_info, dict):
-            name = str(stock_info.get("Name", "") or "").strip()
+    realtime_data = collect_realtime_report_data(code)
+    daily_kline = add_volume_ratio_to_daily_kline(
+        collect_daily_kline_for_report(code)
+    )
+
+    item_for_chip = {
+        "code": code,
+        "market_snapshot": realtime_data["market_snapshot"],
+        "stock_info": realtime_data["stock_info"],
+        "more_info": realtime_data["more_info"],
+        "daily_kline": daily_kline,
+    }
 
     return {
         "raw_code": target.get("raw_code", ""),
         "target_type": target.get("target_type", ""),
         "code": code,
-        "name": name,
-        "daily_kline": collect_daily_kline_for_report(code),
+        "name": realtime_data["name"] or target.get("name", ""),
+        "daily_kline": daily_kline,
+        "chip": collect_chip_for_report(item_for_chip),
     }
 
 
 def build_thises_data(codes):
-    """根据股票或板块 code 批量构建 thises 日 K 数据。"""
+    """根据股票或板块 code 批量构建 thises 输入数据。"""
     targets = resolve_report_codes(codes)
     items = []
     errors = []
@@ -1072,7 +1104,7 @@ def build_thises_data(codes):
 
     return {
         "task": "thises",
-        "data_type": "daily_kline",
+        "data_type": "thises_input",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "items": items,
         "errors": errors,
