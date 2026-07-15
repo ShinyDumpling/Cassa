@@ -558,9 +558,20 @@ def daily_kline_rows_to_map(rows):
 
 def load_realtime_daily_kline(stock_list, batch_size=BREAKOUT_KLINE_BATCH_SIZE):
     """通过通达信读取最新日 K，用于盘中临时覆盖或追加。"""
+    started_at = time.perf_counter()
     result = {}
+    batches = list(chunk_list(stock_list, batch_size))
+    total_batches = len(batches)
 
-    for stock_batch in chunk_list(stock_list, batch_size):
+    print(
+        f"[数据] 盘中实时日K开始：{len(stock_list)}只，"
+        f"每批{batch_size}只，共{total_batches}批"
+    )
+
+    for batch_index, stock_batch in enumerate(batches, start=1):
+        batch_started_at = time.perf_counter()
+        first_code = stock_batch[0] if stock_batch else ""
+        last_code = stock_batch[-1] if stock_batch else ""
         market_data = get_market_data(
             stock_list=stock_batch,
             period="1d",
@@ -570,7 +581,16 @@ def load_realtime_daily_kline(stock_list, batch_size=BREAKOUT_KLINE_BATCH_SIZE):
         )
         rows = market_data_to_daily_kline_rows(market_data, stock_batch)
         result.update(daily_kline_rows_to_map(rows))
+        print(
+            f"[数据] 盘中实时日K {batch_index}/{total_batches} 完成："
+            f"{len(stock_batch)}只，{first_code} ~ {last_code}，"
+            f"返回 {len(rows)} 行，耗时 {time.perf_counter() - batch_started_at:.1f}s"
+        )
 
+    print(
+        f"[数据] 盘中实时日K完成：返回{len(result)}只，"
+        f"耗时 {time.perf_counter() - started_at:.1f}s"
+    )
     return result
 
 
@@ -586,6 +606,7 @@ def load_breakout_kline(
     默认返回每只股票 box_days + 1 根 K 线；extra_days 用于需要
     突破后继续观察的策略，例如突破后回踩 MA5。
     """
+    started_at = time.perf_counter()
     today = datetime.now().strftime("%Y-%m-%d")
     target_date = breakout_date or today
     intraday = should_merge_realtime_daily_kline(target_date)
@@ -605,6 +626,7 @@ def load_breakout_kline(
         "K线最后日期分布：",
         get_latest_trade_date_distribution(kline_map, stock_list),
     )
+    print(f"[数据] K线读取总耗时：{time.perf_counter() - started_at:.1f}s")
 
     return kline_map
 
@@ -621,24 +643,42 @@ def load_daily_kline(stock_list, count=120, end_date=None, batch_size=BREAKOUT_K
     Returns:
         按股票代码分组的日 K 字典，K 线按交易日升序排列。
     """
+    db_started_at = time.perf_counter()
     db_kline_map = load_daily_kline_rows_from_db(
         code_list=stock_list,
         count=count,
         end_date=end_date,
     )
+    print(
+        f"[数据] 本地日K读取完成：{len(db_kline_map)}只，"
+        f"耗时 {time.perf_counter() - db_started_at:.1f}s"
+    )
 
     if not should_merge_realtime_daily_kline(end_date):
         return db_kline_map
 
+    realtime_started_at = time.perf_counter()
     realtime_kline_map = load_realtime_daily_kline(
         stock_list=stock_list,
         batch_size=batch_size,
     )
+    print(
+        f"[数据] 盘中实时日K读取阶段完成：{len(realtime_kline_map)}只，"
+        f"耗时 {time.perf_counter() - realtime_started_at:.1f}s"
+    )
+
+    merge_started_at = time.perf_counter()
     merge_result = merge_realtime_daily_kline_map(
         db_kline_map=db_kline_map,
         realtime_kline_map=realtime_kline_map,
         stock_list=stock_list,
         count=count,
+    )
+    print(
+        f"[数据] 实时日K合并完成：覆盖 {merge_result['replaced_count']}只，"
+        f"追加 {merge_result['appended_count']}只，"
+        f"缺失实时 {merge_result['missing_realtime_count']}只，"
+        f"耗时 {time.perf_counter() - merge_started_at:.1f}s"
     )
     return merge_result["kline_map"]
 

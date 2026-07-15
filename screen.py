@@ -7,6 +7,8 @@ Cassa 选股脚本。
 
 import argparse
 import json
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import data
@@ -29,6 +31,24 @@ DEFAULT_PULLBACK_HIGH_ABOVE_MA_RATIO = 0.03
 DEFAULT_BULLISH_MA_DAYS = (5, 10, 20)
 DEFAULT_BATCH_SIZE = 500
 DEFAULT_CONSOLE_CODE_LIMIT = 100
+
+DEFAULT_HEAT_KLINE_DAYS = 6
+DEFAULT_HEAT_AMOUNT_MIN = 30000
+DEFAULT_HEAT_TURNOVER_RATE_MIN = 2.0
+DEFAULT_HEAT_VOLUME_RATIO_MIN = 1.5
+DEFAULT_HEAT_CHANGE_PCT_MIN = 1.0
+DEFAULT_HEAT_PRICE_MIN = 3
+DEFAULT_HEAT_PRICE_MAX = 220
+
+
+def safe_float(value, default=0.0):
+    """安全转换 float。"""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def print_json(value):
@@ -650,16 +670,182 @@ def filter_pullback_close_near_ma(
     return passed_codes, pullback_detail_map
 
 
+def build_heat_metric_map(stock_codes, kline_map):
+    """根据 K 线构造 heat 硬过滤所需指标。"""
+    metric_map = {}
+
+    for stock_code in stock_codes:
+        kline_bars = kline_map.get(stock_code, [])
+        if len(kline_bars) < 2:
+            continue
+
+        latest_kline = kline_bars[-1]
+        previous_kline = kline_bars[-2]
+        price = safe_float(latest_kline.get("close_price"))
+        previous_close = safe_float(previous_kline.get("close_price"))
+        change_pct = (
+            (price / previous_close - 1) * 100
+            if price > 0 and previous_close > 0
+            else 0.0
+        )
+
+        previous_rows = kline_bars[-6:-1]
+        previous_volumes = [
+            safe_float(row.get("volume"))
+            for row in previous_rows
+            if safe_float(row.get("volume")) > 0
+        ]
+        average_volume = (
+            sum(previous_volumes) / len(previous_volumes)
+            if len(previous_volumes) >= 5
+            else 0.0
+        )
+        latest_volume = safe_float(latest_kline.get("volume"))
+        volume_ratio = (
+            latest_volume / average_volume
+            if latest_volume > 0 and average_volume > 0
+            else 0.0
+        )
+
+        metric_map[stock_code] = {
+            "code": stock_code,
+            "trade_date": latest_kline.get("trade_date", ""),
+            "price": round(price, 4),
+            "amount": round(safe_float(latest_kline.get("amount")), 4),
+            "change_pct": round(change_pct, 4),
+            "volume_ratio": round(volume_ratio, 6),
+        }
+
+    return metric_map
+
+
+def enrich_heat_realtime_info(metric_map):
+    """补充股票名称和换手率。"""
+    for stock_code, metrics in metric_map.items():
+        stock_info = data.get_stock_info(stock_code, field_list=[])
+        more_info = data.get_more_info(stock_code, field_list=[])
+
+        name = ""
+        if isinstance(stock_info, dict):
+            name = str(stock_info.get("Name", "") or "").strip()
+        if not name and isinstance(more_info, dict):
+            name = str(more_info.get("Name", "") or "").strip()
+
+        metrics["name"] = name
+        metrics["turnover_rate"] = round(
+            safe_float((more_info or {}).get("fHSL")),
+            4,
+        )
+
+    return metric_map
+
+
+def filter_heat_exclude_st(stock_codes, metric_map):
+    """剔除 ST / 退市相关股票。"""
+    passed_codes = []
+    for stock_code in stock_codes:
+        name = str(metric_map.get(stock_code, {}).get("name", ""))
+        if "ST" in name.upper() or "退" in name:
+            continue
+        passed_codes.append(stock_code)
+    return passed_codes
+
+
+def filter_heat_price_range(
+    stock_codes,
+    metric_map,
+    price_min=DEFAULT_HEAT_PRICE_MIN,
+    price_max=DEFAULT_HEAT_PRICE_MAX,
+):
+    """筛选价格区间。"""
+    return [
+        stock_code
+        for stock_code in stock_codes
+        if float(price_min) <= safe_float(metric_map.get(stock_code, {}).get("price")) <= float(price_max)
+    ]
+
+
+def filter_heat_amount(
+    stock_codes,
+    metric_map,
+    amount_min=DEFAULT_HEAT_AMOUNT_MIN,
+):
+    """筛选成交额，amount_min 使用万元口径。"""
+    return [
+        stock_code
+        for stock_code in stock_codes
+        if safe_float(metric_map.get(stock_code, {}).get("amount")) >= float(amount_min)
+    ]
+
+
+def filter_heat_turnover_rate(
+    stock_codes,
+    metric_map,
+    turnover_rate_min=DEFAULT_HEAT_TURNOVER_RATE_MIN,
+):
+    """筛选换手率。"""
+    return [
+        stock_code
+        for stock_code in stock_codes
+        if safe_float(metric_map.get(stock_code, {}).get("turnover_rate")) >= float(turnover_rate_min)
+    ]
+
+
+def filter_heat_volume_ratio(
+    stock_codes,
+    metric_map,
+    volume_ratio_min=DEFAULT_HEAT_VOLUME_RATIO_MIN,
+):
+    """筛选量比。"""
+    return [
+        stock_code
+        for stock_code in stock_codes
+        if safe_float(metric_map.get(stock_code, {}).get("volume_ratio")) >= float(volume_ratio_min)
+    ]
+
+
+def filter_heat_change_pct(
+    stock_codes,
+    metric_map,
+    change_pct_min=DEFAULT_HEAT_CHANGE_PCT_MIN,
+):
+    """筛选涨幅。"""
+    return [
+        stock_code
+        for stock_code in stock_codes
+        if safe_float(metric_map.get(stock_code, {}).get("change_pct")) >= float(change_pct_min)
+    ]
+
+
+def elapsed_seconds(started_at):
+    """返回从 started_at 到当前的秒数。"""
+    return round(time.perf_counter() - started_at, 1)
+
+
+@contextmanager
+def timed_step(label):
+    """打印一个阶段的开始和结束耗时。"""
+    started_at = time.perf_counter()
+    print(f"[耗时] {label} 开始")
+    try:
+        yield
+    finally:
+        print(f"[耗时] {label} 完成：{elapsed_seconds(started_at)}s")
+
+
 def run_layer(layer_name, input_codes, filter_func, layer_records):
-    """执行一层筛选并记录通过数量。"""
+    """执行一层筛选并记录通过数量和耗时。"""
+    started_at = time.perf_counter()
     before_count = len(input_codes)
     output_codes = filter_func(input_codes)
     after_count = len(output_codes)
     removed_count = before_count - after_count
+    elapsed = elapsed_seconds(started_at)
 
     print(
         f"[选股] {layer_name}: "
-        f"输入 {before_count}，通过 {after_count}，淘汰 {removed_count}"
+        f"输入 {before_count}，通过 {after_count}，淘汰 {removed_count}，"
+        f"耗时 {elapsed}s"
     )
 
     layer_records.append(
@@ -668,6 +854,7 @@ def run_layer(layer_name, input_codes, filter_func, layer_records):
             "input_count": before_count,
             "passed_count": after_count,
             "removed_count": removed_count,
+            "elapsed_seconds": elapsed,
         }
     )
 
@@ -681,18 +868,23 @@ def screen_box_consolidation(
     batch_size=DEFAULT_BATCH_SIZE,
 ):
     """从全部 A 股中筛选当前仍处于箱体震荡的股票。"""
-    all_stock_codes = get_all_a_share_codes()
+    flow_started_at = time.perf_counter()
+
+    with timed_step("获取全部A股"):
+        all_stock_codes = get_all_a_share_codes()
     if not all_stock_codes:
         raise RuntimeError("未获取到全部 A 股股票列表")
 
     layer_records = []
     print(f"[选股] 初始股票池：{len(all_stock_codes)}")
-    kline_map = data.load_breakout_kline(
-        stock_list=all_stock_codes,
-        box_days=box_days,
-        breakout_date=breakout_date,
-        batch_size=batch_size,
-    )
+
+    with timed_step("读取K线"):
+        kline_map = data.load_breakout_kline(
+            stock_list=all_stock_codes,
+            box_days=box_days,
+            breakout_date=breakout_date,
+            batch_size=batch_size,
+        )
 
     box_codes, box_detail_map = filter_current_box_consolidation(
         stock_codes=all_stock_codes,
@@ -709,16 +901,17 @@ def screen_box_consolidation(
 
     print(f"[选股] 最终入选：{len(final_codes)}")
 
-    selected_items = []
-    for stock_code in final_codes:
-        item = {
-            "code": stock_code,
-            "breakout_date": breakout_date or "",
-        }
-        item.update(box_detail_map.get(stock_code, {}))
-        selected_items.append(item)
+    with timed_step("结果组装"):
+        selected_items = []
+        for stock_code in final_codes:
+            item = {
+                "code": stock_code,
+                "breakout_date": breakout_date or "",
+            }
+            item.update(box_detail_map.get(stock_code, {}))
+            selected_items.append(item)
 
-    return {
+    result = {
         "strategy": "box_consolidation",
         "breakout_date": breakout_date or "",
         "box_days": int(box_days),
@@ -728,7 +921,10 @@ def screen_box_consolidation(
         "selected_codes": final_codes,
         "selected_items": selected_items,
         "layers": layer_records,
+        "elapsed_seconds": elapsed_seconds(flow_started_at),
     }
+    print(f"[耗时] 全流程完成：{result['elapsed_seconds']}s")
+    return result
 
 
 def screen_breakout_pullback_ma(
@@ -743,7 +939,10 @@ def screen_breakout_pullback_ma(
     batch_size=DEFAULT_BATCH_SIZE,
 ):
     """从全部 A 股中筛选放量突破后在目标日回踩 MA 的股票。"""
-    all_stock_codes = get_all_a_share_codes()
+    flow_started_at = time.perf_counter()
+
+    with timed_step("获取全部A股"):
+        all_stock_codes = get_all_a_share_codes()
     if not all_stock_codes:
         raise RuntimeError("未获取到全部 A 股股票列表")
 
@@ -753,13 +952,15 @@ def screen_breakout_pullback_ma(
         int(box_days) + int(pullback_days) + 1,
         max(DEFAULT_BULLISH_MA_DAYS),
     )
-    kline_map = data.load_breakout_kline(
-        stock_list=all_stock_codes,
-        box_days=box_days,
-        breakout_date=pullback_date,
-        extra_days=kline_count - int(box_days) - 1,
-        batch_size=batch_size,
-    )
+
+    with timed_step("读取K线"):
+        kline_map = data.load_breakout_kline(
+            stock_list=all_stock_codes,
+            box_days=box_days,
+            breakout_date=pullback_date,
+            extra_days=kline_count - int(box_days) - 1,
+            batch_size=batch_size,
+        )
 
     breakout_codes, breakout_detail_map = filter_recent_volume_breakout(
         stock_codes=all_stock_codes,
@@ -804,18 +1005,19 @@ def screen_breakout_pullback_ma(
 
     print(f"[选股] 最终入选：{len(final_codes)}")
 
-    selected_items = []
-    for stock_code in final_codes:
-        item = {
-            "code": stock_code,
-            "pullback_date": pullback_date or "",
-        }
-        item.update(breakout_detail_map.get(stock_code, {}))
-        item.update(bullish_ma_detail_map.get(stock_code, {}))
-        item.update(pullback_detail_map.get(stock_code, {}))
-        selected_items.append(item)
+    with timed_step("结果组装"):
+        selected_items = []
+        for stock_code in final_codes:
+            item = {
+                "code": stock_code,
+                "pullback_date": pullback_date or "",
+            }
+            item.update(breakout_detail_map.get(stock_code, {}))
+            item.update(bullish_ma_detail_map.get(stock_code, {}))
+            item.update(pullback_detail_map.get(stock_code, {}))
+            selected_items.append(item)
 
-    return {
+    result = {
         "strategy": f"breakout_pullback_ma{ma_days}",
         "pullback_date": pullback_date or "",
         "box_days": int(box_days),
@@ -832,7 +1034,135 @@ def screen_breakout_pullback_ma(
         "selected_codes": final_codes,
         "selected_items": selected_items,
         "layers": layer_records,
+        "elapsed_seconds": elapsed_seconds(flow_started_at),
     }
+    print(f"[耗时] 全流程完成：{result['elapsed_seconds']}s")
+    return result
+
+
+def screen_heat(
+    heat_date="",
+    amount_min=DEFAULT_HEAT_AMOUNT_MIN,
+    turnover_rate_min=DEFAULT_HEAT_TURNOVER_RATE_MIN,
+    volume_ratio_min=DEFAULT_HEAT_VOLUME_RATIO_MIN,
+    change_pct_min=DEFAULT_HEAT_CHANGE_PCT_MIN,
+    price_min=DEFAULT_HEAT_PRICE_MIN,
+    price_max=DEFAULT_HEAT_PRICE_MAX,
+    batch_size=DEFAULT_BATCH_SIZE,
+):
+    """从全部 A 股中筛选资金热度候选。"""
+    flow_started_at = time.perf_counter()
+
+    with timed_step("获取全部A股"):
+        all_stock_codes = get_all_a_share_codes()
+    if not all_stock_codes:
+        raise RuntimeError("未获取到全部 A 股股票列表")
+
+    layer_records = []
+    print(f"[选股] 初始股票池：{len(all_stock_codes)}")
+
+    with timed_step("读取K线"):
+        kline_map = data.load_breakout_kline(
+            stock_list=all_stock_codes,
+            box_days=DEFAULT_HEAT_KLINE_DAYS - 1,
+            breakout_date=heat_date,
+            batch_size=batch_size,
+        )
+
+    with timed_step("补齐实时快照"):
+        metric_map = build_heat_metric_map(all_stock_codes, kline_map)
+        metric_map = enrich_heat_realtime_info(metric_map)
+        available_codes = [
+            stock_code
+            for stock_code in all_stock_codes
+            if stock_code in metric_map
+        ]
+
+    current_codes = run_layer(
+        layer_name="ST/退市过滤",
+        input_codes=available_codes,
+        filter_func=lambda codes: filter_heat_exclude_st(codes, metric_map),
+        layer_records=layer_records,
+    )
+    current_codes = run_layer(
+        layer_name="价格区间过滤",
+        input_codes=current_codes,
+        filter_func=lambda codes: filter_heat_price_range(
+            codes,
+            metric_map,
+            price_min=price_min,
+            price_max=price_max,
+        ),
+        layer_records=layer_records,
+    )
+    current_codes = run_layer(
+        layer_name="成交额过滤",
+        input_codes=current_codes,
+        filter_func=lambda codes: filter_heat_amount(
+            codes,
+            metric_map,
+            amount_min=amount_min,
+        ),
+        layer_records=layer_records,
+    )
+    current_codes = run_layer(
+        layer_name="换手率过滤",
+        input_codes=current_codes,
+        filter_func=lambda codes: filter_heat_turnover_rate(
+            codes,
+            metric_map,
+            turnover_rate_min=turnover_rate_min,
+        ),
+        layer_records=layer_records,
+    )
+    current_codes = run_layer(
+        layer_name="量比过滤",
+        input_codes=current_codes,
+        filter_func=lambda codes: filter_heat_volume_ratio(
+            codes,
+            metric_map,
+            volume_ratio_min=volume_ratio_min,
+        ),
+        layer_records=layer_records,
+    )
+    final_codes = run_layer(
+        layer_name="涨幅过滤",
+        input_codes=current_codes,
+        filter_func=lambda codes: filter_heat_change_pct(
+            codes,
+            metric_map,
+            change_pct_min=change_pct_min,
+        ),
+        layer_records=layer_records,
+    )
+
+    print(f"[选股] 最终入选：{len(final_codes)}")
+
+    with timed_step("结果组装"):
+        selected_items = [
+            dict(metric_map.get(stock_code, {}))
+            for stock_code in final_codes
+        ]
+
+    result = {
+        "strategy": "heat",
+        "heat_date": heat_date or "",
+        "amount_min": float(amount_min),
+        "turnover_rate_min": float(turnover_rate_min),
+        "volume_ratio_min": float(volume_ratio_min),
+        "change_pct_min": float(change_pct_min),
+        "price_min": float(price_min),
+        "price_max": float(price_max),
+        "initial_count": len(all_stock_codes),
+        "available_count": len(available_codes),
+        "selected_count": len(final_codes),
+        "selected_codes": final_codes,
+        "selected_items": selected_items,
+        "layers": layer_records,
+        "elapsed_seconds": elapsed_seconds(flow_started_at),
+    }
+    print(f"[耗时] 全流程完成：{result['elapsed_seconds']}s")
+    return result
 
 
 def screen_volume_breakout(
@@ -843,18 +1173,23 @@ def screen_volume_breakout(
     batch_size=DEFAULT_BATCH_SIZE,
 ):
     """从全部 A 股中筛选放量突破箱体的股票。"""
-    all_stock_codes = get_all_a_share_codes()
+    flow_started_at = time.perf_counter()
+
+    with timed_step("获取全部A股"):
+        all_stock_codes = get_all_a_share_codes()
     if not all_stock_codes:
         raise RuntimeError("未获取到全部 A 股股票列表")
 
     layer_records = []
     print(f"[选股] 初始股票池：{len(all_stock_codes)}")
-    kline_map = data.load_breakout_kline(
-        stock_list=all_stock_codes,
-        box_days=box_days,
-        breakout_date=breakout_date,
-        batch_size=batch_size,
-    )
+
+    with timed_step("读取K线"):
+        kline_map = data.load_breakout_kline(
+            stock_list=all_stock_codes,
+            box_days=box_days,
+            breakout_date=breakout_date,
+            batch_size=batch_size,
+        )
 
     box_codes = run_layer(
         layer_name="箱体区间筛选",
@@ -884,16 +1219,17 @@ def screen_volume_breakout(
 
     print(f"[选股] 最终入选：{len(final_codes)}")
 
-    selected_items = []
-    for stock_code in final_codes:
-        item = {
-            "code": stock_code,
-            "breakout_date": breakout_date or "",
-        }
-        item.update(breakout_detail_map.get(stock_code, {}))
-        selected_items.append(item)
+    with timed_step("结果组装"):
+        selected_items = []
+        for stock_code in final_codes:
+            item = {
+                "code": stock_code,
+                "breakout_date": breakout_date or "",
+            }
+            item.update(breakout_detail_map.get(stock_code, {}))
+            selected_items.append(item)
 
-    return {
+    result = {
         "strategy": "volume_breakout",
         "breakout_date": breakout_date or "",
         "box_days": int(box_days),
@@ -905,7 +1241,10 @@ def screen_volume_breakout(
         "selected_codes": final_codes,
         "selected_items": selected_items,
         "layers": layer_records,
+        "elapsed_seconds": elapsed_seconds(flow_started_at),
     }
+    print(f"[耗时] 全流程完成：{result['elapsed_seconds']}s")
+    return result
 
 
 def main():
@@ -1062,6 +1401,64 @@ def main():
         help="输出完整 JSON 调试信息",
     )
 
+    heat_parser = subparsers.add_parser(
+        "heat",
+        help="从全部 A 股扫描资金热度候选",
+        description="从全部 A 股出发，按成交额、换手率、量比、涨幅和价格区间筛选资金热度候选。",
+    )
+    heat_parser.add_argument(
+        "--heat-date",
+        default="",
+        help="观察日，格式 YYYY-MM-DD；不传则使用今天/最新 K 线",
+    )
+    heat_parser.add_argument(
+        "--amount-min",
+        type=float,
+        default=DEFAULT_HEAT_AMOUNT_MIN,
+        help=f"成交额下限，单位万元，默认 {DEFAULT_HEAT_AMOUNT_MIN}",
+    )
+    heat_parser.add_argument(
+        "--turnover-rate-min",
+        type=float,
+        default=DEFAULT_HEAT_TURNOVER_RATE_MIN,
+        help=f"换手率下限，默认 {DEFAULT_HEAT_TURNOVER_RATE_MIN}",
+    )
+    heat_parser.add_argument(
+        "--volume-ratio-min",
+        type=float,
+        default=DEFAULT_HEAT_VOLUME_RATIO_MIN,
+        help=f"量比下限，默认 {DEFAULT_HEAT_VOLUME_RATIO_MIN}",
+    )
+    heat_parser.add_argument(
+        "--change-pct-min",
+        type=float,
+        default=DEFAULT_HEAT_CHANGE_PCT_MIN,
+        help=f"涨幅下限，默认 {DEFAULT_HEAT_CHANGE_PCT_MIN}",
+    )
+    heat_parser.add_argument(
+        "--price-min",
+        type=float,
+        default=DEFAULT_HEAT_PRICE_MIN,
+        help=f"股价下限，默认 {DEFAULT_HEAT_PRICE_MIN}",
+    )
+    heat_parser.add_argument(
+        "--price-max",
+        type=float,
+        default=DEFAULT_HEAT_PRICE_MAX,
+        help=f"股价上限，默认 {DEFAULT_HEAT_PRICE_MAX}",
+    )
+    heat_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"每批拉取多少只股票 K 线，默认 {DEFAULT_BATCH_SIZE}",
+    )
+    heat_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="输出完整 JSON 调试信息",
+    )
+
     args = parser.parse_args()
     data.initialize(Path(__file__))
 
@@ -1096,6 +1493,20 @@ def main():
             pullback_date=args.pullback_date,
             range_max=args.range_max,
             volume_ratio_min=args.volume_ratio_min,
+            batch_size=args.batch_size,
+        )
+        print_screen_result(result, debug=args.debug)
+        return
+
+    if args.command == "heat":
+        result = screen_heat(
+            heat_date=args.heat_date,
+            amount_min=args.amount_min,
+            turnover_rate_min=args.turnover_rate_min,
+            volume_ratio_min=args.volume_ratio_min,
+            change_pct_min=args.change_pct_min,
+            price_min=args.price_min,
+            price_max=args.price_max,
             batch_size=args.batch_size,
         )
         print_screen_result(result, debug=args.debug)
