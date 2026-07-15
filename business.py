@@ -1083,6 +1083,14 @@ def collect_thises_data(target):
     }
 
 
+def build_market_context():
+    """构建 thises 分析所需的盘中 / 盘外上下文。"""
+    return {
+        "as_of": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "is_intraday": data.is_a_share_intraday(),
+    }
+
+
 def build_thises_data(codes):
     """根据股票或板块 code 批量构建 thises 输入数据。"""
     targets = resolve_report_codes(codes)
@@ -1106,6 +1114,7 @@ def build_thises_data(codes):
         "task": "thises",
         "data_type": "thises_input",
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "market_context": build_market_context(),
         "items": items,
         "errors": errors,
     }

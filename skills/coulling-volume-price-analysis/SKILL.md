@@ -21,6 +21,10 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 {
   "code": "881394.SH",
   "name": "证券",
+  "market_context": {
+    "as_of": "2026-07-15 10:42:00",
+    "is_intraday": true
+  },
   "daily_kline": [
     {
       "code": "881394.SH",
@@ -53,6 +57,9 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 
 - `code`
 - `name`
+- `market_context`
+- `market_context.as_of`
+- `market_context.is_intraday`
 - `daily_kline`
 - `daily_kline[].code`
 - `daily_kline[].trade_date`
@@ -84,6 +91,19 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 
 分析时只能使用“输入参数格式”中明确提供的数据。
 
+### K 线引用一致性规则
+
+所有输出模块中的 `data[].kline` 和 `chip.data.kline_evidence[].kline` 必须从输入 `daily_kline` 中按原始对象整行复制，不允许手写、重算、四舍五入、拼接不同日期字段，或把某一天的 `trade_date` 与另一根 K 线的价格/成交量字段混用。
+
+如果 `evidence` 或 `result` 中提到某个交易日，则同一条证据里的 `kline.trade_date` 必须等于该交易日，并且 `open_price`、`high_price`、`low_price`、`close_price`、`volume`、`amount`、`volume_ratio` 必须与输入中该 `trade_date` 的原始行完全一致。
+
+输出 JSON 前必须做一次自检：
+
+1. 为输入 `daily_kline` 建立 `trade_date -> 原始 K 线行` 的映射。
+2. 检查输出中每一个 `kline.trade_date` 都存在于输入映射。
+3. 检查输出中每一个 `kline` 的全部字段与输入映射中的原始行完全一致。
+4. 若发现不一致，必须用输入原始行替换该 `kline` 后再输出。
+
 允许基于已提供的日 K 数据计算直接派生指标，例如：
 
 - 涨跌幅
@@ -114,6 +134,20 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 3. 输出结构化 JSON 分析结果。
 4. 分析结果必须遵循“有结论、有数据、有理论”的原则。
 5. 每个结论都必须有足够的数据支撑，并给出对应的书中理论索引。
+6. 必须读取输入 JSON 中的 `market_context.is_intraday`，并根据盘中 / 盘外状态进行判断。
+
+如果 `market_context.is_intraday == true`：
+
+1. 最后一根 `daily_kline` 是盘中临时 K，不是完整日 K。
+2. 涉及成交量、收盘价、上下影线、实体、突破确认、反转确认、放量确认、缩量确认等判断，必须结合盘中状态说明为“盘中暂态判断”。
+3. 不得把最后一根 K 当作收盘后定型 K。
+4. 不得输出“已经确认突破”“已经确认跌破”“已经完成反转”“已经确认放量止涨/止跌”等收盘级确认结论。
+5. 正确表达应为“盘中暂时出现”“若收盘仍保持则可确认”“当前仅为盘中迹象”。
+
+如果 `market_context.is_intraday == false`：
+
+1. 可以把最后一根 `daily_kline` 视为完整日 K。
+2. 可以基于最后一根 K 做收盘级别的确认判断。
 
 ### 输出 JSON 格式
 
@@ -298,7 +332,7 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 
 普通模块 `data` 中的每一项都必须包含：
 
-- `kline`：完整单根日 K 数据（从输入 `daily_kline` 中原样取出）。
+- `kline`：完整单根日 K 数据（从输入 `daily_kline` 中原样取出，字段和值必须完全一致）。
 - `evidence`：基于该 K 线得到的证据说明。
 
 `data` 示例：
