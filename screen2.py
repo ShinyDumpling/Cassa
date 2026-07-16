@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import business
 import data
 from rich.console import Console
 from rich.table import Table
@@ -369,23 +368,16 @@ def build_stock_records_from_snapshot(snapshot_rows):
 
 
 def ensure_sectors(records):
-    """补齐行业和概念板块，仅保留 industry/concept。"""
+    """从本地数据库读取板块关系并转换为 StockRecord.sectors。"""
     for record in records:
-        relations = data.get_relation(record.code) or []
-        sectors = []
-        for relation in relations:
-            mapped_type = business.map_relation_type(relation.get("BlockType"))
-            if mapped_type not in {"industry", "concept"}:
-                continue
-            name = str(relation.get("BlockName", "") or "").strip()
-            if not name:
-                continue
-            sectors.append(SectorRecord(
-                type=mapped_type,
-                name=name,
-                code=str(relation.get("BlockCode", "") or ""),
-            ))
-        record.sectors = sectors
+        record.sectors = [
+            SectorRecord(
+                type=sector["type"],
+                name=sector["name"],
+                code=sector["code"],
+            )
+            for sector in data.load_stock_sectors(record.code)
+        ]
     return records
 
 

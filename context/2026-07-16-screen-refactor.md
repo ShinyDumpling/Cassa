@@ -1812,3 +1812,1351 @@ python screen2.py heat --snapshot-mode refresh
 ```
 
 这样“重复筛选”和“刷新行情”被明确分离，避免每次盘中运行都触发 5000 多只股票的快照请求。
+
+## 去掉选股过程去获取章节，改为数据库获取
+
+### 1. 目标与边界
+
+选股过程不再逐只调用 `data.get_stock_info(code)` 或 `data.get_relation(code)`。股票名称、总股本、所属行业和概念统一由 `data.py` 在维护数据库时获取并落盘，`screen2.py` 只从本地数据库读取。
+
+本章只改变基础资料和板块资料的获取位置，不改变快照行情字段的来源。快照生成仍可以使用通达信快照接口获取价格、成交额、换手率、量比、PE、PB 等实时字段；其中股票名称、总股本优先来自数据库。
+
+### 2. 数据表设计
+
+#### 2.1 `stock_basic`
+
+```sql
+CREATE TABLE IF NOT EXISTS stock_basic (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    total_shares REAL,
+    updated_at TEXT NOT NULL
+)
+```
+
+`total_shares` 继续使用现有约定的“万股”单位，保持与 `business.py` 和 `cassa.py` 一致。总市值换算时：
+
+```python
+market_cap_yuan = total_shares * price * 10000
+market_cap_yi = total_shares * price / 10000
+```
+
+#### 2.2 `stock_sector`
+
+```sql
+CREATE TABLE IF NOT EXISTS stock_sector (
+    code TEXT NOT NULL,
+    sector_type TEXT NOT NULL,
+    sector_code TEXT NOT NULL DEFAULT '',
+    sector_name TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (code, sector_type, sector_code, sector_name)
+)
+```
+
+`sector_type` 只保存 `industry` 和 `concept`。板块数据不放入快照文件，也不放入 `StockRecord` 的额外动态字段；`StockRecord.sectors` 在组装时由数据库记录填充。
+
+### 3. 全量刷新与事务边界
+
+每次执行 `data.py update-daily-kline` 时，按以下顺序维护两张表：
+
+1. 获取全市场股票代码。
+2. 在内存中获取并整理所有股票的名称、总股本。
+3. 在内存中获取并整理所有股票的行业、概念关系。
+4. 只有上述网络获取全部成功后，才开启 SQLite 写事务。
+5. 在同一个事务中清空 `stock_sector`、`stock_basic`，再批量插入本次完整数据。
+6. 全部插入成功后 `COMMIT`；任意异常执行 `ROLLBACK`，保留上一次完整数据。
+
+这里的“全量删掉重新插入”是逻辑上的全量替换，不是先提交删除再写入。网络请求不放在数据库事务中，避免长时间占用写锁；事务只负责短时间内完成两张表的一致性替换。
+
+### 4. `data.py` 执行方案
+
+#### 4.1 建表和兼容旧表
+
+```python
+def migrate_stock_tables(conn):
+    """创建股票基础信息和板块关系表，并为旧 stock_basic 表补齐缺失列。"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stock_basic (
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(stock_basic)").fetchall()
+    }
+    if "total_shares" not in columns:
+        conn.execute("ALTER TABLE stock_basic ADD COLUMN total_shares REAL")
+    if "updated_at" not in columns:
+        conn.execute(
+            "ALTER TABLE stock_basic ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+        )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stock_sector (
+            code TEXT NOT NULL,
+            sector_type TEXT NOT NULL,
+            sector_code TEXT NOT NULL DEFAULT '',
+            sector_name TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (code, sector_type, sector_code, sector_name)
+        )
+    """)
+    conn.commit()
+
+
+def collect_stock_basic_rows(stock_codes, updated_at):
+    """获取全部股票的名称和总股本，返回可批量写入 stock_basic 的行。"""
+    rows = []
+    for code in stock_codes:
+        info = get_stock_info(code)
+        rows.append({
+            "code": code,
+            "name": info.get("Name", ""),
+            "total_shares": info.get("J_zgb"),
+            "updated_at": updated_at,
+        })
+    return rows
+
+
+def collect_stock_sector_rows(stock_codes, updated_at):
+    """获取全部股票的行业和概念关系，返回可批量写入 stock_sector 的行。"""
+    rows = []
+    relation_type_map = {"行业": "industry", "概念": "concept"}
+    for code in stock_codes:
+        for relation in get_relation(code) or []:
+            sector_type = relation_type_map.get(relation.get("BlockType"))
+            sector_name = relation.get("BlockName", "")
+            if not sector_type or not sector_name:
+                continue
+            rows.append({
+                "code": code,
+                "sector_type": sector_type,
+                "sector_code": relation.get("BlockCode", ""),
+                "sector_name": sector_name,
+                "updated_at": updated_at,
+            })
+    return rows
+
+
+def replace_stock_metadata(stock_basic_rows, stock_sector_rows):
+    """在一个事务中全量替换股票基础信息和板块关系，失败时回滚。"""
+    conn = get_connection()
+    try:
+        migrate_stock_tables(conn)
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM stock_sector")
+        conn.execute("DELETE FROM stock_basic")
+        conn.executemany(
+            """INSERT INTO stock_basic
+               (code, name, total_shares, updated_at)
+               VALUES (:code, :name, :total_shares, :updated_at)""",
+            stock_basic_rows,
+        )
+        conn.executemany(
+            """INSERT INTO stock_sector
+               (code, sector_type, sector_code, sector_name, updated_at)
+               VALUES (:code, :sector_type, :sector_code, :sector_name, :updated_at)""",
+            stock_sector_rows,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def refresh_stock_metadata(stock_codes):
+    """先完整获取股票资料，再以事务全量替换本地资料表。"""
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    basic_rows = collect_stock_basic_rows(stock_codes, updated_at)
+    sector_rows = collect_stock_sector_rows(stock_codes, updated_at)
+    if len(basic_rows) != len(stock_codes):
+        raise RuntimeError("股票基础信息未完整获取，取消本次数据库替换")
+    replace_stock_metadata(basic_rows, sector_rows)
+    return {"stock_basic": len(basic_rows), "stock_sector": len(sector_rows)}
+```
+
+实际项目中的连接函数名以当前 `data.py` 为准；如果现有名称是 `ensure_database()`，则将示例中的 `get_connection()` 替换为该函数。迁移函数必须在首次使用和 `update-daily-kline` 入口执行，确保旧数据库能够自动增加 `total_shares` 列。
+
+#### 4.2 接入 `update-daily-kline`
+
+```python
+def update_daily_kline_after_close():
+    """收盘后更新日 K，并同步全市场股票基础信息和板块关系。"""
+    stock_rows = get_stock_list()
+    stock_codes = [extract_stock_code(row) for row in stock_rows]
+    stock_codes = [code for code in stock_codes if code]
+
+    metadata_stats = refresh_stock_metadata(stock_codes)
+    print(
+        f"[股票资料] 已全量更新：基础信息 {metadata_stats['stock_basic']} 只，"
+        f"板块关系 {metadata_stats['stock_sector']} 条"
+    )
+
+    # 继续执行原有的收盘后日 K 拉取和入库逻辑。
+    update_daily_kline(stock_codes)
+```
+
+如果基础信息或板块接口在第 2、3 步任意失败，`refresh_stock_metadata()` 不得进入替换事务，旧数据继续可用；日 K 是否继续执行由现有错误处理策略决定，但不能把不完整资料覆盖进数据库。
+
+### 5. `screen2.py` 只读数据库
+
+```python
+def load_stock_basic_records():
+    """从本地 stock_basic 读取选股所需的代码、名称和总股本。"""
+    conn = data.ensure_database()
+    try:
+        data.migrate_stock_tables(conn)
+        rows = conn.execute(
+            """SELECT code, name, total_shares
+               FROM stock_basic ORDER BY code"""
+        ).fetchall()
+        return {
+            row["code"]: {
+                "code": row["code"],
+                "name": row["name"],
+                "total_shares": row["total_shares"],
+            }
+            for row in rows
+        }
+    finally:
+        conn.close()
+
+
+def load_stock_sectors(code):
+    """从本地 stock_sector 读取一只股票的行业和概念。"""
+    conn = data.ensure_database()
+    try:
+        rows = conn.execute(
+            """SELECT sector_type, sector_name, sector_code
+               FROM stock_sector WHERE code = ?
+               ORDER BY sector_type, sector_name""",
+            (code,),
+        ).fetchall()
+        return [
+            SectorRecord(
+                type=row["sector_type"],
+                name=row["sector_name"],
+                code=row["sector_code"],
+            )
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+def ensure_sectors(records):
+    """为 StockRecord 补齐本地数据库中的行业和概念关系。"""
+    for record in records:
+        record.sectors = load_stock_sectors(record.code)
+    return records
+```
+
+筛选过程中禁止出现以下网络调用：
+
+```python
+data.get_stock_info(code)
+data.get_relation(code)
+```
+
+`screen2.py` 只读取 `stock_basic` 和 `stock_sector`。快照生成时使用 `stock_basic.total_shares` 计算总市值；`get_more_info()` 仅在快照确实需要 PE、PB 等实时补充字段时保留，不能用于补股票名称或板块。
+
+### 6. 一致性和验证要求
+
+1. 迁移旧库：已有 `stock_basic.name` 数据必须保留，并自动增加 `total_shares` 列。
+2. 正常刷新：两张表在同一个事务中替换，提交后行数和更新时间对应同一批数据。
+3. 异常回滚：在第二张表插入阶段制造异常，确认两张表都恢复到刷新前状态，不能出现一张新、一张旧。
+4. 全量覆盖：本次接口已删除的板块关系在刷新后必须从 `stock_sector` 消失，不能残留旧关系。
+5. 选股验证：执行 `python screen2.py heat` 时不调用 `get_stock_info()`、`get_relation()`，板块补齐耗时应明显下降。
+6. 数据缺失：数据库没有对应股票资料时只记录警告并按既有缺失数据策略处理；不在选股阶段临时回源请求接口。
+
+最终流程为：
+
+```text
+update-daily-kline
+  -> 网络获取全量股票资料（内存）
+  -> 事务全量替换 stock_basic + stock_sector
+  -> 更新日 K
+
+screen2.py heat
+  -> 读取本地 stock_basic
+  -> 读取本地 stock_sector
+  -> 生成/读取快照并执行筛选
+  -> 组装 StockRecord 和控制台结果
+```
+
+### 7. 执行决策收敛与代码修正
+
+本节覆盖本章前面示例代码中的接口差异，具有最高执行优先级。
+
+#### 7.1 `total_shares` 保持现有非空约束
+
+现有数据库中的 `stock_basic.total_shares` 已经是 `REAL NOT NULL DEFAULT 0`，第一版不重建表、不降级约束。迁移代码应保持如下定义：
+
+```sql
+total_shares REAL NOT NULL DEFAULT 0
+```
+
+采集时将缺失或非法的 `J_zgb` 统一转换成 `0.0`，确保单只股票资料缺失不会因为 `NULL` 触发事务失败：
+
+```python
+def parse_total_shares(value):
+    """将 J_zgb 转成万股；缺失或非法值按 0 处理。"""
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# collect_stock_basic_rows() 内
+"total_shares": parse_total_shares(info.get("J_zgb")),
+```
+
+因此 `migrate_stock_tables()` 中新增列的 SQL 必须是：
+
+```python
+conn.execute(
+    "ALTER TABLE stock_basic ADD COLUMN total_shares REAL NOT NULL DEFAULT 0"
+)
+```
+
+缺失总股本只影响该股票的总市值计算，不阻断名称、板块和其他股票资料的更新。
+
+#### 7.2 新增查询代码使用 tuple 位置索引
+
+当前 `ensure_database()` 返回默认的 SQLite tuple 行，不能在新增代码中使用 `row["code"]`。第一版不修改全局 `row_factory`，避免影响 `data.py` 既有查询；新增查询统一使用位置索引：
+
+```python
+def load_stock_basic_records():
+    """从本地 stock_basic 读取股票基础信息。"""
+    conn = data.ensure_database()
+    try:
+        data.migrate_stock_tables(conn)
+        rows = conn.execute(
+            "SELECT code, name, total_shares FROM stock_basic ORDER BY code"
+        ).fetchall()
+        return {
+            row[0]: {
+                "code": row[0],
+                "name": row[1],
+                "total_shares": float(row[2] or 0),
+            }
+            for row in rows
+        }
+    finally:
+        conn.close()
+
+
+def load_stock_sectors(code):
+    """从本地 stock_sector 读取一只股票的行业和概念。"""
+    conn = data.ensure_database()
+    try:
+        rows = conn.execute(
+            """SELECT sector_type, sector_name, sector_code
+               FROM stock_sector WHERE code = ?
+               ORDER BY sector_type, sector_name""",
+            (code,),
+        ).fetchall()
+        return [
+            SectorRecord(type=row[0], name=row[1], code=row[2])
+            for row in rows
+        ]
+    finally:
+        conn.close()
+```
+
+#### 7.3 板块关系在采集阶段去重
+
+选择 C1：在写入前按主键字段去重，避免源接口偶发重复关系导致整个事务失败。保留第一次出现的记录：
+
+```python
+def collect_stock_sector_rows(stock_codes, updated_at):
+    """获取行业和概念关系，并按 stock_sector 主键去重。"""
+    unique_rows = {}
+    relation_type_map = {"行业": "industry", "概念": "concept"}
+    for code in stock_codes:
+        for relation in get_relation(code) or []:
+            sector_type = relation_type_map.get(relation.get("BlockType"))
+            sector_name = str(relation.get("BlockName") or "").strip()
+            if not sector_type or not sector_name:
+                continue
+            sector_code = str(relation.get("BlockCode") or "").strip()
+            key = (code, sector_type, sector_code, sector_name)
+            unique_rows.setdefault(key, {
+                "code": code,
+                "sector_type": sector_type,
+                "sector_code": sector_code,
+                "sector_name": sector_name,
+                "updated_at": updated_at,
+            })
+    return list(unique_rows.values())
+```
+
+不使用 `INSERT OR IGNORE` 掩盖数据问题；去重逻辑放在采集层，便于后续统计和排查源数据质量。
+
+#### 7.4 `load_stock_basic_records()` 保留在 `data.py`
+
+选择 D2：`load_stock_basic_records()` 作为数据访问函数保留在 `data.py`，`screen2.py` 继续调用：
+
+```python
+stock_rows = data.load_stock_basic_records()
+```
+
+`screen2.py` 只负责选股业务和 `StockRecord` 组装，不直接编写股票基础表 SQL。板块读取同理，建议最终由 `data.load_stock_sectors(code)` 暴露数据访问接口，`screen2.py` 的 `ensure_sectors()` 只负责把查询结果赋给记录。
+
+#### 7.5 收盘更新入口使用实际代码接口
+
+`get_stock_list()` 当前返回 `list[str]`，因此不再使用不存在的 `extract_stock_code(row)`：
+
+```python
+stock_rows = get_stock_list()
+stock_codes = [str(code).strip() for code in stock_rows if code]
+refresh_stock_metadata(stock_codes)
+```
+
+现有 `update_daily_kline_after_close()` 中的：
+
+```python
+upsert_stock_basic_rows(stock_rows)
+```
+
+必须删除，避免旧的逐行 upsert 逻辑与新的事务全量替换逻辑重复执行。`upsert_stock_basic_rows()` 和旧的 `migrate_stock_basic_table()` 不再作为运行入口；完成迁移后删除，或暂时保留为明确标注“废弃、禁止调用”的兼容代码，但不能被 `update-daily-kline` 或 `screen2.py` 调用。最终保留的正式接口为：
+
+```text
+migrate_stock_tables
+collect_stock_basic_rows
+collect_stock_sector_rows
+replace_stock_metadata
+refresh_stock_metadata
+load_stock_basic_records
+load_stock_sectors
+```
+
+这样可以同时解决旧表约束、SQLite 行格式、源数据重复、数据层职责和实际代码接口五类问题，并保持“网络采集完成后，事务全量替换；选股阶段只读数据库”的总体设计不变。
+
+### 9. 为 `update-daily-kline` 添加执行日志
+
+#### 9.1 目标
+
+当前执行：
+
+```bash
+python data.py update-daily-kline --count 1
+```
+
+在输出“正在获取全市场股票列表”后，可能长时间没有新日志。实际流程中不仅会获取日 K，还会顺序获取全市场股票基础信息和板块关系；如果没有进度输出，用户无法判断程序是在等待接口、采集资料，还是已经异常卡死。
+
+本次只增加可观测性，不改变现有数据来源、全量刷新方式和事务边界。`--count 1` 仍然表示每只股票拉取 1 根日 K，不代表只处理 1 只股票；股票列表、基础信息和板块关系仍按全市场执行。
+
+#### 9.2 统一阶段划分
+
+`update_daily_kline_after_close()` 的控制台日志统一按以下阶段输出：
+
+```text
+[日K更新] 阶段 1/4：获取全市场股票列表
+[日K更新] 阶段 2/4：获取股票基础信息
+[日K更新] 阶段 3/4：获取股票行业和概念
+[日K更新] 阶段 4/4：拉取并写入日K
+```
+
+阶段名称必须在阶段开始时打印，阶段结束时打印数量、成功数、失败数和耗时。所有耗时使用 `time.perf_counter()` 计算，保留一位小数。
+
+#### 9.3 股票列表阶段日志
+
+现有代码：
+
+```python
+print("[日K更新] 正在获取全市场股票列表...")
+stock_rows = get_stock_list()
+stock_list = extract_stock_codes_from_stock_list(stock_rows)
+```
+
+改为：
+
+```python
+stage_started_at = time.perf_counter()
+print("[日K更新] 阶段 1/4：正在获取全市场股票列表...")
+
+stock_rows = get_stock_list()
+stock_list = extract_stock_codes_from_stock_list(stock_rows)
+
+stage_seconds = time.perf_counter() - stage_started_at
+print(
+    f"[日K更新] 阶段 1/4 完成：获取 {len(stock_list)} 只股票，"
+    f"耗时 {stage_seconds:.1f}s"
+)
+```
+
+如果列表为空，必须明确打印：
+
+```text
+[日K更新] 阶段 1/4 失败：未获取到股票列表，结束本次更新
+```
+
+空列表不能继续执行资料清空或数据库替换。
+
+#### 9.4 基础信息采集进度
+
+`collect_stock_basic_rows()` 当前会逐只调用 `get_stock_info()`。函数内部需要增加批量进度日志，但不需要为每只成功股票打印一行，避免日志过多。
+
+```python
+def collect_stock_basic_rows(stock_codes, updated_at, progress_interval=500):
+    """获取全部股票名称和总股本，并按固定间隔输出进度。"""
+    started_at = time.perf_counter()
+    total = len(stock_codes)
+    rows = []
+    failed_count = 0
+
+    print(f"[股票基础信息] 开始获取：共 {total} 只")
+
+    for index, code in enumerate(stock_codes, 1):
+        try:
+            info = get_stock_info(code, field_list=[]) or {}
+        except Exception as exc:
+            failed_count += 1
+            info = {}
+            print(f"[股票基础信息] 获取失败：{code}，{exc}")
+
+        rows.append({
+            "code": code,
+            "name": str(info.get("Name", "") or "").strip(),
+            "total_shares": parse_total_shares(info.get("J_zgb")),
+            "updated_at": updated_at,
+        })
+
+        if index % progress_interval == 0 or index == total:
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"[股票基础信息] 进度：{index}/{total}，"
+                f"失败 {failed_count} 只，耗时 {elapsed:.1f}s"
+            )
+
+    elapsed = time.perf_counter() - started_at
+    print(
+        f"[股票基础信息] 获取完成：{total} 只，"
+        f"失败 {failed_count} 只，耗时 {elapsed:.1f}s"
+    )
+    return rows
+```
+
+单只股票接口异常仍按现有策略记录为空资料并继续；只有基础信息行数量不完整时，才禁止进入数据库替换事务。进度日志中的失败数必须与最终汇总一致。
+
+#### 9.5 板块关系采集进度
+
+`collect_stock_sector_rows()` 同样逐只调用 `get_relation()`，增加与基础信息阶段一致的进度统计：
+
+```python
+def collect_stock_sector_rows(stock_codes, updated_at, progress_interval=500):
+    """获取行业和概念关系，并输出全量采集进度。"""
+    started_at = time.perf_counter()
+    total = len(stock_codes)
+    failed_count = 0
+    unique_rows = {}
+
+    print(f"[板块关系] 开始获取：共 {total} 只")
+
+    for index, code in enumerate(stock_codes, 1):
+        try:
+            relations = get_relation(code) or []
+        except Exception as exc:
+            failed_count += 1
+            relations = []
+            print(f"[板块关系] 获取失败：{code}，{exc}")
+
+        for relation in relations:
+            sector_type = {"行业": "industry", "概念": "concept"}.get(
+                relation.get("BlockType")
+            )
+            sector_name = str(relation.get("BlockName") or "").strip()
+            if not sector_type or not sector_name:
+                continue
+            sector_code = str(relation.get("BlockCode") or "").strip()
+            key = (code, sector_type, sector_code, sector_name)
+            unique_rows.setdefault(key, {
+                "code": code,
+                "sector_type": sector_type,
+                "sector_code": sector_code,
+                "sector_name": sector_name,
+                "updated_at": updated_at,
+            })
+
+        if index % progress_interval == 0 or index == total:
+            elapsed = time.perf_counter() - started_at
+            print(
+                f"[板块关系] 进度：{index}/{total}，"
+                f"已整理 {len(unique_rows)} 条，失败 {failed_count} 只，"
+                f"耗时 {elapsed:.1f}s"
+            )
+
+    elapsed = time.perf_counter() - started_at
+    print(
+        f"[板块关系] 获取完成：{total} 只，"
+        f"整理 {len(unique_rows)} 条，失败 {failed_count} 只，"
+        f"耗时 {elapsed:.1f}s"
+    )
+    return list(unique_rows.values())
+```
+
+#### 9.6 事务替换日志
+
+网络资料全部获取完成后，进入数据库事务前明确打印：
+
+```python
+print(
+    f"[股票资料] 网络获取完成，准备开启事务："
+    f"stock_basic={len(stock_basic_rows)}，"
+    f"stock_sector={len(stock_sector_rows)}"
+)
+```
+
+事务函数中增加开始、提交和回滚日志：
+
+```python
+def replace_stock_metadata(stock_basic_rows, stock_sector_rows):
+    """在一个事务中全量替换两张资料表，失败时回滚。"""
+    conn = ensure_database()
+    transaction_started_at = time.perf_counter()
+    try:
+        migrate_stock_tables(conn)
+        print("[股票资料] 开始事务：清空并写入 stock_basic、stock_sector")
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM stock_sector")
+        conn.execute("DELETE FROM stock_basic")
+        # executemany 插入两张表的完整数据。
+        insert_stock_basic_rows(conn, stock_basic_rows)
+        insert_stock_sector_rows(conn, stock_sector_rows)
+        conn.commit()
+        elapsed = time.perf_counter() - transaction_started_at
+        print(
+            f"[股票资料] 事务提交完成：stock_basic={len(stock_basic_rows)}，"
+            f"stock_sector={len(stock_sector_rows)}，耗时 {elapsed:.1f}s"
+        )
+    except Exception as exc:
+        conn.rollback()
+        elapsed = time.perf_counter() - transaction_started_at
+        print(
+            f"[股票资料] 事务失败，已回滚并保留旧数据：{exc}，"
+            f"耗时 {elapsed:.1f}s"
+        )
+        raise
+```
+
+`insert_stock_basic_rows()` 和 `insert_stock_sector_rows()` 代表现有的 `executemany()` 插入代码，不改变事务逻辑。由于 `ensure_database()` 返回全局连接，本函数不能调用 `conn.close()`。
+
+#### 9.7 日 K 批次阶段日志
+
+完成资料维护后打印：
+
+```text
+[日K更新] 阶段 3/4 完成：股票资料更新完成
+[日K更新] 阶段 4/4：开始拉取日K，共 5535 只，12 批，count=1
+```
+
+保留现有每批开始和完成日志，并在批次失败时打印股票范围、异常信息和累计耗时：
+
+```text
+[日K更新] 第 3/12 批开始：500 只，002501.SZ ~ 300006.SZ
+[日K更新] 第 3/12 批完成：写入 500 行，本批耗时 5.2s，总耗时 28.4s
+```
+
+全部完成后输出完整汇总：
+
+```text
+[日K更新] 阶段 4/4 完成：股票 5535 只，写入/覆盖 5535 行，耗时 62.6s
+[日K更新] 全部完成：总耗时 248.7s
+```
+
+#### 9.8 预期日志示例
+
+```text
+[日K更新] 开始更新全部A股日K：count=1, batch_size=500
+[日K更新] 阶段 1/4：正在获取全市场股票列表...
+[日K更新] 阶段 1/4 完成：获取 5535 只股票，耗时 2.3s
+[日K更新] 阶段 2/4：正在获取股票基础信息...
+[股票基础信息] 开始获取：共 5535 只
+[股票基础信息] 进度：500/5535，失败 1 只，耗时 18.6s
+[股票基础信息] 获取完成：5535 只，失败 6 只，耗时 184.2s
+[日K更新] 阶段 3/4：正在获取股票行业和概念...
+[板块关系] 进度：500/5535，已整理 4200 条，失败 2 只，耗时 35.1s
+[板块关系] 获取完成：5535 只，整理 48000 条，失败 12 只，耗时 392.4s
+[股票资料] 网络获取完成，准备开启事务：stock_basic=5535，stock_sector=48000
+[股票资料] 事务提交完成：stock_basic=5535，stock_sector=48000，耗时 0.8s
+[日K更新] 阶段 4/4：开始拉取日K，共 5535 只，12 批，count=1
+[日K更新] 阶段 4/4 完成：股票 5535 只，写入/覆盖 5535 行，耗时 62.6s
+[日K更新] 全部完成：总耗时 642.1s
+```
+
+通过阶段耗时可以明确区分：股票列表接口耗时、基础信息接口耗时、板块关系接口耗时、数据库事务耗时和日 K 接口耗时。后续如果需要优化速度，也可以根据日志直接定位最慢阶段，而不是把所有时间都归因于日 K 拉取。
+
+### 8. `SectorRecord` 归属与数据库连接约束
+
+#### 8.1 `SectorRecord` 保留在 `screen2.py`
+
+`SectorRecord` 是选股业务层的数据结构，继续定义在 `screen2.py`。`data.py` 不得导入 `screen2.py`，避免形成 `screen2 -> data -> screen2` 循环依赖。
+
+因此 `data.load_stock_sectors(code)` 只返回普通字典列表，不直接构造 `SectorRecord`：
+
+```python
+def load_stock_sectors(code):
+    """从 stock_sector 查询一只股票的行业和概念，返回普通字典列表。"""
+    conn = ensure_database()
+    rows = conn.execute(
+        """SELECT sector_type, sector_name, sector_code
+           FROM stock_sector WHERE code = ?
+           ORDER BY sector_type, sector_name""",
+        (code,),
+    ).fetchall()
+    return [
+        {
+            "type": row[0],
+            "name": row[1],
+            "code": row[2],
+        }
+        for row in rows
+    ]
+```
+
+`screen2.py` 的 `ensure_sectors()` 负责把字典转换为业务对象：
+
+```python
+def ensure_sectors(records):
+    """从本地数据库读取板块关系并转换为 StockRecord.sectors。"""
+    for record in records:
+        record.sectors = [
+            SectorRecord(
+                type=sector["type"],
+                name=sector["name"],
+                code=sector["code"],
+            )
+            for sector in data.load_stock_sectors(record.code)
+        ]
+    return records
+```
+
+这样数据层只处理数据库记录，业务层只处理 `StockRecord` 和 `SectorRecord`，职责清晰且没有循环依赖。
+
+#### 8.2 全局数据库连接不在刷新函数中关闭
+
+当前 `ensure_database()` 返回全局共享的 `_CONN` 单例。因此 `replace_stock_metadata()` 不得调用 `conn.close()`；否则会关闭仍被其他数据函数使用的全局连接，导致后续查询出现 `Cannot operate on a closed database`。
+
+刷新函数只负责事务边界：
+
+```python
+def replace_stock_metadata(stock_basic_rows, stock_sector_rows):
+    """在一个事务中全量替换两张资料表，失败时回滚。"""
+    conn = ensure_database()
+    migrate_stock_tables(conn)
+    try:
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM stock_sector")
+        conn.execute("DELETE FROM stock_basic")
+        conn.executemany(
+            """INSERT INTO stock_basic
+               (code, name, total_shares, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            [
+                (
+                    row["code"],
+                    row["name"],
+                    row["total_shares"],
+                    row["updated_at"],
+                )
+                for row in stock_basic_rows
+            ],
+        )
+        conn.executemany(
+            """INSERT INTO stock_sector
+               (code, sector_type, sector_code, sector_name, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            [
+                (
+                    row["code"],
+                    row["sector_type"],
+                    row["sector_code"],
+                    row["sector_name"],
+                    row["updated_at"],
+                )
+                for row in stock_sector_rows
+            ],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+```
+
+连接的生命周期由应用程序或现有数据库模块统一管理；本函数既不创建独立连接，也不关闭 `_CONN`。后续如果重构数据库连接管理，再单独评估使用 `sqlite3.connect(DB_PATH)` 的独立事务连接，当前版本不引入该变化。
+
+## 迁移放量突破策略
+
+### 1. 迁移范围
+
+将 `alphasift-fork` 的 `volume_breakout` 迁移到 Cassa 的 `screen2.py`，但第一版不迁移 `signal_score`、LLM 排序、后置分析和原项目评分体系。
+
+保留的硬筛条件为：
+
+```text
+快照：排除 ST/退、成交额、换手率、量比、涨幅区间
+日K：站上 MA20、MACD 状态、20 日突破形态
+```
+
+20 日突破形态内部包含：突破幅度、20 日区间振幅、20 日量能比、当日实体涨幅、突破前横盘天数。
+
+完整流程为：
+
+```text
+读取 stock_basic
+  -> 读取/生成当天快照
+  -> 快照硬筛
+  -> 对候选股票读取 120 根日K
+  -> 统一计算并缓存指标
+  -> 日K条件逐层筛选
+  -> 从 stock_sector 读取板块
+  -> 组装 result 并输出
+```
+
+日 K 必须在快照初筛之后读取，不能对全市场直接请求 120 根日 K。
+
+### 2. KlineRecord 增加指标字段
+
+MA、MACD 和形态指标都直接加入 `KlineRecord`。单根 K 线不能计算 MA 或 MACD，计算函数的入参必须是一只股票按交易日期升序排列的完整 K 线列表。
+
+```python
+@dataclass
+class KlineRecord:
+    """一根日K及其可复用技术指标。"""
+    code: str
+    trade_date: str
+    open_price: float
+    high_price: float
+    low_price: float
+    close_price: float
+    volume: float
+    amount: float
+    change_pct: float | None = None
+    volume_ratio: float | None = None
+
+    # 公共指标
+    ma5: float | None = None
+    ma20: float | None = None
+    ma60: float | None = None
+    macd_diff: float | None = None
+    macd_dea: float | None = None
+    macd_status: str | None = None
+
+    # 放量突破指标
+    prev_high_20d: float | None = None
+    breakout_20d_pct: float | None = None
+    range_20d_pct: float | None = None
+    volume_ratio_20d: float | None = None
+    body_pct: float | None = None
+    consolidation_days_20d: int | None = None
+```
+
+### 3. 公共指标计算函数
+
+所有日 K 派生指标统一由一个公共函数计算；策略函数只读取字段并判断条件。后续策略需要 RSI、KDJ、ATR 等指标时，继续扩展这个函数，不在每个策略中重复计算。
+
+```python
+def _positive_float(value):
+    """将值转换为正数浮点数，无效值返回 None。"""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _average(values):
+    """计算非空数值平均值。"""
+    values = [value for value in values if value is not None]
+    return sum(values) / len(values) if values else None
+
+
+def _ema(values, period):
+    """计算指数移动平均序列。"""
+    alpha = 2 / (period + 1)
+    result = []
+    current = None
+    for value in values:
+        if value is None:
+            result.append(None)
+            continue
+        current = value if current is None else alpha * value + (1 - alpha) * current
+        result.append(current)
+    return result
+
+
+def _ma(klines, index, period):
+    """计算截至指定 K 线的简单移动平均。"""
+    if index + 1 < period:
+        return None
+    values = [
+        _positive_float(item.close_price)
+        for item in klines[index - period + 1:index + 1]
+    ]
+    return _average(values) if len(values) == period and all(v is not None for v in values) else None
+
+
+def _macd_series(klines):
+    """计算 DIF、DEA 序列。"""
+    closes = [_positive_float(item.close_price) for item in klines]
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    diff = [
+        left - right if left is not None and right is not None else None
+        for left, right in zip(ema12, ema26)
+    ]
+    return diff, _ema(diff, 9)
+
+
+def _macd_status(diff, dea):
+    """将 DIF/DEA 转换为 bullish、neutral、bearish。"""
+    if diff is None or dea is None:
+        return "neutral"
+    if diff > dea and diff > 0:
+        return "bullish"
+    if diff < dea and diff < 0:
+        return "bearish"
+    return "neutral"
+
+
+def _consolidation_days(previous, max_range_pct=12.0):
+    """计算突破前最长横盘整理天数。"""
+    if len(previous) < 2:
+        return None
+    for days in range(min(len(previous), 20), 1, -1):
+        window = previous[-days:]
+        highs = [_positive_float(item.high_price) for item in window]
+        lows = [_positive_float(item.low_price) for item in window]
+        if not all(value is not None for value in highs + lows):
+            continue
+        low = min(lows)
+        range_pct = (max(highs) / low - 1) * 100 if low > 0 else None
+        if range_pct is not None and range_pct <= max_range_pct:
+            return days
+    return 0
+
+
+def calculate_kline_indicators(klines: list[KlineRecord]) -> None:
+    """一次性计算并写回一只股票全部日K的公共指标和突破指标。"""
+    if not klines:
+        return
+
+    klines.sort(key=lambda item: item.trade_date)
+    diff, dea = _macd_series(klines)
+
+    for index, current in enumerate(klines):
+        current.ma5 = _ma(klines, index, 5)
+        current.ma20 = _ma(klines, index, 20)
+        current.ma60 = _ma(klines, index, 60)
+        current.macd_diff = diff[index]
+        current.macd_dea = dea[index]
+        current.macd_status = _macd_status(diff[index], dea[index])
+
+        previous = klines[max(0, index - 20):index]
+        recent = klines[max(0, index - 19):index + 1]
+        previous_highs = [_positive_float(item.high_price) for item in previous]
+        current_close = _positive_float(current.close_price)
+        if len(previous) == 20 and all(v is not None for v in previous_highs):
+            current.prev_high_20d = max(previous_highs)
+            current.breakout_20d_pct = (
+                (current_close / current.prev_high_20d - 1) * 100
+                if current_close is not None else None
+            )
+        else:
+            current.prev_high_20d = None
+            current.breakout_20d_pct = None
+
+        highs = [_positive_float(item.high_price) for item in recent]
+        lows = [_positive_float(item.low_price) for item in recent]
+        if len(recent) == 20 and all(v is not None for v in highs + lows):
+            current.range_20d_pct = (max(highs) / min(lows) - 1) * 100
+        else:
+            current.range_20d_pct = None
+
+        previous_volumes = [_positive_float(item.volume) for item in previous]
+        average_volume = _average(previous_volumes)
+        current_volume = _positive_float(current.volume)
+        current.volume_ratio_20d = (
+            current_volume / average_volume
+            if len(previous) == 20 and all(v is not None for v in previous_volumes)
+            and current_volume is not None and average_volume and average_volume > 0
+            else None
+        )
+
+        current_open = _positive_float(current.open_price)
+        current.body_pct = (
+            (current_close / current_open - 1) * 100
+            if current_close is not None and current_open is not None else None
+        )
+        current.consolidation_days_20d = _consolidation_days(previous)
+```
+
+规则口径与原策略保持一致：前高不包含当前 K 线；20 日量能比为当前成交量除以前 20 根 K 线平均成交量；横盘区间默认不超过 12%。
+
+### 4. 指标缓存与日K组装
+
+```python
+def ensure_kline_indicators(record: StockRecord) -> StockRecord:
+    """确保一只股票的日K指标已计算，重复调用直接复用。"""
+    if not record.kline:
+        return record
+    latest = record.kline[-1]
+    if latest.ma20 is None or latest.macd_status is None:
+        calculate_kline_indicators(record.kline)
+    return record
+
+
+def ensure_kline_records(records):
+    """批量确保候选股票完成日K指标计算。"""
+    for record in records:
+        ensure_kline_indicators(record)
+    return records
+
+
+def kline_row_to_record(row):
+    """把 data.load_daily_kline 返回的一行转换为 KlineRecord。"""
+    return KlineRecord(
+        code=str(row.get("code", "")),
+        trade_date=str(row.get("trade_date", "")),
+        open_price=float(row.get("open_price") or 0),
+        high_price=float(row.get("high_price") or 0),
+        low_price=float(row.get("low_price") or 0),
+        close_price=float(row.get("close_price") or 0),
+        volume=float(row.get("volume") or 0),
+        amount=float(row.get("amount") or 0),
+        change_pct=(float(row["change_pct"]) if row.get("change_pct") is not None else None),
+        volume_ratio=(float(row["volume_ratio"]) if row.get("volume_ratio") is not None else None),
+    )
+
+
+def build_stock_records_with_daily_kline(snapshot_rows, kline_map):
+    """为快照候选股票组装日K；没有日K的股票不进入技术筛选。"""
+    records = []
+    missing_count = 0
+    for row in snapshot_rows:
+        klines = [kline_row_to_record(item) for item in kline_map.get(row["code"], [])]
+        if not klines:
+            missing_count += 1
+            continue
+        records.append(StockRecord(
+            code=row["code"],
+            name=str(row.get("name", "") or ""),
+            kline=klines,
+        ))
+    print(f"[日K候选] 组装完成：成功 {len(records)} 只，缺失日K {missing_count} 只")
+    return records
+
+### 5. 放量突破条件函数
+
+条件函数只负责判断，不重复计算指标；指标缺失时统一调用 `ensure_kline_indicators()`，缺失数据按不通过处理。
+
+```python
+def filter_price_above_ma20(records):
+    """过滤最新收盘价没有站上 MA20 的股票。"""
+    result = []
+    for record in records:
+        ensure_kline_indicators(record)
+        latest = record.kline[-1] if record.kline else None
+        if latest and latest.ma20 is not None and latest.close_price >= latest.ma20:
+            result.append(record)
+    return result
+
+
+def filter_macd_status(records, allowed_statuses):
+    """过滤 MACD 状态不在允许集合中的股票。"""
+    allowed = set(allowed_statuses)
+    result = []
+    for record in records:
+        ensure_kline_indicators(record)
+        latest = record.kline[-1] if record.kline else None
+        if latest and latest.macd_status in allowed:
+            result.append(record)
+    return result
+
+
+def filter_breakout_shape(
+    records,
+    breakout_min_pct,
+    range_max_pct,
+    volume_ratio_min,
+    body_min_pct,
+    consolidation_days_min,
+):
+    """按突破幅度、区间、量能、实体和横盘天数过滤。"""
+    result = []
+    for record in records:
+        ensure_kline_indicators(record)
+        latest = record.kline[-1] if record.kline else None
+        if latest is None:
+            continue
+        values = (
+            latest.breakout_20d_pct,
+            latest.range_20d_pct,
+            latest.volume_ratio_20d,
+            latest.body_pct,
+            latest.consolidation_days_20d,
+        )
+        if any(value is None for value in values):
+            continue
+        if (
+            latest.breakout_20d_pct >= breakout_min_pct
+            and latest.range_20d_pct <= range_max_pct
+            and latest.volume_ratio_20d >= volume_ratio_min
+            and latest.body_pct >= body_min_pct
+            and latest.consolidation_days_20d >= consolidation_days_min
+        ):
+            result.append(record)
+    return result
+
+
+def run_kline_filters(records, filters):
+    """按配置逐层执行日K条件并记录数量和耗时。"""
+    layers = []
+    filtered = records
+    for item in filters:
+        started = time.perf_counter()
+        before = filtered
+        filtered = item["function"](filtered, **item.get("params", {}))
+        layers.append(timed_layer(item["name"], before, filtered, started))
+    return filtered, layers
+```
+
+这样不需要分别创建 `filter_breakout_20d`、`filter_range_20d`、`filter_volume_ratio_20d`、`filter_body_pct` 和 `filter_consolidation_days_20d` 五个函数；它们仍然是独立条件，只是在同一个“突破形态”业务函数中执行。
+
+### 6. 策略配置
+
+配置放在 `screen2.py` 顶部常量区，所有条件函数不写死阈值：
+
+```python
+VOLUME_BREAKOUT_CONFIG = {
+    "strategy": "volume_breakout",
+    "title": "放量突破",
+    "kline_count": 120,
+    "snapshot_filters": [
+        {
+            "name": "成交额",
+            "function": filter_snapshot_amount,
+            "params": {"min_amount": 100_000_000},
+        },
+        {
+            "name": "换手率",
+            "function": filter_snapshot_turnover_rate,
+            "params": {"min_turnover_rate": 3.0},
+        },
+        {
+            "name": "量比",
+            "function": filter_snapshot_volume_ratio,
+            "params": {"min_volume_ratio": 2.0},
+        },
+        {
+            "name": "涨幅下限",
+            "function": filter_snapshot_change_pct,
+            "params": {"min_change_pct": 2.0},
+        },
+        {
+            "name": "涨幅上限",
+            "function": filter_snapshot_change_pct_max,
+            "params": {"max_change_pct": 9.9},
+        },
+    ],
+    "kline_filters": [
+        {
+            "name": "站上MA20",
+            "function": filter_price_above_ma20,
+            "params": {},
+        },
+        {
+            "name": "MACD状态",
+            "function": filter_macd_status,
+            "params": {"allowed_statuses": ("bullish", "neutral")},
+        },
+        {
+            "name": "放量突破形态",
+            "function": filter_breakout_shape,
+            "params": {
+                "breakout_min_pct": -1.0,
+                "range_max_pct": 35.0,
+                "volume_ratio_min": 1.3,
+                "body_min_pct": 0.5,
+                "consolidation_days_min": 8,
+            },
+        },
+    ],
+}
+```
+
+新增快照涨幅上限函数：
+
+```python
+def filter_snapshot_change_pct_max(rows, max_change_pct):
+    """按快照涨跌幅上限过滤。"""
+    result = []
+    for row in rows:
+        value = safe_float(row.get("change_pct"))
+        if value is not None and value <= max_change_pct:
+            result.append(row)
+    return result
+```
+
+`min_amount` 必须使用当前 Cassa 快照 `amount` 字段的实际单位。若快照金额以元保存，使用 `100_000_000`；若现有快照统一保存为万元，则配置应换算为 `10_000`。单位只在配置处确定，过滤函数不做隐式换算。
+
+### 7. 通用 result 和策略执行函数
+
+现有 `build_result()` 不能继续把 `strategy` 和 `title` 写死为 heat，改成接收策略配置：
+
+```python
+def build_result(records, layers, started_at, strategy_config):
+    """构建任意选股策略的统一 JSON 结果。"""
+    all_filters = (
+        strategy_config.get("snapshot_filters", [])
+        + strategy_config.get("kline_filters", [])
+    )
+    return {
+        "strategy": strategy_config["strategy"],
+        "title": strategy_config["title"],
+        "run_date": datetime.now().strftime("%Y-%m-%d"),
+        "mode": data.get_market_mode_label(),
+        "conditions": [
+            {"name": item["name"], "params": item.get("params", {})}
+            for item in all_filters
+        ],
+        "selected": [serialize_record(record) for record in records],
+        "layers": [asdict(layer) for layer in layers],
+        "summary": {
+            "selected_count": len(records),
+            "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+        },
+    }
+
+
+def run_volume_breakout(debug=False, snapshot_mode="local"):
+    """执行放量突破选股。"""
+    started_at = time.perf_counter()
+    print("开始执行策略: volume_breakout")
+
+    step = time.perf_counter()
+    stock_rows = data.load_stock_basic_records()
+    print(
+        f"[股票基础信息] 读取本地 stock_basic：{len(stock_rows)} 只，"
+        f"用时 {time.perf_counter() - step:.2f}s"
+    )
+
+    snapshot_rows = load_or_generate_snapshot(
+        stock_rows,
+        snapshot_mode=snapshot_mode,
+    )
+    snapshot_rows, snapshot_layers = run_snapshot_filters(
+        snapshot_rows,
+        VOLUME_BREAKOUT_CONFIG["snapshot_filters"],
+    )
+
+    codes = [row["code"] for row in snapshot_rows]
+    step = time.perf_counter()
+    kline_map = data.load_daily_kline(
+        codes,
+        count=VOLUME_BREAKOUT_CONFIG["kline_count"],
+    )
+    print(
+        f"[日K读取] 候选 {len(codes)} 只，"
+        f"用时 {time.perf_counter() - step:.2f}s"
+    )
+
+    records = build_stock_records_with_daily_kline(snapshot_rows, kline_map)
+    step = time.perf_counter()
+    records = ensure_kline_records(records)
+    print(
+        f"[日K指标] 计算完成：{len(records)} 只，"
+        f"用时 {time.perf_counter() - step:.2f}s"
+    )
+    records, kline_layers = run_kline_filters(
+        records,
+        VOLUME_BREAKOUT_CONFIG["kline_filters"],
+    )
+
+    step = time.perf_counter()
+    records = ensure_sectors(records)
+    print(
+        f"[板块补齐] {len(records)} 只，"
+        f"用时 {time.perf_counter() - step:.2f}s"
+    )
+
+    result = build_result(
+        records,
+        snapshot_layers + kline_layers,
+        started_at,
+        VOLUME_BREAKOUT_CONFIG,
+    )
+    print_screen_result(result, debug=debug)
+    return result
+```
+
+`run_heat()` 同时改为向新的 `build_result()` 传入 `HEAT_CONFIG`，避免通用结果函数仍然固定输出 `strategy="heat"`。
+
+### 8. CLI 入口
+
+在 `build_arg_parser()` 增加独立命令：
+
+```python
+volume_parser = subparsers.add_parser(
+    "volume-breakout",
+    help="执行放量突破选股",
+)
+volume_parser.add_argument(
+    "--snapshot-mode",
+    choices=("local", "refresh"),
+    default="local",
+    help="local 使用当天快照，refresh 强制重新拉取",
+)
+volume_parser.add_argument(
+    "--debug",
+    action="store_true",
+    help="输出完整 JSON",
+)
+```
+
+在 `main()` 中增加：
+
+```python
+elif args.command == "volume-breakout":
+    run_volume_breakout(
+        debug=args.debug,
+        snapshot_mode=args.snapshot_mode,
+    )
+```
+
+执行命令：
+
+```bash
+python screen2.py volume-breakout
+python screen2.py volume-breakout --snapshot-mode refresh
+python screen2.py volume-breakout --debug
+```
+
+### 9. 旧逻辑清理与验证
+
+1. 删除 `screen2.py` 对 `data.load_breakout_kline()` 的调用；统一使用 `data.load_daily_kline(codes, count=120)`。
+2. 后续删除 `data.load_breakout_kline()` 及其专用辅助逻辑，避免两套日 K 读取口径并存。
+3. 确认 `screen2.py` 不调用 `data.get_stock_info()`、`data.get_relation()`。
+4. 确认 `signal_score` 没有加入 `KlineRecord`、配置和结果。
+5. 使用固定 K 线验证 MA20、MACD、前 20 日最高价和量能比，确认前高不包含当前 K 线。
+6. 不足 20 根 K 线时，突破、区间、量能和横盘指标必须为缺失并过滤掉；不足 60 根时 `ma60` 可以缺失，但本策略不依赖 `ma60`。
+7. 多个条件函数连续调用 `ensure_kline_indicators()` 时，只允许第一次真正计算，后续复用字段。
+8. 验证快照筛选后才拉取日 K，不能对全市场请求 120 根日 K。
+9. 验证 `python screen2.py heat` 原有流程不受影响。
+10. 验证 `python screen2.py volume-breakout --debug` 的 `strategy`、`conditions`、`layers`、`selected` 字段正确。
+
+最终函数分工：
+
+```text
+calculate_kline_indicators  公共日K指标计算
+ensure_kline_indicators     公共指标缓存
+filter_price_above_ma20     站上 MA20 条件
+filter_macd_status          MACD 条件
+filter_breakout_shape       放量突破形态条件
+run_kline_filters            通用逐层执行器
+run_volume_breakout          策略 CLI 执行入口
+```
