@@ -135,6 +135,9 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 4. 分析结果必须遵循“有结论、有数据、有理论”的原则。
 5. 每个结论都必须有足够的数据支撑，并给出对应的书中理论索引。
 6. 必须读取输入 JSON 中的 `market_context.is_intraday`，并根据盘中 / 盘外状态进行判断。
+7. 必须严格按照同目录下的 `量价关系归因法.md` 执行 `volume_price_relation` 模块，不得自行简化、替换或引入另一套量价关系归因规则。
+8. `volume_price_relation` 模块只能使用 `daily_kline[].volume`，不得使用 `daily_kline[].volume_ratio` 作为该模块的分析依据。
+9. `volume_price_relation.result` 必须明确输出“看多”或“看空”；证据不足时只能降低结论强度，不能只输出“无法判断”。
 
 如果 `market_context.is_intraday == true`：
 
@@ -157,6 +160,30 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 {
   "code": "",
   "name": "",
+  "market_context": {
+    "as_of": "",
+    "is_intraday": false
+  },
+  "volume_price_relation": {
+    "result": "",
+    "data": [
+      {
+        "kline": {
+          "code": "",
+          "trade_date": "",
+          "open_price": 0,
+          "high_price": 0,
+          "low_price": 0,
+          "close_price": 0,
+          "volume": 0,
+          "amount": 0,
+          "volume_ratio": 0
+        },
+        "evidence": ""
+      }
+    ],
+    "refs": ["", ""]
+  },
   "direction": {
     "result": "",
     "data": [
@@ -324,6 +351,10 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 
 字段要求：
 
+- `market_context`：原样反映输入中的市场状态。
+- `market_context.as_of`：分析数据对应的时间。
+- `market_context.is_intraday`：`true` 表示盘中，`false` 表示非盘中。
+- `volume_price_relation`：必须严格按照同目录 `量价关系归因法.md` 执行的量价关系归因模块。
 - `direction`：判断下一步更偏看多还是看空。
 - `truth`：判断目前价格运动是真实运动还是陷阱。
 - `stage`：根据输入的历史 K 线，列出这一段 K 线中各阶段的开始时间和结束时间。阶段只能使用：吸筹、测试、拉升、派筹、下跌。
@@ -337,6 +368,8 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 - `result`：分析结论。
 - `data`：支撑结论的数据，必须是数组。
 - `refs`：书中理论索引。
+
+`volume_price_relation` 也必须使用普通模块结构，包含 `result`、`data` 和 `refs`。其中 `result` 必须输出看多或看空；`data[].kline` 必须从输入 `daily_kline` 原样复制；其分析依据只能使用价格字段和 `volume`，不能使用 `volume_ratio`。
 
 普通模块 `data` 中的每一项都必须包含：
 
