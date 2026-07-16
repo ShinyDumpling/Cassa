@@ -3399,3 +3399,567 @@ records = ensure_kline_records(records)
 2. `serialize_record()` 和控制台输出读取最新 `KlineRecord`，否则放量突破结果中的最新涨幅会一直是 `None`。
 
 如果某个候选股票在 `snapshot_map` 中不存在，使用空字典并保留 `None`，不能按缺失数据伪造默认涨幅或量比。
+
+## 股票资料更新开关
+
+### 1. 目标
+
+当前 `update-daily-kline` 每次都会顺序调用全市场股票基础信息接口和板块关系接口：
+
+```text
+股票基础信息：约 50 秒
+板块关系：约 286 秒
+日K：正常执行
+```
+
+板块关系不是每次日 K 更新都必须刷新，因此为两类资料增加独立开关。参数只使用 `on` 和 `off` 两种值，不引入额外的正反参数。
+
+默认值：
+
+```text
+stock_basic=on
+sectors=off
+```
+
+默认执行日 K 更新时，继续维护股票名称和总股本，但完全跳过行业、概念接口请求和 `stock_sector` 写入。
+
+### 2. CLI 参数
+
+新增参数：
+
+```python
+update_daily_kline_parser.add_argument(
+    "--stock-basic",
+    choices=("on", "off"),
+    default="on",
+    help="是否更新股票名称和总股本：on/off，默认 on",
+)
+update_daily_kline_parser.add_argument(
+    "--sectors",
+    choices=("on", "off"),
+    default="off",
+    help="是否更新股票行业和概念：on/off，默认 off",
+)
+```
+
+执行示例：
+
+```bash
+# 默认：更新 stock_basic，跳过 stock_sector
+python data.py update-daily-kline --count 1
+
+# 更新基础信息和板块关系
+python data.py update-daily-kline --count 1 --stock-basic on --sectors on
+
+# 只更新板块关系，保留旧 stock_basic
+python data.py update-daily-kline --count 1 --stock-basic off --sectors on
+
+# 两类资料都跳过，只更新日K
+python data.py update-daily-kline --count 1 --stock-basic off --sectors off
+```
+
+参数解析后转换为布尔值：
+
+```python
+update_stock_basic = stock_basic_mode == "on"
+update_sectors = sectors_mode == "on"
+```
+
+### 3. 数据维护函数
+
+#### 3.1 支持按开关采集资料
+
+`refresh_stock_metadata()` 必须先根据开关决定是否调用接口。关闭的资料不得请求接口，也不得清空或写入对应数据表。
+
+```python
+def refresh_stock_metadata(
+    stock_codes,
+    *,
+    update_stock_basic=True,
+    update_sectors=False,
+):
+    """按开关获取资料，并事务替换已开启的资料表。"""
+    if not update_stock_basic and not update_sectors:
+        print("[股票资料] stock_basic=off，sectors=off，跳过资料更新")
+        return {"stock_basic": 0, "stock_sector": 0}
+
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    basic_rows = None
+    sector_rows = None
+
+    print(
+        f"[股票资料] stock_basic={'on' if update_stock_basic else 'off'}，"
+        f"sectors={'on' if update_sectors else 'off'}"
+    )
+
+    if update_stock_basic:
+        basic_rows = collect_stock_basic_rows(stock_codes, updated_at)
+    else:
+        print("[股票基础信息] 已关闭，跳过网络请求和数据库写入")
+
+    if update_sectors:
+        sector_rows = collect_stock_sector_rows(stock_codes, updated_at)
+    else:
+        print("[板块关系] 已关闭，跳过网络请求和数据库写入")
+
+    replace_stock_metadata(
+        stock_basic_rows=basic_rows,
+        stock_sector_rows=sector_rows,
+        update_stock_basic=update_stock_basic,
+        update_sectors=update_sectors,
+    )
+    return {
+        "stock_basic": len(basic_rows or []),
+        "stock_sector": len(sector_rows or []),
+    }
+```
+
+#### 3.2 事务只替换开启的表
+
+全量替换仍然使用事务，但关闭的表必须保持原数据：
+
+```python
+def replace_stock_metadata(
+    stock_basic_rows=None,
+    stock_sector_rows=None,
+    *,
+    update_stock_basic=True,
+    update_sectors=False,
+):
+    """在一个事务中替换已开启的资料表，失败时回滚。"""
+    conn = ensure_database()
+    migrate_stock_tables(conn)
+    started_at = time.perf_counter()
+
+    try:
+        print(
+            "[股票资料] 开始事务："
+            f"stock_basic={'替换' if update_stock_basic else '保留'}，"
+            f"stock_sector={'替换' if update_sectors else '保留'}"
+        )
+        conn.execute("BEGIN")
+
+        if update_stock_basic:
+            conn.execute("DELETE FROM stock_basic")
+            conn.executemany(
+                """INSERT INTO stock_basic
+                   (code, name, total_shares, updated_at)
+                   VALUES (?, ?, ?, ?)""",
+                [
+                    (
+                        row["code"],
+                        row["name"],
+                        row["total_shares"],
+                        row["updated_at"],
+                    )
+                    for row in (stock_basic_rows or [])
+                ],
+            )
+
+        if update_sectors:
+            conn.execute("DELETE FROM stock_sector")
+            conn.executemany(
+                """INSERT INTO stock_sector
+                   (code, sector_type, sector_code, sector_name, updated_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [
+                    (
+                        row["code"],
+                        row["sector_type"],
+                        row["sector_code"],
+                        row["sector_name"],
+                        row["updated_at"],
+                    )
+                    for row in (stock_sector_rows or [])
+                ],
+            )
+
+        conn.commit()
+        elapsed = time.perf_counter() - started_at
+        print(
+            f"[股票资料] 事务提交完成："
+            f"stock_basic={'已替换' if update_stock_basic else '保留'}，"
+            f"stock_sector={'已替换' if update_sectors else '保留'}，"
+            f"耗时 {elapsed:.1f}s"
+        )
+    except Exception as exc:
+        conn.rollback()
+        elapsed = time.perf_counter() - started_at
+        print(
+            f"[股票资料] 事务失败，已回滚并保留旧数据：{exc}，"
+            f"耗时 {elapsed:.1f}s"
+        )
+        raise
+```
+
+该函数沿用 `ensure_database()` 返回的全局连接，不调用 `conn.close()`。关闭开关表示保留原表数据，而不是删除原表数据。
+
+### 4. `update_daily_kline_after_close()` 完整调整
+
+更新函数增加两个参数，并在股票列表获取完成后调用资料刷新：
+
+```python
+def update_daily_kline_after_close(
+    count=DAILY_KLINE_UPDATE_DAYS,
+    batch_size=DAILY_KLINE_UPDATE_BATCH_SIZE,
+    stock_basic_mode="on",
+    sectors_mode="off",
+):
+    """按开关更新股票资料，并更新全部 A 股最近 N 天日K。"""
+    started_at = time.perf_counter()
+
+    update_stock_basic = stock_basic_mode == "on"
+    update_sectors = sectors_mode == "on"
+
+    print(
+        f"[日K更新] 开始更新全部A股日K：count={count}，"
+        f"batch_size={batch_size}"
+    )
+    print(
+        f"[股票资料] stock_basic={stock_basic_mode}，"
+        f"sectors={sectors_mode}"
+    )
+
+    print("[日K更新] 阶段 1/3：获取全市场股票列表...")
+    list_started_at = time.perf_counter()
+    stock_rows = get_stock_list()
+    stock_list = extract_stock_codes_from_stock_list(stock_rows)
+    print(
+        f"[日K更新] 阶段 1/3 完成：获取 {len(stock_list)} 只股票，"
+        f"耗时 {time.perf_counter() - list_started_at:.1f}s"
+    )
+
+    if not stock_list:
+        print("[日K更新] 未获取到股票列表，结束本次更新")
+        return {
+            "stock_count": 0,
+            "updated_rows": 0,
+            "count": count,
+            "batch_size": batch_size,
+        }
+
+    print("[日K更新] 阶段 2/3：更新股票资料...")
+    metadata_started_at = time.perf_counter()
+    try:
+        stats = refresh_stock_metadata(
+            stock_list,
+            update_stock_basic=update_stock_basic,
+            update_sectors=update_sectors,
+        )
+        print(
+            f"[日K更新] 阶段 2/3 完成："
+            f"stock_basic={stats['stock_basic']}，"
+            f"stock_sector={stats['stock_sector']}，"
+            f"耗时 {time.perf_counter() - metadata_started_at:.1f}s"
+        )
+    except Exception as exc:
+        print(f"[股票资料] 更新失败，旧资料保留：{exc}")
+        print("[日K更新] 继续执行日K更新")
+
+    print("[日K更新] 阶段 3/3：开始拉取日K...")
+    kline_started_at = time.perf_counter()
+    batches = chunk_list(stock_list, batch_size)
+    total_updated_rows = 0
+
+    for batch_index, stock_batch in enumerate(batches, 1):
+        batch_started_at = time.perf_counter()
+        first_code = stock_batch[0]
+        last_code = stock_batch[-1]
+        print(
+            f"[日K更新] 第 {batch_index}/{len(batches)} 批开始："
+            f"{len(stock_batch)} 只，{first_code} ~ {last_code}"
+        )
+        try:
+            market_data = get_market_data(
+                stock_list=stock_batch,
+                period="1d",
+                count=count,
+                field_list=["Open", "High", "Low", "Close", "Volume", "Amount"],
+                fill_data=True,
+            )
+            rows = market_data_to_daily_kline_rows(market_data, stock_batch)
+            updated_rows = upsert_daily_kline_rows(rows)
+        except Exception as exc:
+            print(
+                f"[日K更新] 第 {batch_index}/{len(batches)} 批失败："
+                f"{first_code} ~ {last_code}，错误：{exc}"
+            )
+            raise
+
+        total_updated_rows += updated_rows
+        print(
+            f"[日K更新] 第 {batch_index}/{len(batches)} 批完成："
+            f"写入 {updated_rows} 行，本批耗时 "
+            f"{time.perf_counter() - batch_started_at:.1f}s，"
+            f"日K累计耗时 {time.perf_counter() - kline_started_at:.1f}s"
+        )
+
+    elapsed = time.perf_counter() - started_at
+    print(
+        f"[日K更新] 全部完成：股票 {len(stock_list)} 只，"
+        f"写入/覆盖 {total_updated_rows} 行，总耗时 {elapsed:.1f}s"
+    )
+    return {
+        "stock_count": len(stock_list),
+        "updated_rows": total_updated_rows,
+        "count": count,
+        "batch_size": batch_size,
+        "stock_basic": stock_basic_mode,
+        "sectors": sectors_mode,
+        "elapsed_seconds": round(elapsed, 1),
+    }
+```
+
+实际落地时保留现有日 K 批次实现，只把函数签名、阶段日志和资料刷新参数接入；不要重复维护两套日 K 拉取循环。
+
+### 5. CLI 完整接入
+
+在 `update-daily-kline` 子命令中加入参数：
+
+```python
+update_daily_kline_parser.add_argument(
+    "--stock-basic",
+    choices=("on", "off"),
+    default="on",
+    help="是否更新股票名称和总股本：on/off，默认 on",
+)
+update_daily_kline_parser.add_argument(
+    "--sectors",
+    choices=("on", "off"),
+    default="off",
+    help="是否更新股票行业和概念：on/off，默认 off",
+)
+```
+
+在命令分发处传入参数：
+
+```python
+elif args.command == "update-daily-kline":
+    print_json(
+        update_daily_kline_after_close(
+            count=args.count,
+            batch_size=args.batch_size,
+            stock_basic_mode=args.stock_basic,
+            sectors_mode=args.sectors,
+        )
+    )
+```
+
+帮助文本和示例同步增加：
+
+```text
+python data.py update-daily-kline --count 1
+python data.py update-daily-kline --count 1 --stock-basic on --sectors on
+python data.py update-daily-kline --count 1 --stock-basic off --sectors on
+python data.py update-daily-kline --count 1 --stock-basic off --sectors off
+```
+
+### 6. 验证要求
+
+1. 不传参数时，确认 `stock_basic=on`、`sectors=off`。
+2. 默认执行日志中不能出现 `get_relation()` 的逐股请求，也不能出现板块采集进度。
+3. `--sectors on` 时，两张表按现有事务逻辑更新，成功提交、失败回滚。
+4. `--stock-basic off --sectors on` 时，只替换 `stock_sector`，`stock_basic` 保持不变。
+5. `--stock-basic off --sectors off` 时，两张资料表都不修改，只更新日 K。
+6. 关闭某个开关不能清空对应表，旧数据必须保留。
+7. 资料更新失败后，保留旧资料并继续执行日 K 更新，沿用当前错误处理策略。
+8. 最终汇总需要显示两个开关状态，便于确认本次到底执行了哪些工作。
+
+### 7. 与现有执行日志的最终合并口径
+
+本节解决本章与前一章“为 `update-daily-kline` 添加执行日志”之间的阶段编号和日志内容冲突，实施时以本节为准。
+
+#### 7.1 保留四阶段结构
+
+不回退到“资料合并为一个阶段”的三阶段结构，继续保留四阶段日志，因为基础信息和板块关系是两个耗时差异明显、开关也独立的工作：
+
+```text
+阶段 1/4：获取全市场股票列表
+阶段 2/4：获取股票基础信息
+阶段 3/4：获取股票行业和概念
+阶段 4/4：拉取并写入日K
+```
+
+开关关闭时，阶段仍然打印，但明确标记跳过，不发起接口请求：
+
+```text
+[日K更新] 阶段 2/4：股票基础信息更新已关闭，跳过
+[日K更新] 阶段 3/4：板块关系更新已关闭，跳过
+```
+
+这样每次运行的日志结构稳定，同时可以直接看出耗时来自哪个阶段。
+
+#### 7.2 删除旧的重复阶段头
+
+`refresh_stock_metadata()` 只负责按开关采集和替换数据表，不再打印以下阶段头：
+
+```python
+print("[日K更新] 阶段 2/4：正在获取股票基础信息...")
+print("[日K更新] 阶段 3/4：正在获取股票行业和概念...")
+```
+
+这两行必须删除。阶段头统一由 `update_daily_kline_after_close()` 外层打印，采集函数内部只打印自己的进度：
+
+```text
+[股票基础信息] 开始获取：共 5535 只
+[股票基础信息] 进度：500/5535...
+[板块关系] 开始获取：共 5535 只
+[板块关系] 进度：500/5535...
+```
+
+不能让内层函数继续打印 `[日K更新] 阶段 X/4`，否则会出现阶段日志重复和编号错乱。
+
+#### 7.3 完整性检查只针对已开启的表
+
+保留完整性检查，但只检查本次实际开启更新的资料表。
+
+基础信息开启时必须满足：
+
+```python
+if update_stock_basic and len(basic_rows or []) != len(stock_codes):
+    raise RuntimeError("股票基础信息未完整获取，取消本次数据库替换")
+```
+
+板块关系开启时必须至少确认采集函数正常完成；板块接口允许某些股票没有行业或概念关系，因此不能用“关系行数等于股票数”作为完整性条件。可以检查返回对象不是 `None`：
+
+```python
+if update_sectors and sector_rows is None:
+    raise RuntimeError("板块关系未完成获取，取消本次板块表替换")
+```
+
+当开关关闭时，不执行对应检查：
+
+```python
+basic_rows = None
+sector_rows = None
+
+if update_stock_basic:
+    basic_rows = collect_stock_basic_rows(stock_codes, updated_at)
+    if len(basic_rows) != len(stock_codes):
+        raise RuntimeError("股票基础信息未完整获取，取消本次数据库替换")
+
+if update_sectors:
+    sector_rows = collect_stock_sector_rows(stock_codes, updated_at)
+    if sector_rows is None:
+        raise RuntimeError("板块关系未完成获取，取消本次板块表替换")
+```
+
+不能执行以下无条件检查：
+
+```python
+if len(basic_rows) != len(stock_codes):
+    ...
+```
+
+因为 `stock_basic=off` 时 `basic_rows` 必须是 `None`，且数据库中的旧基础资料应被保留。
+
+#### 7.4 四阶段主流程日志
+
+外层 `update_daily_kline_after_close()` 使用以下日志结构：
+
+```python
+print("[日K更新] 阶段 1/4：正在获取全市场股票列表...")
+# get_stock_list()
+print("[日K更新] 阶段 1/4 完成：获取 N 只股票，耗时 X.Xs")
+
+if update_stock_basic:
+    print("[日K更新] 阶段 2/4：正在更新股票基础信息...")
+    # collect_stock_basic_rows() + 事务内写入 stock_basic
+    print("[日K更新] 阶段 2/4 完成：stock_basic=N，耗时 X.Xs")
+else:
+    print("[日K更新] 阶段 2/4：股票基础信息更新已关闭，跳过")
+
+if update_sectors:
+    print("[日K更新] 阶段 3/4：正在更新股票行业和概念...")
+    # collect_stock_sector_rows() + 事务内写入 stock_sector
+    print("[日K更新] 阶段 3/4 完成：stock_sector=N，耗时 X.Xs")
+else:
+    print("[日K更新] 阶段 3/4：板块关系更新已关闭，跳过")
+
+print("[日K更新] 阶段 4/4：开始拉取日K...")
+# 日K批次循环
+print("[日K更新] 阶段 4/4 完成：股票 N 只，写入/覆盖 M 行，耗时 X.Xs")
+print("[日K更新] 全部完成：总耗时 X.Xs")
+```
+
+资料表的全量替换仍然要求：网络采集先完成，之后在事务中写入已开启的表。若基础信息和板块同时开启，可以在同一个资料事务中完成两张表替换；日志仍按两个业务阶段分别输出采集进度，事务提交日志统一输出一次。
+
+#### 7.5 日 K 阶段必须打印完成日志
+
+接受增加明确的阶段完成日志，不能只输出“全部完成”：
+
+```text
+[日K更新] 阶段 4/4 完成：股票 5535 只，写入/覆盖 5535 行，耗时 62.6s
+[日K更新] 全部完成：总耗时 120.4s
+```
+
+“阶段 4/4 完成”只统计日 K 阶段耗时；“全部完成”统计从股票列表开始到日 K 结束的全流程耗时。
+
+#### 7.6 保留每批累计写入行数
+
+保留现有每批日志中的累计行数，同时增加“日 K 阶段累计耗时”：
+
+```python
+print(
+    f"[日K更新] 第 {batch_index}/{total_batches} 批完成："
+    f"本批写入 {updated_rows} 行，累计 {total_updated_rows} 行，"
+    f"本批耗时 {batch_seconds:.1f}s，"
+    f"日K累计耗时 {time.perf_counter() - kline_started_at:.1f}s"
+)
+```
+
+这里保留两个不同的累计概念：
+
+- `累计 N 行`：日 K 已经写入或覆盖的总行数；
+- `日K累计耗时 X.Xs`：从阶段 4/4 开始到当前批次结束的耗时。
+
+最终阶段日志中同时输出总行数和日 K 阶段耗时，避免把资料更新耗时误认为日 K 接口耗时。
+
+#### 7.7 当前 CLI 入口的实际改动点
+
+现有 `data.py` 已经有 `update-daily-kline` 子命令，并且已有：
+
+```python
+update_daily_kline_parser.add_argument("--count", ...)
+update_daily_kline_parser.add_argument("--batch-size", ...)
+```
+
+本轮只在这两个参数后增加：
+
+```python
+update_daily_kline_parser.add_argument(
+    "--stock-basic",
+    choices=("on", "off"),
+    default="on",
+    help="是否更新股票名称和总股本：on/off，默认 on",
+)
+update_daily_kline_parser.add_argument(
+    "--sectors",
+    choices=("on", "off"),
+    default="off",
+    help="是否更新股票行业和概念：on/off，默认 off",
+)
+```
+
+现有分发代码是：
+
+```python
+elif args.command == "update-daily-kline":
+    print_json(update_daily_kline_after_close(args.count, args.batch_size))
+```
+
+改为关键字传参，避免新增参数位置错位：
+
+```python
+elif args.command == "update-daily-kline":
+    print_json(
+        update_daily_kline_after_close(
+            count=args.count,
+            batch_size=args.batch_size,
+            stock_basic_mode=args.stock_basic,
+            sectors_mode=args.sectors,
+        )
+    )
+```
+
+这样解决四个日志决策：保留四阶段、删除内层重复阶段头、增加阶段 4/4 完成日志、保留每批累计写入行数。
