@@ -891,11 +891,11 @@ VOLUME_BREAKOUT_CONFIG = {
             "function": filter_snapshot_change_pct,
             "params": {"min_change_pct": 2.0},
         },
-        {
-            "name": "涨幅上限",
-            "function": filter_snapshot_change_pct_max,
-            "params": {"max_change_pct": 9.9},
-        },
+        # {
+        #     "name": "涨幅上限",
+        #     "function": filter_snapshot_change_pct_max,
+        #     "params": {"max_change_pct": 9.9},
+        # },
     ],
     "kline_filters": [
         {
