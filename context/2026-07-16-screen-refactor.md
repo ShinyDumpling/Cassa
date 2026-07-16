@@ -3160,3 +3160,242 @@ filter_breakout_shape       放量突破形态条件
 run_kline_filters            通用逐层执行器
 run_volume_breakout          策略 CLI 执行入口
 ```
+
+### 10. 实施前核对结论
+
+本节是对本章方案实施前疑问的最终确认，后续代码以本节为准。
+
+#### 10.1 `load_daily_kline()` 的返回字段已经确认
+
+当前 `data.load_daily_kline_rows_from_db()` 查询 `daily_kline` 表的字段为：
+
+```python
+code
+trade_date
+open_price
+high_price
+low_price
+close_price
+volume
+amount
+```
+
+数据库表结构与返回字典字段一致：
+
+```sql
+CREATE TABLE daily_kline (
+    code TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    open_price REAL NOT NULL,
+    high_price REAL NOT NULL,
+    low_price REAL NOT NULL,
+    close_price REAL NOT NULL,
+    volume REAL NOT NULL DEFAULT 0,
+    amount REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (code, trade_date)
+)
+```
+
+因此 `kline_row_to_record()` 只从日 K 数据读取以上 8 个字段。`change_pct` 和 `volume_ratio` 不属于 `daily_kline` 表，不能从数据库日 K 行读取；它们的处理方式为：
+
+1. 基础日 K 记录中的 `change_pct`、`volume_ratio` 初始保持 `None`。
+2. 组装放量突破候选记录时，将快照中的最新 `change_pct` 和实时 `volume_ratio` 写入最新一根 `KlineRecord`。
+3. `volume_ratio_20d` 是基于日 K 成交量历史重新计算的指标，与快照的实时 `volume_ratio` 是两个不同字段，不能混用。
+
+示例：
+
+```python
+def apply_snapshot_latest_fields(record, snapshot_row):
+    """把快照中的最新实时字段写入候选记录的最新日K。"""
+    if not record.kline:
+        return record
+    latest = record.kline[-1]
+    latest.change_pct = safe_float(snapshot_row.get("change_pct"))
+    latest.volume_ratio = safe_float(snapshot_row.get("volume_ratio"))
+    return record
+```
+
+#### 10.2 快照成交额单位已经确认
+
+当前 Cassa 快照中的 `amount` 单位是“万元”，与现有 `HEAT_CONFIG` 保持一致。数据库样本中：
+
+```text
+volume = 70065312
+amount = 70782.95
+```
+
+该成交额约等于 7.08 亿元，因此不是以元保存。
+
+放量突破要求成交额至少 1 亿元，配置必须写成：
+
+```python
+"params": {"min_amount": 10_000}
+```
+
+现有 heat 的：
+
+```python
+"params": {"min_amount": 30_000}
+```
+
+表示成交额至少 3 亿元。禁止在 `filter_snapshot_amount()` 内部再次换算单位；金额单位只由快照数据定义和策略配置共同约定。
+
+#### 10.3 ST/退过滤是固定业务过滤，不属于策略配置
+
+`run_snapshot_filters()` 当前执行顺序是：
+
+```text
+先固定执行 filter_snapshot_excluded_names
+再执行具体策略的 snapshot_filters
+```
+
+因此 `VOLUME_BREAKOUT_CONFIG["snapshot_filters"]` 不重复加入 ST/退条件。为了避免文档和代码产生歧义，最终方案明确：
+
+- ST/退过滤始终执行；
+- 它不由策略配置控制；
+- 它不属于放量突破的可配置策略条件；
+- `layers` 仍然记录一层“ST/退市”，用于控制台日志和 JSON 结果。
+
+#### 10.4 MACD EMA 口径对齐 AlphaSift
+
+AlphaSift 原实现使用：
+
+```python
+ema12 = close.ewm(span=12, adjust=False).mean()
+ema26 = close.ewm(span=26, adjust=False).mean()
+diff = ema12 - ema26
+dea = diff.ewm(span=9, adjust=False).mean()
+```
+
+`adjust=False` 的 EMA 冷启动以第一根有效收盘价作为初始值。Cassa 的 `_ema()` 必须保持同样口径；不能改成 SMA 初始值，也不能使用 `adjust=True`。
+
+MACD 状态规则保持一致：
+
+```text
+DIF > DEA 且 DIF > 0  -> bullish
+DIF < DEA 且 DIF < 0  -> bearish
+其他                  -> neutral
+历史不足 35 根          -> neutral
+```
+
+由于第一版读取 120 根日 K，正常情况下 MACD 有足够历史数据；不足 35 根时仍按 `neutral` 处理，与 AlphaSift 原策略一致。
+
+#### 10.5 横盘天数口径对齐 AlphaSift
+
+`consolidation_days_20d` 的计算范围是当前 K 线之前的最多 20 根 K 线，不包含当前突破 K 线：
+
+```python
+previous = klines[max(0, index - 20):index]
+```
+
+然后从 20 天向下检查到 2 天，每次只取距离当前最近的 `days` 根：
+
+```python
+for days in range(min(len(previous), 20), 1, -1):
+    window = previous[-days:]
+    if range_pct(window) <= 12.0:
+        return days
+return 0
+```
+
+这与 AlphaSift 的 `_consolidation_days()` 实现一致。它表达的是“突破前最近一段连续整理区间的最长天数”，不是在 20 天历史中任意寻找一个满足条件的窗口。
+
+#### 10.6 `KlineRecord` 指标字段均为本轮新增
+
+当前 Cassa `screen2.py` 的 `KlineRecord` 只有基础 OHLC、成交量、成交额，以及：
+
+```python
+change_pct
+volume_ratio
+```
+
+当前不存在以下字段，本轮需要新增：
+
+```python
+ma5
+ma20
+ma60
+macd_diff
+macd_dea
+macd_status
+prev_high_20d
+breakout_20d_pct
+range_20d_pct
+volume_ratio_20d
+body_pct
+consolidation_days_20d
+```
+
+这些字段全部设置默认值 `None`，不影响 heat：heat 不调用日 K 指标计算函数，也不依赖这些字段。
+
+#### 10.7 `run_heat()` 本轮同步改造
+
+通用化 `build_result()` 后，`run_heat()` 必须同步传入 `HEAT_CONFIG`：
+
+```python
+result = build_result(
+    records,
+    layers,
+    started_at,
+    HEAT_CONFIG,
+)
+```
+
+这样 heat 和 volume-breakout 都使用同一套 result 结构，但各自输出正确的 `strategy`、`title` 和 `conditions`。
+
+#### 10.8 `load_breakout_kline()` 本轮保留
+
+本轮不删除 `data.load_breakout_kline()`。原因是旧版 `screen.py` 仍有多处调用，直接删除会影响尚未迁移的旧策略。
+
+本轮只做以下约束：
+
+- 新的 `screen2.py volume-breakout` 统一调用 `data.load_daily_kline(codes, count=120)`；
+- `screen2.py` 不再调用 `data.load_breakout_kline()`；
+- 旧 `screen.py` 继续使用现有接口；
+- 待旧策略全部迁移、旧入口退役后，再单独删除 `load_breakout_kline()` 及其专用辅助逻辑。
+
+#### 10.9 快照实时字段回填必须接入主流程
+
+`apply_snapshot_latest_fields()` 不能只作为孤立辅助函数，必须接入 `run_volume_breakout()` 主流程。调用位置固定在：
+
+```text
+build_stock_records_with_daily_kline
+  -> 构建 snapshot_map
+  -> apply_snapshot_latest_fields
+  -> ensure_kline_records
+  -> 执行日K条件过滤
+```
+
+完整代码如下：
+
+```python
+records = build_stock_records_with_daily_kline(
+    snapshot_rows,
+    kline_map,
+)
+
+snapshot_map = {
+    row["code"]: row
+    for row in snapshot_rows
+    if row.get("code")
+}
+
+for record in records:
+    apply_snapshot_latest_fields(
+        record,
+        snapshot_map.get(record.code, {}),
+    )
+
+records = ensure_kline_records(records)
+```
+
+`apply_snapshot_latest_fields()` 写入的是最新 K 线的原始实时字段，不会修改 MA、MACD 或 20 日形态指标；因此放在 `ensure_kline_records()` 前后都不会影响指标计算，但统一规定放在指标计算前，便于保证候选记录组装完成后再进入指标阶段。
+
+该回填步骤解决两个问题：
+
+1. `change_pct` 和实时 `volume_ratio` 不属于 `daily_kline` 数据库表，必须从快照补入。
+2. `serialize_record()` 和控制台输出读取最新 `KlineRecord`，否则放量突破结果中的最新涨幅会一直是 `None`。
+
+如果某个候选股票在 `snapshot_map` 中不存在，使用空字典并保留 `None`，不能按缺失数据伪造默认涨幅或量比。
