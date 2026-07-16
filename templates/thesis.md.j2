@@ -1,0 +1,194 @@
+# {{ data.name }}（{{ data.code }}）量价分析报告
+
+## 分析上下文
+
+- 标的代码：{{ data.code }}
+- 标的名称：{{ data.name }}
+- 数据时间：{{ data.market_context.as_of }}
+- 数据状态：{% if data.market_context.is_intraday %}盘中{% else %}盘后{% endif %}
+
+{% if data.market_context.is_intraday %}
+> 注意：当前为盘中数据，最新 K 线及相关判断属于盘中暂态判断，不能视为收盘确认。
+{% endif %}
+
+## 总体结论
+
+{{ data.volume_price_relation.result }}
+
+## 一、量价关系
+
+### 结论
+
+{{ data.volume_price_relation.result }}
+
+### K 线证据
+
+| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+{% for item in data.volume_price_relation.data %}
+| {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
+{% endfor %}
+
+### 参考依据
+
+{% for ref in data.volume_price_relation.refs %}
+- {{ ref }}
+{% endfor %}
+
+## 二、方向判断
+
+### 结论
+
+{{ data.direction.result }}
+
+### K 线证据
+
+| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+{% for item in data.direction.data %}
+| {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
+{% endfor %}
+
+### 参考依据
+
+{% for ref in data.direction.refs %}
+- {{ ref }}
+{% endfor %}
+
+## 三、真实性判断
+
+### 结论
+
+{{ data.truth.result }}
+
+### K 线证据
+
+| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+{% for item in data.truth.data %}
+| {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
+{% endfor %}
+
+### 参考依据
+
+{% for ref in data.truth.refs %}
+- {{ ref }}
+{% endfor %}
+
+## 四、阶段划分
+
+{{ data.stage.result }}
+
+{% for stage_item in data.stage.data %}
+### {{ loop.index }}. {{ stage_item.stage }}
+
+- 时间:{{ stage_item.start_date }} 至 {{ stage_item.end_date }}
+- 概要:{{ stage_item.summary }}
+
+关键证据：
+
+{% for evidence_item in stage_item.evidence %}
+- {{ evidence_item.kline.trade_date }}:{{ evidence_item.evidence }}
+{% endfor %}
+
+{% endfor %}
+### 参考依据
+
+{% for ref in data.stage.refs %}
+- {{ ref }}
+{% endfor %}
+
+## 五、聪明钱
+
+### 结论
+
+{{ data.smart_money.result }}
+
+### K 线证据
+
+| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+{% for item in data.smart_money.data %}
+| {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
+{% endfor %}
+
+### 参考依据
+
+{% for ref in data.smart_money.refs %}
+- {{ ref }}
+{% endfor %}
+
+## 六、反转判断
+
+### 结论
+
+{{ data.reversal.result }}
+
+### K 线证据
+
+| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+{% for item in data.reversal.data %}
+| {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
+{% endfor %}
+
+### 参考依据
+
+{% for ref in data.reversal.refs %}
+- {{ ref }}
+{% endfor %}
+
+## 七、关键价格
+
+### 结论
+
+{{ data.key_price.result }}
+
+### K 线证据
+
+| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+{% for item in data.key_price.data %}
+| {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
+{% endfor %}
+
+### 参考依据
+
+{% for ref in data.key_price.refs %}
+- {{ ref }}
+{% endfor %}
+
+## 八、筹码分析
+
+### 结论
+
+{{ data.chip.result }}
+
+### 筹码数据
+
+| 指标 | 数值 |
+|---|---:|
+| 获利比例 | {{ data.chip.data.chip.profit_ratio }} |
+| 平均成本 | {{ data.chip.data.chip.avg_cost }} |
+| 90% 成本区间下沿 | {{ data.chip.data.chip.cost_90_low }} |
+| 90% 成本区间上沿 | {{ data.chip.data.chip.cost_90_high }} |
+| 90% 成本集中度 | {{ data.chip.data.chip.concentration_90 }} |
+| 70% 成本区间下沿 | {{ data.chip.data.chip.cost_70_low }} |
+| 70% 成本区间上沿 | {{ data.chip.data.chip.cost_70_high }} |
+| 70% 成本集中度 | {{ data.chip.data.chip.concentration_70 }} |
+| 筹码状态 | {{ data.chip.data.chip.chip_status }} |
+| 样本数量 | {{ data.chip.data.chip.sample_count }} |
+
+### K 线证据
+
+| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+{% for item in data.chip.data.kline_evidence %}
+| {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
+{% endfor %}
+
+### 参考依据
+
+{% for ref in data.chip.refs %}
+- {{ ref }}
+{% endfor %}
