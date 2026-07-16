@@ -323,15 +323,20 @@ def collect_stock_sector_rows(stock_codes, updated_at, progress_interval=500):
     return list(unique_rows.values())
 
 
-def replace_stock_metadata(stock_basic_rows, stock_sector_rows):
-    """在一个事务中全量替换两张资料表，失败时回滚。"""
+def refresh_stock_basic(stock_codes):
+    """全量采集股票基础信息，并以独立事务替换 stock_basic 表。"""
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    basic_rows = collect_stock_basic_rows(stock_codes, updated_at)
+
+    if len(basic_rows) != len(stock_codes):
+        raise RuntimeError("股票基础信息未完整获取，取消本次 stock_basic 替换")
+
     conn = ensure_database()
     migrate_stock_tables(conn)
     transaction_started_at = time.perf_counter()
     try:
-        print("[股票资料] 开始事务：清空并写入 stock_basic、stock_sector")
+        print(f"[股票资料] 开始事务：清空并写入 stock_basic（{len(basic_rows)} 行）")
         conn.execute("BEGIN")
-        conn.execute("DELETE FROM stock_sector")
         conn.execute("DELETE FROM stock_basic")
         conn.executemany(
             """INSERT INTO stock_basic
@@ -339,9 +344,41 @@ def replace_stock_metadata(stock_basic_rows, stock_sector_rows):
                VALUES (?, ?, ?, ?)""",
             [
                 (row["code"], row["name"], row["total_shares"], row["updated_at"])
-                for row in stock_basic_rows
+                for row in basic_rows
             ],
         )
+        conn.commit()
+        elapsed = time.perf_counter() - transaction_started_at
+        print(
+            f"[股票资料] stock_basic 事务提交完成："
+            f"{len(basic_rows)} 行，耗时 {elapsed:.1f}s"
+        )
+    except Exception as exc:
+        conn.rollback()
+        elapsed = time.perf_counter() - transaction_started_at
+        print(
+            f"[股票资料] stock_basic 事务失败，已回滚并保留旧数据：{exc}，"
+            f"耗时 {elapsed:.1f}s"
+        )
+        raise
+    return {"stock_basic": len(basic_rows)}
+
+
+def refresh_stock_sectors(stock_codes):
+    """全量采集板块关系，并以独立事务替换 stock_sector 表。"""
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    sector_rows = collect_stock_sector_rows(stock_codes, updated_at)
+
+    if sector_rows is None:
+        raise RuntimeError("板块关系未完成获取，取消本次 stock_sector 替换")
+
+    conn = ensure_database()
+    migrate_stock_tables(conn)
+    transaction_started_at = time.perf_counter()
+    try:
+        print(f"[股票资料] 开始事务：清空并写入 stock_sector（{len(sector_rows)} 行）")
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM stock_sector")
         conn.executemany(
             """INSERT INTO stock_sector
                (code, sector_type, sector_code, sector_name, updated_at)
@@ -354,44 +391,24 @@ def replace_stock_metadata(stock_basic_rows, stock_sector_rows):
                     row["sector_name"],
                     row["updated_at"],
                 )
-                for row in stock_sector_rows
+                for row in sector_rows
             ],
         )
         conn.commit()
         elapsed = time.perf_counter() - transaction_started_at
         print(
-            f"[股票资料] 事务提交完成：stock_basic={len(stock_basic_rows)}，"
-            f"stock_sector={len(stock_sector_rows)}，耗时 {elapsed:.1f}s"
+            f"[股票资料] stock_sector 事务提交完成："
+            f"{len(sector_rows)} 行，耗时 {elapsed:.1f}s"
         )
     except Exception as exc:
         conn.rollback()
         elapsed = time.perf_counter() - transaction_started_at
         print(
-            f"[股票资料] 事务失败，已回滚并保留旧数据：{exc}，"
+            f"[股票资料] stock_sector 事务失败，已回滚并保留旧数据：{exc}，"
             f"耗时 {elapsed:.1f}s"
         )
         raise
-
-
-def refresh_stock_metadata(stock_codes):
-    """先完整获取股票资料，再以事务全量替换本地资料表。"""
-    updated_at = datetime.now().isoformat(timespec="seconds")
-
-    print("[日K更新] 阶段 2/4：正在获取股票基础信息...")
-    basic_rows = collect_stock_basic_rows(stock_codes, updated_at)
-
-    print("[日K更新] 阶段 3/4：正在获取股票行业和概念...")
-    sector_rows = collect_stock_sector_rows(stock_codes, updated_at)
-
-    if len(basic_rows) != len(stock_codes):
-        raise RuntimeError("股票基础信息未完整获取，取消本次数据库替换")
-
-    print(
-        f"[股票资料] 网络获取完成，准备开启事务："
-        f"stock_basic={len(basic_rows)}，stock_sector={len(sector_rows)}"
-    )
-    replace_stock_metadata(basic_rows, sector_rows)
-    return {"stock_basic": len(basic_rows), "stock_sector": len(sector_rows)}
+    return {"stock_sector": len(sector_rows)}
 
 
 def load_stock_basic_records():
@@ -600,11 +617,16 @@ def extract_stock_codes_from_stock_list(stock_rows):
 def update_daily_kline_after_close(
     count=DAILY_KLINE_UPDATE_DAYS,
     batch_size=DAILY_KLINE_UPDATE_BATCH_SIZE,
+    stock_basic_mode="on",
+    sectors_mode="off",
 ):
-    """收盘后更新全部 A 股最近 N 天日 K，并 upsert 到本地数据库。"""
+    """收盘后按开关更新股票资料，并更新全部 A 股最近 N 天日 K。"""
     started_at = time.perf_counter()
+    update_stock_basic = stock_basic_mode == "on"
+    update_sectors = sectors_mode == "on"
 
     print(f"[日K更新] 开始更新全部A股日K：count={count}, batch_size={batch_size}")
+    print(f"[股票资料] stock_basic={stock_basic_mode}，sectors={sectors_mode}")
 
     stage_started_at = time.perf_counter()
     print("[日K更新] 阶段 1/4：正在获取全市场股票列表...")
@@ -619,6 +641,8 @@ def update_daily_kline_after_close(
             "updated_rows": 0,
             "count": count,
             "batch_size": batch_size,
+            "stock_basic": stock_basic_mode,
+            "sectors": sectors_mode,
         }
 
     stage_seconds = time.perf_counter() - stage_started_at
@@ -627,18 +651,38 @@ def update_daily_kline_after_close(
         f"耗时 {stage_seconds:.1f}s"
     )
 
-    try:
-        stats = refresh_stock_metadata(stock_list)
-        print(
-            f"[日K更新] 阶段 3/4 完成：股票资料更新完成 "
-            f"(基础信息 {stats['stock_basic']} 只，板块关系 {stats['stock_sector']} 条)"
-        )
-    except Exception as exc:
-        print(f"[股票资料] 全量替换失败，保留旧数据: {exc}")
+    if update_stock_basic:
+        stage_started_at = time.perf_counter()
+        print("[日K更新] 阶段 2/4：正在更新股票基础信息...")
+        try:
+            stats = refresh_stock_basic(stock_list)
+            print(
+                f"[日K更新] 阶段 2/4 完成：stock_basic={stats['stock_basic']}，"
+                f"耗时 {time.perf_counter() - stage_started_at:.1f}s"
+            )
+        except Exception as exc:
+            print(f"[股票资料] stock_basic 更新失败，旧资料保留：{exc}")
+    else:
+        print("[日K更新] 阶段 2/4：股票基础信息更新已关闭，跳过")
+
+    if update_sectors:
+        stage_started_at = time.perf_counter()
+        print("[日K更新] 阶段 3/4：正在更新股票行业和概念...")
+        try:
+            stats = refresh_stock_sectors(stock_list)
+            print(
+                f"[日K更新] 阶段 3/4 完成：stock_sector={stats['stock_sector']}，"
+                f"耗时 {time.perf_counter() - stage_started_at:.1f}s"
+            )
+        except Exception as exc:
+            print(f"[股票资料] stock_sector 更新失败，旧资料保留：{exc}")
+    else:
+        print("[日K更新] 阶段 3/4：板块关系更新已关闭，跳过")
 
     batches = chunk_list(stock_list, batch_size)
     total_batches = len(batches)
     total_updated_rows = 0
+    kline_started_at = time.perf_counter()
 
     print(
         f"[日K更新] 阶段 4/4：开始拉取日K，共 {len(stock_list)} 只，"
@@ -674,18 +718,19 @@ def update_daily_kline_after_close(
 
         total_updated_rows += updated_rows
         batch_seconds = time.perf_counter() - batch_started_at
-        total_seconds = time.perf_counter() - started_at
+        kline_elapsed = time.perf_counter() - kline_started_at
 
         print(
             f"[日K更新] 第 {batch_index}/{total_batches} 批完成："
             f"本批写入 {updated_rows} 行，累计 {total_updated_rows} 行，"
-            f"本批耗时 {batch_seconds:.1f}s，总耗时 {total_seconds:.1f}s"
+            f"本批耗时 {batch_seconds:.1f}s，日K累计耗时 {kline_elapsed:.1f}s"
         )
 
+    kline_elapsed = time.perf_counter() - kline_started_at
     total_seconds = time.perf_counter() - started_at
     print(
         f"[日K更新] 阶段 4/4 完成：股票 {len(stock_list)} 只，"
-        f"写入/覆盖 {total_updated_rows} 行"
+        f"写入/覆盖 {total_updated_rows} 行，耗时 {kline_elapsed:.1f}s"
     )
     print(f"[日K更新] 全部完成：总耗时 {total_seconds:.1f}s")
 
@@ -694,6 +739,8 @@ def update_daily_kline_after_close(
         "updated_rows": total_updated_rows,
         "count": count,
         "batch_size": batch_size,
+        "stock_basic": stock_basic_mode,
+        "sectors": sectors_mode,
         "elapsed_seconds": round(total_seconds, 1),
     }
 
@@ -1302,6 +1349,18 @@ def main():
         default=DAILY_KLINE_UPDATE_BATCH_SIZE,
         help=f"每批更新多少只股票，默认 {DAILY_KLINE_UPDATE_BATCH_SIZE}",
     )
+    update_daily_kline_parser.add_argument(
+        "--stock-basic",
+        choices=("on", "off"),
+        default="on",
+        help="是否更新股票名称和总股本：on/off，默认 on",
+    )
+    update_daily_kline_parser.add_argument(
+        "--sectors",
+        choices=("on", "off"),
+        default="off",
+        help="是否更新股票行业和概念：on/off，默认 off",
+    )
 
     load_daily_kline_parser = subparsers.add_parser(
         "load-daily-kline",
@@ -1373,7 +1432,14 @@ def main():
             )
         )
     elif args.command == "update-daily-kline":
-        print_json(update_daily_kline_after_close(args.count, args.batch_size))
+        print_json(
+            update_daily_kline_after_close(
+                count=args.count,
+                batch_size=args.batch_size,
+                stock_basic_mode=args.stock_basic,
+                sectors_mode=args.sectors,
+            )
+        )
     elif args.command == "load-daily-kline":
         print_json(load_daily_kline([args.code], args.count, args.end_date or None))
     elif args.command == "archive-snapshot":
