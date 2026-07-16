@@ -188,79 +188,87 @@ def ensure_database():
     return conn
 
 
-def ensure_stock_basic_table(conn=None):
-    """创建股票基础信息表，并返回可用的 SQLite 连接。"""
-    owns_connection = conn is None
-    connection = conn or ensure_database()
-    connection.execute(
+def migrate_stock_basic_table(conn):
+    """创建或迁移 stock_basic，保留现有 code/name 数据。"""
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS stock_basic (
             code TEXT PRIMARY KEY,
             name TEXT NOT NULL DEFAULT '',
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL DEFAULT ''
         )
         """
     )
-    connection.commit()
-    return connection, owns_connection
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(stock_basic)").fetchall()
+    }
+    if "total_shares" not in columns:
+        conn.execute(
+            "ALTER TABLE stock_basic ADD COLUMN total_shares REAL NOT NULL DEFAULT 0"
+        )
+    if "updated_at" not in columns:
+        conn.execute(
+            "ALTER TABLE stock_basic ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+        )
+    conn.commit()
 
 
 def upsert_stock_basic_rows(stock_rows):
-    """批量维护本地股票代码和名称。"""
-    if not stock_rows:
-        return 0
-
+    """同步股票名称和总股本到本地 stock_basic。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn, owns_connection = ensure_stock_basic_table()
-    count = 0
-    try:
-        for row in stock_rows:
-            if isinstance(row, dict):
-                code = str(row.get("Code", "") or "").strip()
-                name = str(row.get("Name", "") or "").strip()
-            else:
-                code = str(row).strip()
-                name = ""
-                try:
-                    stock_info = get_stock_info(code, field_list=[])
-                    if isinstance(stock_info, dict):
-                        name = str(stock_info.get("Name", "") or "").strip()
-                except Exception as exc:
-                    print(f"[股票基础信息] 获取名称失败: {code}, {exc}")
-            if not code:
-                continue
-            conn.execute(
-                """
-                INSERT INTO stock_basic(code, name, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(code) DO UPDATE SET
-                    name = CASE
-                        WHEN excluded.name <> '' THEN excluded.name
-                        ELSE stock_basic.name
-                    END,
-                    updated_at = excluded.updated_at
-                """,
-                (code, name, now),
-            )
-            count += 1
-        conn.commit()
-    finally:
-        if owns_connection:
-            conn.close()
-    return count
+    conn = ensure_database()
+    migrate_stock_basic_table(conn)
+    for code in stock_rows:
+        code = str(code).strip()
+        if not code:
+            continue
+        name = ""
+        total_shares = 0.0
+        try:
+            stock_info = get_stock_info(code, field_list=[]) or {}
+            name = str(stock_info.get("Name", "") or "").strip()
+            total_shares = float(stock_info.get("J_zgb", 0) or 0)
+        except Exception as exc:
+            print(f"[股票基础信息] 获取失败: {code}, {exc}")
+
+        conn.execute(
+            """
+            INSERT INTO stock_basic(code, name, total_shares, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+                name = CASE
+                    WHEN excluded.name <> '' THEN excluded.name
+                    ELSE stock_basic.name
+                END,
+                total_shares = CASE
+                    WHEN excluded.total_shares > 0 THEN excluded.total_shares
+                    ELSE stock_basic.total_shares
+                END,
+                updated_at = excluded.updated_at
+            """,
+            (code, name, total_shares, now),
+        )
+    conn.commit()
+    conn.close()
 
 
 def load_stock_basic_records():
-    """读取本地股票基础信息；返回 code/name 列表。"""
-    conn, owns_connection = ensure_stock_basic_table()
-    try:
-        rows = conn.execute(
-            "SELECT code, name FROM stock_basic ORDER BY code"
-        ).fetchall()
-        return [{"code": row[0], "name": row[1] or ""} for row in rows]
-    finally:
-        if owns_connection:
-            conn.close()
+    """读取本地股票基础信息。"""
+    conn = ensure_database()
+    migrate_stock_basic_table(conn)
+    rows = conn.execute(
+        "SELECT code, name, total_shares FROM stock_basic ORDER BY code"
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "code": row[0],
+            "name": row[1] or "",
+            "total_shares": float(row[2] or 0),
+        }
+        for row in rows
+    ]
 
 
 def get_market_mode_label():

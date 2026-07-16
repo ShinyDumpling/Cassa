@@ -6,17 +6,31 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import business
 import data
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
 
-DEFAULT_KLINE_COUNT = 120
+CONSOLE = Console()
+
 SNAPSHOT_KLINE_COUNT = 7
 SNAPSHOT_DIR = Path(__file__).resolve().parent / "data" / "snapshot"
 EXCLUDE_NAME_KEYWORDS = ("ST", "退")
-DEFAULT_CONSOLE_CODE_LIMIT = 100
+SNAPSHOT_COLUMNS = [
+    "SECUCODE", "code", "name",
+    "open_price", "high_price", "low_price", "close_price", "volume",
+    "price", "change_pct", "volume_ratio", "amount",
+    "turnover_rate", "pe_ratio", "pb_ratio", "total_mv",
+    "MAX_TRADE_DATE",
+]
+SNAPSHOT_REQUIRED_COLUMNS = {
+    "code", "name", "open_price", "high_price", "low_price",
+    "close_price", "volume", "amount", "MAX_TRADE_DATE",
+}
 
 
 @dataclass
@@ -36,6 +50,7 @@ class KlineRecord:
     close_price: float
     volume: float
     amount: float
+    change_pct: float | None = None
     volume_ratio: float | None = None
 
 
@@ -69,7 +84,7 @@ def safe_float(value, default=None):
 def print_step(layer: LayerRecord):
     """打印一个筛选步骤的数量和耗时。"""
     print(
-        f"[{layer.name}] {layer.input_count} -> {layer.output_count}, "
+        f"[快照筛选] {layer.name}: {layer.input_count} -> {layer.output_count}, "
         f"淘汰 {layer.removed_count}, 用时 {layer.elapsed_seconds:.2f}s"
     )
 
@@ -95,22 +110,17 @@ def snapshot_path():
 
 def to_snapshot_payload(rows: list[dict[str, Any]], source="tdx"):
     """把快照行转换为统一 JSON payload。"""
-    columns = [
-        "SECUCODE", "code", "name", "price", "change_pct",
-        "volume_ratio", "amount", "turnover_rate", "pe_ratio",
-        "pb_ratio", "total_mv", "MAX_TRADE_DATE",
-    ]
-    data_rows = [[row.get(column) for column in columns] for row in rows]
+    data_rows = [[row.get(column) for column in SNAPSHOT_COLUMNS] for row in rows]
     return {
         "version": 1,
         "created_at": datetime.utcnow().isoformat() + "+00:00",
         "metadata": {
             "snapshot_source": source,
             "row_count": len(data_rows),
-            "columns": columns,
+            "columns": SNAPSHOT_COLUMNS,
         },
         "frame": {
-            "columns": columns,
+            "columns": SNAPSHOT_COLUMNS,
             "data": data_rows,
             "index": list(range(len(data_rows))),
         },
@@ -140,6 +150,9 @@ def read_snapshot(path: Path):
         raise ValueError(f"快照结构不合法: {path}")
     if not rows:
         raise ValueError(f"快照为空: {path}")
+    missing = SNAPSHOT_REQUIRED_COLUMNS - set(columns)
+    if missing:
+        raise ValueError(f"旧版快照缺少字段: {sorted(missing)}")
     return [dict(zip(columns, row)) for row in rows]
 
 
@@ -155,8 +168,20 @@ def code_to_secucode(code: str):
     return str(code)
 
 
-def build_snapshot_rows(stock_rows, kline_map):
-    """结合 7 根 K 线和通达信扩展信息构建实时快照行。"""
+def fetch_more_info_map(codes):
+    """逐只获取通达信扩展信息 more_info，返回 code -> dict。"""
+    result = {}
+    for code in codes:
+        try:
+            result[code] = data.get_more_info(code, field_list=[]) or {}
+        except Exception as exc:
+            print(f"[more_info] {code} 失败: {exc}")
+            result[code] = {}
+    return result
+
+
+def build_snapshot_rows(stock_rows, kline_map, more_info_map):
+    """组装快照行：仅使用本地 stock_basic + 7 根 K 线 + more_info。"""
     rows = []
     for stock in stock_rows:
         code = str(stock.get("code", "")).strip()
@@ -173,9 +198,8 @@ def build_snapshot_rows(stock_rows, kline_map):
         if previous_close and previous_close > 0:
             change_pct = round((price / previous_close - 1) * 100, 4)
 
-        stock_info = data.get_stock_info(code, field_list=[]) or {}
-        more_info = data.get_more_info(code, field_list=[]) or {}
-        total_shares = safe_float(stock_info.get("J_zgb"))
+        more_info = more_info_map.get(code) or {}
+        total_shares = safe_float(stock.get("total_shares"), 0.0)
         total_mv = (
             round(total_shares * price * 10000, 2)
             if total_shares and total_shares > 0 else None
@@ -188,6 +212,11 @@ def build_snapshot_rows(stock_rows, kline_map):
             "SECUCODE": code_to_secucode(code),
             "code": code,
             "name": name,
+            "open_price": safe_float(latest.get("open_price")),
+            "high_price": safe_float(latest.get("high_price")),
+            "low_price": safe_float(latest.get("low_price")),
+            "close_price": price,
+            "volume": safe_float(latest.get("volume")),
             "price": price,
             "change_pct": change_pct,
             "volume_ratio": safe_float(more_info.get("fLianB")),
@@ -202,34 +231,57 @@ def build_snapshot_rows(stock_rows, kline_map):
 
 
 def generate_market_snapshot(stock_rows):
-    """获取全市场 7 根 K 线、通达信基本面字段并覆盖当天快照。"""
+    """全市场 7 根 K 线 + more_info + 组装 + 落盘，分段计时。"""
     codes = [row["code"] for row in stock_rows if row.get("code")]
-    kline_map = data.load_daily_kline(
-        stock_list=codes,
-        count=SNAPSHOT_KLINE_COUNT,
-    )
-    rows = build_snapshot_rows(stock_rows, kline_map)
+
+    step = time.perf_counter()
+    kline_map = data.load_daily_kline(stock_list=codes, count=SNAPSHOT_KLINE_COUNT)
+    print(f"[快照] 读取/生成 7 根 K 线: {len(kline_map)} 只, 用时 {time.perf_counter() - step:.2f}s")
+
+    step = time.perf_counter()
+    more_info_map = fetch_more_info_map(codes)
+    print(f"[快照] 获取全市场 more_info: {len(more_info_map)} 只, 用时 {time.perf_counter() - step:.2f}s")
+
+    step = time.perf_counter()
+    rows = build_snapshot_rows(stock_rows, kline_map, more_info_map)
+    print(f"[快照] 组装快照: {len(rows)} 只, 用时 {time.perf_counter() - step:.2f}s")
     if not rows:
         raise RuntimeError("未生成任何有效市场快照数据")
+
+    step = time.perf_counter()
     path = snapshot_path()
     write_snapshot(path, rows)
+    print(f"[快照] 写入文件: {path}, 用时 {time.perf_counter() - step:.2f}s")
     return rows
 
 
-def ensure_market_snapshot(stock_rows):
-    """盘中覆盖快照，非盘中优先读取当天已有快照。"""
+def load_or_generate_snapshot(stock_rows, snapshot_mode="local"):
+    """按显式模式读取或生成当天快照。"""
+    mode = str(snapshot_mode or "local").strip().lower()
+    if mode not in {"local", "refresh"}:
+        raise ValueError(
+            f"不支持的快照模式: {snapshot_mode!r}，可选值为 local/refresh"
+        )
+
     path = snapshot_path()
-    if not data.is_a_share_intraday() and path.is_file():
+
+    if mode == "refresh":
+        print(f"[快照] 强制刷新: {path}")
+        return generate_market_snapshot(stock_rows)
+
+    if path.is_file():
         try:
             rows = read_snapshot(path)
-            print(f"[快照] 非盘中使用本地快照: {path}")
+            print(f"[快照] 使用本地快照: {path}")
             return rows
         except (OSError, ValueError, TypeError) as exc:
-            print(f"[快照] 本地快照不可用，重新生成: {exc}")
+            print(f"[快照] 本地快照不可用: {exc}")
+            print("[快照] 正在重新生成当天快照...")
+    else:
+        print(f"[快照] 当天本地快照不存在: {path}")
+        print("[快照] 正在生成当天快照...")
 
-    rows = generate_market_snapshot(stock_rows)
-    print(f"[快照] 已生成并覆盖: {path}")
-    return rows
+    return generate_market_snapshot(stock_rows)
 
 
 def filter_snapshot_excluded_names(rows):
@@ -276,7 +328,7 @@ def run_snapshot_filters(rows, filters):
     layers = []
     started = time.perf_counter()
     filtered = filter_snapshot_excluded_names(rows)
-    layers.append(timed_layer("快照 ST/退市过滤", rows, filtered, started))
+    layers.append(timed_layer("ST/退市", rows, filtered, started))
 
     for item in filters:
         started = time.perf_counter()
@@ -286,29 +338,32 @@ def run_snapshot_filters(rows, filters):
     return filtered, layers
 
 
-def build_kline_record(row):
-    """把 data 返回的 K 线字典转换为 KlineRecord。"""
-    return KlineRecord(
-        code=row["code"],
-        trade_date=str(row["trade_date"]),
-        open_price=float(row["open_price"]),
-        high_price=float(row["high_price"]),
-        low_price=float(row["low_price"]),
-        close_price=float(row["close_price"]),
-        volume=float(row.get("volume", 0) or 0),
-        amount=float(row.get("amount", 0) or 0),
-    )
-
-
-def build_stock_records(snapshot_rows, kline_map):
-    """用快照筛选后的股票和 120 根 K 线构建 StockRecord。"""
+def build_stock_records_from_snapshot(snapshot_rows):
+    """使用快照最新 K 线构建 heat 结果记录。"""
     records = []
     for row in snapshot_rows:
-        code = row["code"]
+        latest = KlineRecord(
+            code=row["code"],
+            trade_date=str(row.get("MAX_TRADE_DATE", "")),
+            open_price=float(row.get("open_price") or 0),
+            high_price=float(row.get("high_price") or 0),
+            low_price=float(row.get("low_price") or 0),
+            close_price=float(row.get("close_price", row.get("price")) or 0),
+            volume=float(row.get("volume") or 0),
+            amount=float(row.get("amount") or 0),
+            change_pct=(
+                float(row["change_pct"])
+                if row.get("change_pct") is not None else None
+            ),
+            volume_ratio=(
+                float(row["volume_ratio"])
+                if row.get("volume_ratio") is not None else None
+            ),
+        )
         records.append(StockRecord(
-            code=code,
+            code=row["code"],
             name=str(row.get("name", "") or ""),
-            kline=[build_kline_record(item) for item in kline_map.get(code, [])],
+            kline=[latest],
         ))
     return records
 
@@ -334,12 +389,48 @@ def ensure_sectors(records):
     return records
 
 
+def build_display_sector_fields(sectors):
+    """把统一板块记录转换为控制台和结果使用的行业/概念字段。"""
+    industries = []
+    concepts = []
+    for sector in sectors:
+        if sector.type == "industry" and sector.name not in industries:
+            industries.append(sector.name)
+        elif sector.type == "concept" and sector.name not in concepts:
+            concepts.append(sector.name)
+    return {
+        "industry": "、".join(industries),
+        "concepts": concepts,
+    }
+
+
+def format_change_pct(value) -> Text:
+    """格式化涨跌幅，并按涨跌方向着色。"""
+    if value is None or value == "":
+        return Text("-")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return Text("-")
+
+    text = f"{number:+.2f}%"
+    if number > 0:
+        return Text(text, style="red")
+    if number < 0:
+        return Text(text, style="green")
+    return Text(text, style="yellow")
+
+
 def serialize_record(record):
     """把 StockRecord 转换为最终 selected 项。"""
     latest = asdict(record.kline[-1]) if record.kline else None
+    display = build_display_sector_fields(record.sectors)
     return {
         "code": record.code,
         "name": record.name,
+        "change_pct": record.kline[-1].change_pct if record.kline else None,
+        "industry": display["industry"],
+        "concepts": display["concepts"],
         "sectors": [asdict(item) for item in record.sectors],
         "latest_kline": latest,
     }
@@ -366,51 +457,72 @@ def build_result(records, layers, started_at):
 
 
 def print_screen_result(result, debug=False):
-    """打印 heat 摘要；debug 时追加完整 JSON。"""
-    print("=== 资金热度选股 ===")
-    print(f"运行日期: {result['run_date']}")
-    print(f"运行模式: {result['mode']}")
-    print(f"最终入选: {result['summary']['selected_count']}")
-    for item in result["selected"][:DEFAULT_CONSOLE_CODE_LIMIT]:
-        latest = item.get("latest_kline") or {}
-        print(
-            f"{item['code']} {item['name']} "
-            f"close={latest.get('close_price')} "
-            f"amount={latest.get('amount')}"
-        )
+    """统一输出任意选股策略的控制台结果。"""
     if debug:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        CONSOLE.print_json(json.dumps(result, ensure_ascii=False))
+        return
+
+    title = result.get("title") or result.get("strategy") or "选股结果"
+    run_date = result.get("run_date", "")
+    mode = result.get("mode", "")
+    summary = result.get("summary") or {}
+    selected = result.get("selected") or []
+
+    CONSOLE.print()
+    CONSOLE.print(
+        f"[bold cyan]{title}[/bold cyan]  "
+        f"日期：{run_date}  模式：{mode}  "
+        f"入选：{summary.get('selected_count', len(selected))} 只"
+    )
+
+    table = Table(title="选股结果", expand=True, show_lines=True)
+    table.add_column("代码", no_wrap=True, style="cyan")
+    table.add_column("名称", no_wrap=True)
+    table.add_column("涨幅", justify="right", no_wrap=True)
+    table.add_column("行业", no_wrap=False, overflow="fold")
+    table.add_column("概念", no_wrap=False, overflow="fold")
+
+    for item in selected:
+        concepts = item.get("concepts") or []
+        if isinstance(concepts, str):
+            concept_text = concepts
+        else:
+            concept_text = "、".join(str(value) for value in concepts)
+
+        table.add_row(
+            str(item.get("code", "")),
+            str(item.get("name", "")),
+            format_change_pct(item.get("change_pct")),
+            str(item.get("industry", "")),
+            concept_text,
+        )
+
+    if selected:
+        CONSOLE.print(table)
+    else:
+        CONSOLE.print("[yellow]本次没有筛选出符合条件的股票[/yellow]")
 
 
-def run_heat(debug=False):
+def run_heat(debug=False, snapshot_mode="local"):
     """执行第一版 heat 选股流程。"""
     started_at = time.perf_counter()
     print("开始执行策略: heat")
 
-    step_started = time.perf_counter()
+    step = time.perf_counter()
     stock_rows = data.load_stock_basic_records()
-    print(f"[股票池] 本地股票基础信息: {len(stock_rows)} 只, 用时 {time.perf_counter() - step_started:.2f}s")
+    print(f"[股票基础信息] 读取本地 stock_basic: {len(stock_rows)} 只, 用时 {time.perf_counter() - step:.2f}s")
 
-    step_started = time.perf_counter()
-    snapshot_rows = ensure_market_snapshot(stock_rows)
-    print(f"[快照] 快照数据: {len(snapshot_rows)} 只, 用时 {time.perf_counter() - step_started:.2f}s")
+    snapshot_rows = load_or_generate_snapshot(stock_rows, snapshot_mode=snapshot_mode)
 
     snapshot_rows, layers = run_snapshot_filters(
         snapshot_rows, HEAT_CONFIG["snapshot_filters"]
     )
 
-    codes = [row["code"] for row in snapshot_rows]
-    step_started = time.perf_counter()
-    kline_map = data.load_daily_kline(
-        stock_list=codes,
-        count=HEAT_CONFIG["kline_count"],
-    )
-    print(f"[候选日K] {len(kline_map)} 只, 用时 {time.perf_counter() - step_started:.2f}s")
-    records = build_stock_records(snapshot_rows, kline_map)
+    records = build_stock_records_from_snapshot(snapshot_rows)
 
-    step_started = time.perf_counter()
+    step = time.perf_counter()
     records = ensure_sectors(records)
-    print(f"[板块补齐] {len(records)} 只, 用时 {time.perf_counter() - step_started:.2f}s")
+    print(f"[板块补齐] {len(records)} 只, 用时 {time.perf_counter() - step:.2f}s")
 
     result = build_result(records, layers, started_at)
     print_screen_result(result, debug=debug)
@@ -420,30 +532,67 @@ def run_heat(debug=False):
 HEAT_CONFIG = {
     "strategy": "heat",
     "title": "资金热度",
-    "kline_count": DEFAULT_KLINE_COUNT,
     "snapshot_filters": [
-        {"name": "价格区间", "function": filter_snapshot_price_range,
-         "params": {"min_price": 3, "max_price": 220}},
-        {"name": "成交额", "function": filter_snapshot_amount,
-         "params": {"min_amount": 30000}},
-        {"name": "换手率", "function": filter_snapshot_turnover_rate,
-         "params": {"min_turnover_rate": 2.0}},
-        {"name": "量比", "function": filter_snapshot_volume_ratio,
-         "params": {"min_volume_ratio": 1.5}},
-        {"name": "涨幅", "function": filter_snapshot_change_pct,
-         "params": {"min_change_pct": 1.0}},
+        {
+            "name": "价格区间",
+            "function": filter_snapshot_price_range,
+            "params": {"min_price": 3, "max_price": 220},
+        },
+        {
+            "name": "成交额",
+            "function": filter_snapshot_amount,
+            "params": {"min_amount": 30000},
+        },
+        {
+            "name": "换手率",
+            "function": filter_snapshot_turnover_rate,
+            "params": {"min_turnover_rate": 2.0},
+        },
+        {
+            "name": "量比",
+            "function": filter_snapshot_volume_ratio,
+            "params": {"min_volume_ratio": 1.5},
+        },
+        {
+            "name": "涨幅",
+            "function": filter_snapshot_change_pct,
+            "params": {"min_change_pct": 1.0},
+        },
     ],
     "kline_filters": [],
 }
 
 
+def build_arg_parser():
+    """构建 screen2 子命令解析器。"""
+    parser = argparse.ArgumentParser(description="Cassa stock screening")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    heat_parser = subparsers.add_parser(
+        "heat",
+        help="执行资金热度选股",
+    )
+    heat_parser.add_argument(
+        "--snapshot-mode",
+        choices=("local", "refresh"),
+        default="local",
+        help="快照模式：local 使用当天本地快照，refresh 强制重新拉取",
+    )
+    heat_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="输出完整 JSON",
+    )
+    return parser
+
+
 def main():
-    """heat CLI 入口；第一版只暴露 heat 和 debug。"""
-    parser = argparse.ArgumentParser(description="Cassa heat stock screening")
-    parser.add_argument("--debug", action="store_true", help="输出完整 JSON")
+    """screen2.py 命令行入口。"""
+    parser = build_arg_parser()
     args = parser.parse_args()
     data.initialize(Path(__file__))
-    run_heat(debug=args.debug)
+    if args.command == "heat":
+        run_heat(debug=args.debug, snapshot_mode=args.snapshot_mode)
 
 
 if __name__ == "__main__":
