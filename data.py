@@ -188,6 +188,86 @@ def ensure_database():
     return conn
 
 
+def ensure_stock_basic_table(conn=None):
+    """创建股票基础信息表，并返回可用的 SQLite 连接。"""
+    owns_connection = conn is None
+    connection = conn or ensure_database()
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stock_basic (
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    return connection, owns_connection
+
+
+def upsert_stock_basic_rows(stock_rows):
+    """批量维护本地股票代码和名称。"""
+    if not stock_rows:
+        return 0
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn, owns_connection = ensure_stock_basic_table()
+    count = 0
+    try:
+        for row in stock_rows:
+            if isinstance(row, dict):
+                code = str(row.get("Code", "") or "").strip()
+                name = str(row.get("Name", "") or "").strip()
+            else:
+                code = str(row).strip()
+                name = ""
+                try:
+                    stock_info = get_stock_info(code, field_list=[])
+                    if isinstance(stock_info, dict):
+                        name = str(stock_info.get("Name", "") or "").strip()
+                except Exception as exc:
+                    print(f"[股票基础信息] 获取名称失败: {code}, {exc}")
+            if not code:
+                continue
+            conn.execute(
+                """
+                INSERT INTO stock_basic(code, name, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    name = CASE
+                        WHEN excluded.name <> '' THEN excluded.name
+                        ELSE stock_basic.name
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (code, name, now),
+            )
+            count += 1
+        conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
+    return count
+
+
+def load_stock_basic_records():
+    """读取本地股票基础信息；返回 code/name 列表。"""
+    conn, owns_connection = ensure_stock_basic_table()
+    try:
+        rows = conn.execute(
+            "SELECT code, name FROM stock_basic ORDER BY code"
+        ).fetchall()
+        return [{"code": row[0], "name": row[1] or ""} for row in rows]
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def get_market_mode_label():
+    """返回当前 A 股运行模式标签。"""
+    return "盘中" if is_a_share_intraday() else "非盘中"
+
+
 def upsert_daily_kline_rows(rows):
     """把日 K 行写入数据库，已存在的 code + trade_date 直接覆盖。"""
     if not rows:
@@ -365,6 +445,7 @@ def update_daily_kline_after_close(
     print("[日K更新] 正在获取全市场股票列表...")
 
     stock_rows = get_stock_list()
+    upsert_stock_basic_rows(stock_rows)
     stock_list = extract_stock_codes_from_stock_list(stock_rows)
 
     if not stock_list:
