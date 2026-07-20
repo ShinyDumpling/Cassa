@@ -3963,3 +3963,550 @@ elif args.command == "update-daily-kline":
 ```
 
 这样解决四个日志决策：保留四阶段、删除内层重复阶段头、增加阶段 4/4 完成日志、保留每批累计写入行数。
+
+---
+
+## 8. `screen2.py` 选股结果保存方案：新增 `--save`
+
+### 8.1 背景与原因
+
+目前 `screen2.py` 已经可以通过 `heat`、`volume-breakout` 等策略选出股票，并且在 `--debug` 模式下打印完整 JSON。
+
+但只在控制台打印有一个问题：选出来的股票如果不落盘，过一段时间就很容易被遗忘，也无法继续做后续复盘、策略命中率验证、LLM 分析或板块异动观察。
+
+之前讨论过更完整的 `pool` 方案，例如入库、维护股票状态、记录来源、支持板块等。但当前阶段不需要一上来做复杂数据库模型。更稳妥的第一步是先把每次选股的完整结构化结果保存成 JSON 文件，让后续分析程序直接读取这些文件。
+
+因此本轮采用一个最小闭环：
+
+- 不做数据库；
+- 不做股票池状态；
+- 不做板块自动入池；
+- 只给选股命令增加一个显式参数 `--save`；
+- 加了 `--save` 才保存完整 JSON，不加则保持现有行为；
+- 保存内容和 `--debug` 打印的 `result` 完全一致，不额外添加 `generated_at`、`schema_version`、`run_id` 等字段。
+
+这样做的好处是：
+
+- 改动小，风险低；
+- 不改变现有控制台输出逻辑；
+- JSON 文件天然适合后续脚本、Notebook、LLM 或批处理程序消费；
+- 文件名按“策略 + 日期”固定，同一天重复运行会覆盖，避免一天多次选股产生大量重复文件；
+- 后续如果要做真正的 `pool`，可以再从这些 JSON 文件提炼入库规则。
+
+### 8.2 目标行为
+
+新增参数：
+
+```bash
+python screen2.py heat --save
+python screen2.py volume-breakout --save
+```
+
+行为约定：
+
+- `--save` 默认关闭；
+- 不传 `--save` 时，不生成文件；
+- 传 `--save` 时，保存本次选股完整 JSON；
+- `--save` 和 `--debug` 互不依赖，可以单独使用，也可以同时使用；
+- 保存目录为 `Cassa/result/screen/`；
+- 文件名为 `{strategy}_{run_date}.json`；
+- 示例：
+  - `heat_2026-07-20.json`
+  - `volume_breakout_2026-07-20.json`
+- 同一策略、同一天只保留一份结果；
+- 如果当天文件已经存在，直接覆盖；
+- 保存前校验 `run_date` 必须是 `YYYY-MM-DD`；
+- 保存前校验 `run_date` 必须等于当前本地日期；
+- 保存内容必须保持和 `--debug` 打印的完整 JSON 一致。
+
+这里特别说明：项目通用规则里默认“最终结果文件不覆盖旧结果”，但本需求明确要求“同一天的选股只保存一份，如果存在就覆盖”，因此本功能按用户本次需求执行覆盖。
+
+### 8.3 技术方案
+
+当前 `screen2.py` 已经有统一结果对象：
+
+```python
+result = build_result(...)
+```
+
+并且 `print_screen_result(result, debug=debug)` 已经能在 `--debug` 时打印完整 JSON。因此保存功能不需要重新组织数据，也不需要新增一套输出结构，只需要把这个 `result` 原样写入文件。
+
+实现方式：
+
+1. 在路径常量区新增 `SCREEN_RESULT_DIR`，指向 `Cassa/result/screen`。
+2. 新增函数 `save_screen_result(result: dict[str, Any]) -> Path`，负责：
+   - 读取并校验 `strategy`；
+   - 读取并校验 `run_date`；
+   - 确认 `run_date` 是当天日期；
+   - 创建 `result/screen` 目录；
+   - 写入临时文件；
+   - 用 `replace()` 覆盖最终 JSON 文件；
+   - 打印保存路径；
+   - 返回最终路径。
+3. 在 `heat` 子命令增加 `--save`。
+4. 在 `volume-breakout` 子命令增加 `--save`。
+5. 修改 `main()`，让策略执行结果先赋值给 `result`，再根据 `args.save` 决定是否保存。
+
+### 8.4 修改点 1：新增保存目录常量
+
+位置：`D:\股神养成plan\Cassa\screen2.py`
+
+原代码：
+
+```python
+CONSOLE = Console()
+SNAPSHOT_DIR = Path(__file__).resolve().parent / "data" / "snapshots"
+```
+
+改为：
+
+```python
+CONSOLE = Console()
+SNAPSHOT_DIR = Path(__file__).resolve().parent / "data" / "snapshots"
+SCREEN_RESULT_DIR = Path(__file__).resolve().parent / "result" / "screen"
+```
+
+### 8.5 修改点 2：新增 `save_screen_result`
+
+位置：`D:\股神养成plan\Cassa\screen2.py`
+
+建议放在 `build_result()` 后面、`print_screen_result()` 前面。这样阅读顺序是：
+
+1. 先构建统一结果；
+2. 再保存统一结果；
+3. 再打印统一结果。
+
+新增完整代码：
+
+```python
+def save_screen_result(result: dict[str, Any]) -> Path:
+    """校验并保存当天选股结果；输入统一 result，返回最终 JSON 文件路径。"""
+    strategy = str(result.get("strategy", "") or "").strip()
+    if not strategy:
+        raise ValueError("选股结果缺少 strategy，无法保存")
+
+    allowed_strategy_characters = set(
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789_-"
+    )
+    if any(
+        character not in allowed_strategy_characters
+        for character in strategy
+    ):
+        raise ValueError(
+            f"选股策略名称包含不允许用于文件名的字符: {strategy!r}"
+        )
+
+    run_date = str(result.get("run_date", "") or "").strip()
+    try:
+        parsed_run_date = datetime.strptime(run_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(
+            f"选股结果日期格式不正确: {run_date!r}，应为 YYYY-MM-DD"
+        ) from exc
+
+    if parsed_run_date.strftime("%Y-%m-%d") != run_date:
+        raise ValueError(
+            f"选股结果日期格式不正确: {run_date!r}，应为 YYYY-MM-DD"
+        )
+
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    if run_date != current_date:
+        raise ValueError(
+            f"选股结果日期不是当天日期，拒绝保存："
+            f"结果日期={run_date}，当天日期={current_date}"
+        )
+
+    SCREEN_RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+    result_path = SCREEN_RESULT_DIR / f"{strategy}_{run_date}.json"
+    temporary_path = result_path.with_name(
+        f".{result_path.name}.{time.time_ns()}.tmp"
+    )
+
+    try:
+        temporary_path.write_text(
+            json.dumps(
+                result,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        temporary_path.replace(result_path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"选股结果保存失败: {result_path}，错误: {exc}"
+        ) from exc
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+    print(f"[选股结果] 已保存: {result_path}")
+    return result_path
+```
+
+设计说明：
+
+- `strategy` 只允许字母、数字、下划线、短横线，避免策略名污染文件路径；
+- `run_date` 严格要求 `YYYY-MM-DD`；
+- `run_date` 必须等于当前日期，避免历史结果或异常日期误覆盖当天文件；
+- 使用临时文件加 `replace()`，避免写到一半时留下损坏 JSON；
+- 写入的是完整 `result`，没有新增字段，因此和 `--debug` 的数据结构保持一致。
+
+### 8.6 修改点 3：`heat` 子命令增加 `--save`
+
+位置：`D:\股神养成plan\Cassa\screen2.py` 的 `build_arg_parser()`
+
+原代码中 `heat_parser` 已有：
+
+```python
+heat_parser.add_argument(
+    "--debug",
+    action="store_true",
+    help="输出完整调试 JSON",
+)
+```
+
+在它后面新增：
+
+```python
+heat_parser.add_argument(
+    "--save",
+    action="store_true",
+    help="保存当天完整选股 JSON；同一策略同一天覆盖旧文件",
+)
+```
+
+### 8.7 修改点 4：`volume-breakout` 子命令增加 `--save`
+
+位置：`D:\股神养成plan\Cassa\screen2.py` 的 `build_arg_parser()`
+
+原代码中 `volume_parser` 已有：
+
+```python
+volume_parser.add_argument(
+    "--debug",
+    action="store_true",
+    help="输出完整调试 JSON",
+)
+```
+
+在它后面新增：
+
+```python
+volume_parser.add_argument(
+    "--save",
+    action="store_true",
+    help="保存当天完整选股 JSON；同一策略同一天覆盖旧文件",
+)
+```
+
+### 8.8 修改点 5：修改 `main()`
+
+位置：`D:\股神养成plan\Cassa\screen2.py`
+
+原代码：
+
+```python
+def main():
+    """解析选股命令，并分发到对应策略。"""
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    data.initialize(Path(__file__))
+
+    if args.command == "heat":
+        run_heat(
+            debug=args.debug,
+            snapshot_mode=args.snapshot_mode,
+        )
+    elif args.command == "volume-breakout":
+        run_volume_breakout(
+            debug=args.debug,
+            snapshot_mode=args.snapshot_mode,
+        )
+    else:
+        parser.error(f"不支持的选股策略: {args.command}")
+```
+
+改为：
+
+```python
+def main():
+    """解析选股命令；执行策略，并按 --save 决定是否保存完整结果。"""
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    data.initialize(Path(__file__))
+
+    if args.command == "heat":
+        result = run_heat(
+            debug=args.debug,
+            snapshot_mode=args.snapshot_mode,
+        )
+    elif args.command == "volume-breakout":
+        result = run_volume_breakout(
+            debug=args.debug,
+            snapshot_mode=args.snapshot_mode,
+        )
+    else:
+        parser.error(f"不支持的选股策略: {args.command}")
+        return
+
+    if args.save:
+        save_screen_result(result)
+```
+
+这里的关键点是：`run_heat()` 和 `run_volume_breakout()` 已经返回统一 `result`，所以主流程只需要接住返回值，不需要改策略内部逻辑。
+
+### 8.9 不需要修改的地方
+
+本轮不修改：
+
+- `build_result()`：继续负责统一结果结构；
+- `print_screen_result()`：继续负责控制台输出；
+- `run_heat()`：继续负责资金热度策略；
+- `run_volume_breakout()`：继续负责放量突破策略；
+- 数据库结构：暂时不引入 `pool` 表；
+- 板块入池：暂时只保留 TODO，不做实现；
+- JSON 内容结构：不添加 `generated_at` 等额外字段。
+
+### 8.10 验证方案
+
+最小验证命令：
+
+```bash
+python screen2.py heat --help
+python screen2.py volume-breakout --help
+python -m py_compile screen2.py
+```
+
+行为验证：
+
+```bash
+python screen2.py heat --save
+```
+
+预期：
+
+- 控制台正常打印 `heat` 选股结果；
+- 生成文件 `D:\股神养成plan\Cassa\result\screen\heat_YYYY-MM-DD.json`；
+- 同一天再次执行会覆盖同名文件；
+- 没有多余 `.tmp` 文件残留。
+
+同时验证：
+
+```bash
+python screen2.py heat --debug --save
+```
+
+预期：
+
+- 控制台打印完整 JSON；
+- 文件中保存的 JSON 与 `--debug` 使用的是同一个 `result` 对象；
+- 文件里不出现 `generated_at` 等额外字段。
+
+再验证另一个策略：
+
+```bash
+python screen2.py volume-breakout --save
+```
+
+预期生成：
+
+```text
+D:\股神养成plan\Cassa\result\screen\volume_breakout_YYYY-MM-DD.json
+```
+
+### 8.11 后续 TODO
+
+当前先把选股结果沉淀成稳定 JSON 文件。后续可以基于这些文件继续做：
+
+- 读取多天选股文件，统计股票重复出现次数；
+- 统计行业、概念、板块在多天结果中的出现频次；
+- 分析某个策略选出的股票后续走势，用来验证策略有效性；
+- 接入 LLM，让模型读取选股 JSON 并输出观察清单；
+- 再决定是否需要把某些股票、板块或策略信号升级为真正的 `pool` 数据库表。
+
+---
+
+## 9. 控制台选股结果表格优化：新增“序号”列
+
+### 9.1 背景与原因
+
+当前 `screen2.py` 的普通控制台输出会把入选股票打印成 Rich 表格，字段包括：
+
+- 代码；
+- 名称；
+- 涨幅；
+- 行业；
+- 概念。
+
+这个输出已经适合快速查看结果，但人工复盘时还有一个小不便：如果选出几十只股票，后续讨论或记录时很难快速引用“第几只”。例如想说“第 7 只和第 12 只重点看一下”，当前表格没有稳定序号，只能靠股票代码或名称引用。
+
+因此新增第一列“序号”，让控制台结果更适合人工浏览、截图、复盘和后续口头讨论。
+
+这个优化只影响普通表格展示，不影响：
+
+- 选股逻辑；
+- `result` JSON 结构；
+- `--debug` 打印内容；
+- `--save` 保存文件内容。
+
+也就是说，它是纯展示层优化。
+
+### 9.2 目标行为
+
+普通模式下：
+
+```bash
+python screen2.py heat
+python screen2.py volume-breakout
+```
+
+表格第一列新增“序号”：
+
+```text
+┏━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━┳━━━━━━━━┳━━━━━━━━┓
+┃ 序号 ┃ 代码   ┃ 名称   ┃ 涨幅 ┃ 行业   ┃ 概念   ┃
+┡━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━╇━━━━━━━━╇━━━━━━━━┩
+│ 1    │ 000001 │ ...    │ ...  │ ...    │ ...    │
+│ 2    │ 000002 │ ...    │ ...  │ ...    │ ...    │
+└──────┴────────┴────────┴──────┴────────┴────────┘
+```
+
+`--debug` 模式下：
+
+```bash
+python screen2.py heat --debug
+```
+
+仍然只打印完整 JSON，不额外增加序号字段。
+
+`--save` 模式下：
+
+```bash
+python screen2.py heat --save
+```
+
+保存的 JSON 仍然保持和 `--debug` 使用的 `result` 一致，不因为控制台表格新增序号而改变文件内容。
+
+### 9.3 技术方案
+
+当前表格输出集中在 `print_screen_result(result, debug=False)` 中，因此只需要改这个函数内部的表格构造和行添加逻辑。
+
+实现方式：
+
+1. 在 `Table` 第一列新增：
+
+```python
+table.add_column("序号", justify="right", no_wrap=True)
+```
+
+2. 把遍历入选股票的逻辑从：
+
+```python
+for item in selected:
+```
+
+改成：
+
+```python
+for item_index, item in enumerate(selected, start=1):
+```
+
+3. 在 `table.add_row(...)` 的第一项加入：
+
+```python
+str(item_index),
+```
+
+这样序号只在渲染表格时临时生成，不进入 `selected` 数据本体。
+
+### 9.4 修改点：调整 `print_screen_result`
+
+位置：`D:\股神养成plan\Cassa\screen2.py`
+
+原代码：
+
+```python
+table = Table(title="选股结果", expand=True, show_lines=True)
+table.add_column("代码", no_wrap=True, style="cyan")
+table.add_column("名称", no_wrap=True)
+table.add_column("涨幅", justify="right", no_wrap=True)
+table.add_column("行业", no_wrap=False, overflow="fold")
+table.add_column("概念", no_wrap=False, overflow="fold")
+
+for item in selected:
+    concepts = item.get("concepts") or []
+    if isinstance(concepts, str):
+        concept_text = concepts
+    else:
+        concept_text = "、".join(str(value) for value in concepts)
+
+    table.add_row(
+        str(item.get("code", "")),
+        str(item.get("name", "")),
+        format_change_pct(item.get("change_pct")),
+        str(item.get("industry", "")),
+        concept_text,
+    )
+```
+
+改为：
+
+```python
+table = Table(title="选股结果", expand=True, show_lines=True)
+table.add_column("序号", justify="right", no_wrap=True)
+table.add_column("代码", no_wrap=True, style="cyan")
+table.add_column("名称", no_wrap=True)
+table.add_column("涨幅", justify="right", no_wrap=True)
+table.add_column("行业", no_wrap=False, overflow="fold")
+table.add_column("概念", no_wrap=False, overflow="fold")
+
+for item_index, item in enumerate(selected, start=1):
+    concepts = item.get("concepts") or []
+    if isinstance(concepts, str):
+        concept_text = concepts
+    else:
+        concept_text = "、".join(str(value) for value in concepts)
+
+    table.add_row(
+        str(item_index),
+        str(item.get("code", "")),
+        str(item.get("name", "")),
+        format_change_pct(item.get("change_pct")),
+        str(item.get("industry", "")),
+        concept_text,
+    )
+```
+
+### 9.5 设计说明
+
+这次不建议把序号写入 `result["selected"]`，原因是：
+
+- 序号不是股票本身的数据；
+- 序号只和当前展示排序有关；
+- 后续如果排序规则改变，同一只股票的序号也会变化；
+- 如果写入 JSON，容易让后续分析程序误以为序号是业务字段；
+- 当前需求只是“控制台打印的选股结果表格第一列新加一列叫做序号”，所以保持在展示层最干净。
+
+也不需要改 `build_result()`，因为 `build_result()` 的职责是构造统一选股结果，而不是处理控制台展示细节。
+
+### 9.6 验证方案
+
+最小验证命令：
+
+```bash
+python -m py_compile screen2.py
+python screen2.py heat
+```
+
+预期：
+
+- 普通表格第一列显示“序号”；
+- 第一行序号为 `1`，第二行为 `2`，依次递增；
+- 股票代码、名称、涨幅、行业、概念等原字段保持不变；
+- 没有入选股票时，仍然打印“本次没有筛选出符合条件的股票”；
+- `--debug` 输出 JSON 不新增序号字段；
+- `--save` 保存 JSON 不新增序号字段。

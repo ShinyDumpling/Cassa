@@ -18,6 +18,7 @@ CONSOLE = Console()
 
 SNAPSHOT_KLINE_COUNT = 7
 SNAPSHOT_DIR = Path(__file__).resolve().parent / "data" / "snapshot"
+SCREEN_RESULT_DIR = Path(__file__).resolve().parent / "result" / "screen"
 EXCLUDE_NAME_KEYWORDS = ("ST", "退")
 SNAPSHOT_COLUMNS = [
     "SECUCODE", "code", "name",
@@ -759,6 +760,74 @@ def build_result(records, layers, started_at, strategy_config):
     }
 
 
+def save_screen_result(result: dict[str, Any]) -> Path:
+    """校验并保存当天选股结果；输入统一 result，返回最终 JSON 文件路径。"""
+    strategy = str(result.get("strategy", "") or "").strip()
+    if not strategy:
+        raise ValueError("选股结果缺少 strategy，无法保存")
+
+    allowed_strategy_characters = set(
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789_-"
+    )
+    if any(
+        character not in allowed_strategy_characters
+        for character in strategy
+    ):
+        raise ValueError(
+            f"选股策略名称包含不允许用于文件名的字符: {strategy!r}"
+        )
+
+    run_date = str(result.get("run_date", "") or "").strip()
+    try:
+        parsed_run_date = datetime.strptime(run_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(
+            f"选股结果日期格式不正确: {run_date!r}，应为 YYYY-MM-DD"
+        ) from exc
+
+    if parsed_run_date.strftime("%Y-%m-%d") != run_date:
+        raise ValueError(
+            f"选股结果日期格式不正确: {run_date!r}，应为 YYYY-MM-DD"
+        )
+
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    if run_date != current_date:
+        raise ValueError(
+            f"选股结果日期不是当天日期，拒绝保存："
+            f"结果日期={run_date}，当天日期={current_date}"
+        )
+
+    SCREEN_RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+    result_path = SCREEN_RESULT_DIR / f"{strategy}_{run_date}.json"
+    temporary_path = result_path.with_name(
+        f".{result_path.name}.{time.time_ns()}.tmp"
+    )
+
+    try:
+        temporary_path.write_text(
+            json.dumps(
+                result,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        temporary_path.replace(result_path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"选股结果保存失败: {result_path}，错误: {exc}"
+        ) from exc
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+    print(f"[选股结果] 已保存: {result_path}")
+    return result_path
+
+
 def print_screen_result(result, debug=False):
     """统一输出任意选股策略的控制台结果。"""
     if debug:
@@ -779,13 +848,14 @@ def print_screen_result(result, debug=False):
     )
 
     table = Table(title="选股结果", expand=True, show_lines=True)
+    table.add_column("序号", justify="right", no_wrap=True)
     table.add_column("代码", no_wrap=True, style="cyan")
     table.add_column("名称", no_wrap=True)
     table.add_column("涨幅", justify="right", no_wrap=True)
     table.add_column("行业", no_wrap=False, overflow="fold")
     table.add_column("概念", no_wrap=False, overflow="fold")
 
-    for item in selected:
+    for item_index, item in enumerate(selected, start=1):
         concepts = item.get("concepts") or []
         if isinstance(concepts, str):
             concept_text = concepts
@@ -793,6 +863,7 @@ def print_screen_result(result, debug=False):
             concept_text = "、".join(str(value) for value in concepts)
 
         table.add_row(
+            str(item_index),
             str(item.get("code", "")),
             str(item.get("name", "")),
             format_change_pct(item.get("change_pct")),
@@ -1009,6 +1080,11 @@ def build_arg_parser():
         action="store_true",
         help="输出完整 JSON",
     )
+    heat_parser.add_argument(
+        "--save",
+        action="store_true",
+        help="保存当天完整选股 JSON；同一策略同一天覆盖旧文件",
+    )
 
     volume_parser = subparsers.add_parser(
         "volume-breakout",
@@ -1025,18 +1101,36 @@ def build_arg_parser():
         action="store_true",
         help="输出完整 JSON",
     )
+    volume_parser.add_argument(
+        "--save",
+        action="store_true",
+        help="保存当天完整选股 JSON；同一策略同一天覆盖旧文件",
+    )
     return parser
 
 
 def main():
-    """screen2.py 命令行入口。"""
+    """解析选股命令；执行策略，并按 --save 决定是否保存完整结果。"""
     parser = build_arg_parser()
     args = parser.parse_args()
     data.initialize(Path(__file__))
+
     if args.command == "heat":
-        run_heat(debug=args.debug, snapshot_mode=args.snapshot_mode)
+        result = run_heat(
+            debug=args.debug,
+            snapshot_mode=args.snapshot_mode,
+        )
     elif args.command == "volume-breakout":
-        run_volume_breakout(debug=args.debug, snapshot_mode=args.snapshot_mode)
+        result = run_volume_breakout(
+            debug=args.debug,
+            snapshot_mode=args.snapshot_mode,
+        )
+    else:
+        parser.error(f"不支持的选股策略: {args.command}")
+        return
+
+    if args.save:
+        save_screen_result(result)
 
 
 if __name__ == "__main__":
