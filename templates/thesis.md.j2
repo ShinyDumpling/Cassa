@@ -11,10 +11,6 @@
 > 注意：当前为盘中数据，最新 K 线及相关判断属于盘中暂态判断，不能视为收盘确认。
 {% endif %}
 
-## 总体结论
-
-{{ data.volume_price_relation.result }}
-
 ## 一、量价关系
 
 ### 结论
@@ -55,50 +51,52 @@
 - {{ ref }}
 {% endfor %}
 
-## 三、真实性判断
+## 三、异常—测试—确认
 
-### 结论
+### 整体结论
 
-{{ data.truth.result }}
+{{ data.anomaly_test_confirmation.result }}
 
-### K 线证据
+### 异常
+
+- 状态：{{ data.anomaly_test_confirmation.anomaly.status }}
+- 结论：{{ data.anomaly_test_confirmation.anomaly.result }}
 
 | 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-{% for item in data.truth.data %}
+{% for item in data.anomaly_test_confirmation.anomaly.data %}
+| {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
+{% endfor %}
+
+### 测试
+
+- 状态：{{ data.anomaly_test_confirmation.test.status }}
+- 结论：{{ data.anomaly_test_confirmation.test.result }}
+
+| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+{% for item in data.anomaly_test_confirmation.test.data %}
+| {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
+{% endfor %}
+
+### 确认
+
+- 状态：{{ data.anomaly_test_confirmation.confirmation.status }}
+- 结论：{{ data.anomaly_test_confirmation.confirmation.result }}
+
+| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+{% for item in data.anomaly_test_confirmation.confirmation.data %}
 | {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
 {% endfor %}
 
 ### 参考依据
 
-{% for ref in data.truth.refs %}
+{% for ref in data.anomaly_test_confirmation.refs %}
 - {{ ref }}
 {% endfor %}
 
-## 四、阶段划分
-
-{{ data.stage.result }}
-
-{% for stage_item in data.stage.data %}
-### {{ loop.index }}. {{ stage_item.stage }}
-
-- 时间:{{ stage_item.start_date }} 至 {{ stage_item.end_date }}
-- 概要:{{ stage_item.summary }}
-
-关键证据：
-
-{% for evidence_item in stage_item.evidence %}
-- {{ evidence_item.kline.trade_date }}:{{ evidence_item.evidence }}
-{% endfor %}
-
-{% endfor %}
-### 参考依据
-
-{% for ref in data.stage.refs %}
-- {{ ref }}
-{% endfor %}
-
-## 五、聪明钱
+## 四、聪明钱
 
 ### 结论
 
@@ -118,7 +116,7 @@
 - {{ ref }}
 {% endfor %}
 
-## 六、反转判断
+## 五、反转判断
 
 ### 结论
 
@@ -138,7 +136,7 @@
 - {{ ref }}
 {% endfor %}
 
-## 七、关键价格
+## 六、关键价格
 
 ### 结论
 
@@ -158,7 +156,7 @@
 - {{ ref }}
 {% endfor %}
 
-## 八、筹码分析
+## 七、筹码分析
 
 ### 结论
 

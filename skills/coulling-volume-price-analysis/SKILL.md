@@ -93,7 +93,7 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 
 ### K 线引用一致性规则
 
-所有输出模块中的 `data[].kline`、`stage.data[].evidence[].kline` 和 `chip.data.kline_evidence[].kline` 必须从输入 `daily_kline` 中按原始对象整行复制，不允许手写、重算、四舍五入、拼接不同日期字段，或把某一天的 `trade_date` 与另一根 K 线的价格/成交量字段混用。
+所有输出模块中的 `data[].kline`、`anomaly_test_confirmation.anomaly.data[].kline`、`anomaly_test_confirmation.test.data[].kline`、`anomaly_test_confirmation.confirmation.data[].kline` 和 `chip.data.kline_evidence[].kline` 必须从输入 `daily_kline` 中按原始对象整行复制，不允许手写、重算、四舍五入、拼接不同日期字段，或把某一天的 `trade_date` 与另一根 K 线的价格/成交量字段混用。
 
 如果 `evidence` 或 `result` 中提到某个交易日，则同一条证据里的 `kline.trade_date` 必须等于该交易日，并且 `open_price`、`high_price`、`low_price`、`close_price`、`volume`、`amount`、`volume_ratio` 必须与输入中该 `trade_date` 的原始行完全一致。
 
@@ -103,6 +103,14 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 2. 检查输出中每一个 `kline.trade_date` 都存在于输入映射。
 3. 检查输出中每一个 `kline` 的全部字段与输入映射中的原始行完全一致。
 4. 若发现不一致，必须用输入原始行替换该 `kline` 后再输出。
+
+输出 JSON 前还必须检查所有自然语言字段中的价格来源：
+
+1. 单根 K 线价格必须带有 `trade_date` 和价格字段名称。
+2. 区间高点/低点必须带有形成日期、价格字段和统计区间。
+3. 筹码价格必须说明对应的筹码估算字段。
+4. 派生价格必须说明原始价格和推导规则。
+5. 无法回溯到输入 K 线、输入筹码字段或明确派生过程的价格必须删除，不得猜测。
 
 允许基于已提供的日 K 数据计算直接派生指标，例如：
 
@@ -138,6 +146,11 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 7. 必须严格按照同目录下的 `量价关系归因法.md` 执行 `volume_price_relation` 模块，不得自行简化、替换或引入另一套量价关系归因规则。
 8. `volume_price_relation` 模块只能使用 `daily_kline[].volume`，不得使用 `daily_kline[].volume_ratio` 作为该模块的分析依据。
 9. `volume_price_relation.result` 必须明确输出“看多”或“看空”；证据不足时只能降低结论强度，不能只输出“无法判断”。
+10. 所有自然语言字段中出现的价格必须标注来源。单根 K 线价格写明交易日和开盘价/最高价/最低价/收盘价；区间高低点写明形成日期、价格字段和统计区间；筹码价格写明对应筹码字段；派生价格写明原始价格和推导规则。
+11. 必须输出 `anomaly_test_confirmation` 模块，按时间顺序识别最近异常、后续测试和后续确认或否定。
+12. `anomaly_test_confirmation` 只回顾已经发生的证据链；`reversal` 只输出当前之后的反转观察条件，两个模块不得重复。
+13. `volume_price_relation.result` 必须严格按照"价格变化、成交量变化、买卖方结果、量价结论"的顺序输出。
+14. `volume_price_relation.result` 和 `volume_price_relation.data[].evidence` 使用"买方力量、买方主动性、卖方压力"等直观表达，不得使用"供给、需求"，也不得把成交量直接解释成买家或卖家人数变化。
 
 如果 `market_context.is_intraday == true`：
 
@@ -204,52 +217,68 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
     ],
     "refs": ["", "", ""]
   },
-  "truth": {
+  "anomaly_test_confirmation": {
     "result": "",
-    "data": [
-      {
-        "kline": {
-          "code": "",
-          "trade_date": "",
-          "open_price": 0,
-          "high_price": 0,
-          "low_price": 0,
-          "close_price": 0,
-          "volume": 0,
-          "amount": 0,
-          "volume_ratio": 0
-        },
-        "evidence": ""
-      }
-    ],
-    "refs": ["", "", ""]
-  },
-  "stage": {
-    "result": "",
-    "data": [
-      {
-        "stage": "吸筹",
-        "start_date": "",
-        "end_date": "",
-        "summary": "",
-        "evidence": [
-          {
-            "kline": {
-              "code": "",
-              "trade_date": "",
-              "open_price": 0,
-              "high_price": 0,
-              "low_price": 0,
-              "close_price": 0,
-              "volume": 0,
-              "amount": 0,
-              "volume_ratio": 0
-            },
-            "evidence": ""
-          }
-        ]
-      }
-    ],
+    "anomaly": {
+      "status": "found",
+      "result": "",
+      "data": [
+        {
+          "kline": {
+            "code": "",
+            "trade_date": "",
+            "open_price": 0,
+            "high_price": 0,
+            "low_price": 0,
+            "close_price": 0,
+            "volume": 0,
+            "amount": 0,
+            "volume_ratio": 0
+          },
+          "evidence": ""
+        }
+      ]
+    },
+    "test": {
+      "status": "found",
+      "result": "",
+      "data": [
+        {
+          "kline": {
+            "code": "",
+            "trade_date": "",
+            "open_price": 0,
+            "high_price": 0,
+            "low_price": 0,
+            "close_price": 0,
+            "volume": 0,
+            "amount": 0,
+            "volume_ratio": 0
+          },
+          "evidence": ""
+        }
+      ]
+    },
+    "confirmation": {
+      "status": "pending",
+      "result": "",
+      "data": [
+        {
+          "kline": {
+            "code": "",
+            "trade_date": "",
+            "open_price": 0,
+            "high_price": 0,
+            "low_price": 0,
+            "close_price": 0,
+            "volume": 0,
+            "amount": 0,
+            "volume_ratio": 0
+          },
+          "evidence": ""
+        }
+      ]
+    },
     "refs": ["", "", ""]
   },
   "smart_money": {
@@ -356,14 +385,13 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 - `market_context.is_intraday`：`true` 表示盘中，`false` 表示非盘中。
 - `volume_price_relation`：必须严格按照同目录 `量价关系归因法.md` 执行的量价关系归因模块。
 - `direction`：判断下一步更偏看多还是看空。
-- `truth`：判断目前价格运动是真实运动还是陷阱。
-- `stage`：根据输入的历史 K 线，列出这一段 K 线中各阶段的开始时间和结束时间。阶段只能使用：吸筹、测试、拉升、派筹、下跌。
+- `anomaly_test_confirmation`：定位最近一根或连续多根量价异常 K 线，判断异常之后是否出现测试，以及测试之后是否得到确认或被否定。
 - `smart_money`：判断聪明钱更像在买还是在卖。
 - `reversal`：判断趋势什么时候可能反转，以及接下来什么情况算异常、什么情况算确认。
 - `key_price`：根据日 K 数据分析关键支撑位和阻力位，说明哪些价位是关键战场以及强度如何。
 - `chip`：结合 120 日 K 数据和筹码分布数据，分析主力筹码大多在什么区间、是否存在套牢盘、套牢盘筹码大概在什么区间。
 
-普通模块（`direction` / `truth` / `smart_money` / `reversal` / `key_price`）都必须包含：
+普通模块（`direction` / `smart_money` / `reversal` / `key_price`）都必须包含：
 
 - `result`：分析结论。
 - `data`：支撑结论的数据，必须是数组。
@@ -376,38 +404,44 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 - `kline`：完整单根日 K 数据（从输入 `daily_kline` 中原样取出，字段和值必须完全一致）。
 - `evidence`：基于该 K 线得到的证据说明。
 
-`stage` 模块必须包含：
+`chip` 模块结构与其他模块不同，`data` 是对象，包含：
 
-- `result`：对整段历史 K 线阶段切分的总结。
-- `data`：阶段区间数组，按时间从早到晚排列。
+- `data.chip`：直接透传输入中的筹码分布字段。
+- `data.kline_evidence`：数组，用来放筹码判断所引用的 K 线证据，每一项使用统一的 `{kline, evidence}` 结构。
+
+`anomaly_test_confirmation` 必须包含：
+
+- `result`：对最近异常、测试和确认状态的整体总结。
+- `anomaly`：最近异常对象。
+- `test`：异常之后的测试对象。
+- `confirmation`：测试之后的确认对象。
 - `refs`：书中理论索引。
 
-`stage.data` 中的每一项都必须包含：
+`anomaly.status` 只能是 `found` 或 `not_found`。
 
-- `stage`：阶段名称，只能是 `吸筹`、`测试`、`拉升`、`派筹`、`下跌` 之一。
-- `start_date`：该阶段开始日期，必须来自输入 `daily_kline[].trade_date`。
-- `end_date`：该阶段结束日期，必须来自输入 `daily_kline[].trade_date`。
-- `summary`：该阶段的判断摘要，说明为什么把这段 K 线划入该阶段。
-- `evidence`：支撑该阶段判断的 K 线证据数组。
+`test.status` 只能是 `found`、`not_found` 或 `not_applicable`。
 
-`stage.data[].evidence` 中的每一项都必须包含：
+`confirmation.status` 只能是 `confirmed`、`invalidated`、`pending` 或 `not_applicable`。
 
-- `kline`：完整单根日 K 数据（从输入 `daily_kline` 中原样取出，字段和值必须完全一致）。
-- `evidence`：基于该 K 线得到的阶段判断证据说明。
+`anomaly.data`、`test.data` 和 `confirmation.data` 都必须是数组；每一项使用统一的 `{kline, evidence}` 结构。允许数组为空，但不得省略字段。
 
-如果某一段历史 K 线阶段不清晰，不能强行切分，必须在 `summary` 中说明“不足以明确判断”，并用最接近的阶段名称归类。
+如果未发现异常：
 
-`data` 示例：
+- `anomaly.status` 必须是 `not_found`；
+- `anomaly.data` 必须是空数组；
+- `test.status` 和 `confirmation.status` 必须是 `not_applicable`；
+- `test.data` 和 `confirmation.data` 必须是空数组。
 
-```json
-[
-  {
-    "kline": {
-      "code": "881394.SH",
-      "trade_date": "2026-07-14",
-      "open_price": 999.64,
-      "high_price": 1004.66,
-      "low_price": 990.07,
+如果异常由连续多根 K 线共同构成，可以在 `anomaly.data` 中放入多根 K 线；这些 K 线必须日期连续且共同支持同一种异常解释。
+
+测试和确认只能引用异常交易日之后的 K 线，必须遵守时间顺序：异常 → 测试 → 确认。
+
+`chip` 模块注意事项：
+
+1. 筹码分布是模型估算的成本结构，不等同于真实账户持仓。
+2. 不要直接断言"主力真实持仓都在这里"。
+3. 可以表述为"主要成本区""主力可能重点交换区""可能的主力防守区"。
+4. 如果 `chip.status == "todo"`，必须在 `result` 中说明筹码分布不可用，不能猜测筹码结构。
       "close_price": 999.20,
       "volume": 20106216.0,
       "amount": 2332839.25,
