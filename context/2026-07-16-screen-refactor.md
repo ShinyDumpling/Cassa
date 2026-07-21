@@ -4510,3 +4510,341 @@ python screen2.py heat
 - 没有入选股票时，仍然打印“本次没有筛选出符合条件的股票”；
 - `--debug` 输出 JSON 不新增序号字段；
 - `--save` 保存 JSON 不新增序号字段。
+
+## 10. 统一午间盘中判断：拼接最新日 K，但不写入数据库
+
+### 10.1 背景与问题原因
+
+当前 `data.py` 通过 `is_a_share_intraday()` 统一判断当前是否属于 A 股盘中：
+
+```python
+def is_a_share_intraday(now=None):
+    """判断当前是否为 A 股盘中；午间不算盘中。"""
+    current = now or datetime.now()
+    if current.weekday() >= 5:
+        return False
+
+    minutes = current.hour * 60 + current.minute
+    morning_open = 9 * 60 + 30
+    morning_close = 11 * 60 + 30
+    afternoon_open = 13 * 60
+    afternoon_close = 15 * 60
+
+    return (
+        morning_open <= minutes <= morning_close
+        or afternoon_open <= minutes <= afternoon_close
+    )
+```
+
+这段代码按照“交易所是否正在连续交易”理解盘中，因此将 `11:30～13:00` 午间休市判断为非盘中。
+
+但是 Cassa 中这个判断实际承担的业务职责并不是判断交易所是否正在撮合，而是判断：
+
+> 当前交易日的日 K 是否尚未完成，以及读取日 K 时是否需要临时拼接通达信最新日 K。
+
+午间虽然暂停交易，但当天日 K 仍然没有完成。通达信最新一根日 K 已经包含上午产生的开盘价、最高价、最低价、当前价格、累计成交量和累计成交额，因此量价分析、选股和快照生成都应该读取这根临时日 K。
+
+当前午间被判断成非盘中后，会产生以下问题：
+
+1. `data.load_daily_kline()` 不调用 `load_realtime_daily_kline()`；
+2. `business.py thises` 只得到数据库中的历史日 K，缺少今天上午的临时日 K；
+3. `market_context.is_intraday` 被设置为 `false`；
+4. 量价分析可能把上一交易日的 K 线当成当前最新数据；
+5. `screen2.py` 午间生成快照时同样无法包含今天上午的行情。
+
+因此需要将午间统一定义为“盘中数据状态”。这里的“盘中”表示当日日 K 尚未完成，不表示午间仍在连续撮合。
+
+### 10.2 本次修改范围
+
+本次只修改公共判断函数：
+
+```text
+D:\股神养成plan\Cassa\data.py
+```
+
+不修改以下调用方：
+
+- `business.py thises`；
+- `screen2.py`；
+- `data.load_daily_kline()`；
+- `data.should_merge_realtime_daily_kline()`；
+- `data.get_market_mode_label()`。
+
+这些功能目前都已经调用 `data.is_a_share_intraday()`，公共函数修改后会自动获得统一口径，不需要在每个业务模块中重复增加时间判断。
+
+已经废弃的 `cassa.py` 和 `screen.py` 不在本次修改范围内，也不为其增加兼容逻辑。
+
+### 10.3 统一后的业务口径
+
+工作日按照以下规则判断：
+
+| 时间 | 数据状态 | 是否拼接最新日 K | 是否写入数据库 | `market_context.is_intraday` |
+|---|---|---:|---:|---:|
+| 09:30 之前 | 非盘中 | 否 | 否 | `false` |
+| 09:30～11:30 | 盘中 | 是 | 否 | `true` |
+| 11:30～13:00 | 盘中 | 是 | 否 | `true` |
+| 13:00～15:00 | 盘中 | 是 | 否 | `true` |
+| 15:00 之后 | 非盘中 | 否 | 否 | `false` |
+| 周六、周日 | 非盘中 | 否 | 否 | `false` |
+
+也就是将 `09:30～15:00` 作为一个连续的“当日日 K 尚未完成”区间，午间不再单独排除。
+
+午间读取日 K 的完整流程为：
+
+```text
+读取 SQLite 中的历史日 K
+    ↓
+从通达信读取最新 1 根日 K
+    ↓
+日期相同则覆盖返回副本，数据库没有今天则追加到返回副本
+    ↓
+把合并后的结果返回给 thises、screen2 等业务
+    ↓
+不调用 upsert_daily_kline_rows()，不写入 daily_kline 表
+```
+
+### 10.4 技术方案
+
+当前实时日 K 的读取和内存合并已经完整存在：
+
+```python
+data.load_daily_kline()
+    -> should_merge_realtime_daily_kline()
+    -> load_realtime_daily_kline()
+    -> merge_realtime_daily_kline_map()
+    -> merge_realtime_kline_rows()
+```
+
+其中 `merge_realtime_kline_rows()` 已经明确只操作数据库查询结果的副本：
+
+```python
+merged_rows = [dict(row) for row in db_rows]
+```
+
+整个实时拼接分支没有调用 `upsert_daily_kline_rows()`，所以午间启用该分支不会把未完成的当日日 K 写入数据库。
+
+本次不新增函数，也不修改现有加载流程，只把 `is_a_share_intraday()` 的两个交易区间合并为一个连续区间：
+
+```text
+原来：09:30～11:30 或 13:00～15:00
+改为：09:30～15:00
+```
+
+这样可以保持最小改动，并让所有现有调用方自动使用同一个判断结果。
+
+### 10.5 完整代码修改
+
+修改文件：
+
+```text
+D:\股神养成plan\Cassa\data.py
+```
+
+原代码：
+
+```python
+def is_a_share_intraday(now=None):
+    """判断当前是否为 A 股盘中；午间不算盘中。"""
+    current = now or datetime.now()
+    if current.weekday() >= 5:
+        return False
+
+    minutes = current.hour * 60 + current.minute
+    morning_open = 9 * 60 + 30
+    morning_close = 11 * 60 + 30
+    afternoon_open = 13 * 60
+    afternoon_close = 15 * 60
+
+    return (
+        morning_open <= minutes <= morning_close
+        or afternoon_open <= minutes <= afternoon_close
+    )
+```
+
+完整替换为：
+
+```python
+def is_a_share_intraday(now=None):
+    """判断当前是否处于 A 股当日日 K 尚未完成的时段，午间按盘中处理。"""
+    current = now or datetime.now()
+    if current.weekday() >= 5:
+        return False
+
+    current_minutes = current.hour * 60 + current.minute
+    market_open = 9 * 60 + 30
+    market_close = 15 * 60
+
+    return market_open <= current_minutes <= market_close
+```
+
+这就是本次需要修改的全部业务代码。
+
+### 10.6 修改后的调用效果
+
+#### 10.6.1 `business.py thises`
+
+`business.py` 当前已有：
+
+```python
+def collect_daily_kline_for_report(code, history_count=REPORT_HISTORY_COUNT):
+    """采集 120 根历史日 K，并拼接或覆盖最新 1 根实时 K。"""
+    kline_by_code = data.load_daily_kline([code], count=history_count)
+    return kline_by_code.get(code, [])
+```
+
+以及：
+
+```python
+def build_market_context():
+    """构建 thises 分析所需的盘中 / 盘外上下文。"""
+    return {
+        "as_of": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "is_intraday": data.is_a_share_intraday(),
+    }
+```
+
+公共函数修改后，午间会同时得到：
+
+- 包含今天上午行情的临时日 K；
+- `market_context.is_intraday = true`。
+
+量价分析 skill 已将 `10:30～14:30` 定义为普通盘中，因此午间数据会按照累计成交量尚未完成的口径分析，不会被误认为收盘确认数据。
+
+#### 10.6.2 `screen2.py`
+
+`screen2.py` 生成快照和读取候选股票日 K 时都调用 `data.load_daily_kline()`。公共函数修改后，午间会自动拼接最新日 K，快照中的价格、成交量和 `MAX_TRADE_DATE` 可以包含当天上午数据。
+
+`screen2.py` 不需要增加自己的午间判断。
+
+### 10.7 为什么午间数据不能入库
+
+午间最新日 K 只包含上午已经发生的交易：
+
+- 当天最高价和最低价仍可能在下午改变；
+- `close_price` 实际是午间最新价格，不是正式收盘价；
+- `volume` 和 `amount` 只是上午累计值；
+- 下午交易可能改变整根 K 线的形态和量价关系。
+
+如果把这根数据写入 `daily_kline`，后续在没有再次执行收盘更新的情况下，程序可能把半日数据长期当成完整历史日 K。
+
+因此继续沿用当前设计：
+
+```text
+盘中和午间：实时日 K 只在内存中使用
+收盘后：通过 update-daily-kline 将最终日 K 写入数据库
+```
+
+### 10.8 边界与暂不处理的事项
+
+第一版继续沿用当前的工作日判断：
+
+```python
+if current.weekday() >= 5:
+    return False
+```
+
+这只能排除周六和周日，不能识别工作日中的法定节假日。交易日历不属于本次午间问题的最小修改范围，暂时保留为 TODO。
+
+`15:00` 按当前规则仍返回 `true`，`15:01` 开始返回 `false`。这样保持与原代码下午区间的边界一致。
+
+### 10.9 验证方案
+
+#### 10.9.1 语法检查
+
+在 Cassa 项目目录执行：
+
+```powershell
+python -m py_compile data.py business.py screen2.py
+```
+
+预期三个文件均无语法错误。
+
+#### 10.9.2 时间边界验证
+
+执行：
+
+```powershell
+python -c "from datetime import datetime; import data; cases=[('09:29',datetime(2026,7,20,9,29)),('09:30',datetime(2026,7,20,9,30)),('11:45',datetime(2026,7,20,11,45)),('12:30',datetime(2026,7,20,12,30)),('13:00',datetime(2026,7,20,13,0)),('15:00',datetime(2026,7,20,15,0)),('15:01',datetime(2026,7,20,15,1)),('周六12:00',datetime(2026,7,18,12,0))]; print([(label,data.is_a_share_intraday(value)) for label,value in cases])"
+```
+
+预期输出：
+
+```python
+[
+    ('09:29', False),
+    ('09:30', True),
+    ('11:45', True),
+    ('12:30', True),
+    ('13:00', True),
+    ('15:00', True),
+    ('15:01', False),
+    ('周六12:00', False),
+]
+```
+
+#### 10.9.3 午间 thises 验证
+
+在正常交易日 `11:30～13:00` 执行：
+
+```powershell
+python business.py thises --codes 000862
+```
+
+检查输出：
+
+1. `market_context.is_intraday` 为 `true`；
+2. `market_context.as_of` 是午间执行时间；
+3. `items[0].daily_kline` 最后一根 `trade_date` 是当天交易日；
+4. 最后一根 K 线包含上午累计的 OHLC、成交量和成交额；
+5. 控制台出现实时日 K 读取和合并日志。
+
+#### 10.9.4 不入库验证
+
+午间执行 thises 前后，分别查询目标股票数据库最新一根日 K：
+
+```powershell
+python -c "import sqlite3; conn=sqlite3.connect(r'data/cassa.db'); print(conn.execute(\"SELECT code, trade_date, open_price, high_price, low_price, close_price, volume, amount, updated_at FROM daily_kline WHERE code='000862.SZ' ORDER BY trade_date DESC LIMIT 1\").fetchone())"
+```
+
+午间执行：
+
+```powershell
+python business.py thises --codes 000862
+```
+
+然后再次执行相同的数据库查询。
+
+预期：
+
+- thises 输出中的 `daily_kline` 包含今天上午的临时 K；
+- 两次数据库查询结果完全一致；
+- `daily_kline` 表没有因为 thises 执行而新增或覆盖当天记录。
+
+#### 10.9.5 午间 screen2 验证
+
+在正常交易日午间执行：
+
+```powershell
+python screen2.py volume-breakout --snapshot-mode refresh --debug
+```
+
+预期：
+
+- 控制台模式显示为盘中；
+- 快照生成阶段读取并内存合并最新日 K；
+- 当天正常交易股票的 `MAX_TRADE_DATE` 为当天；
+- 本次刷新不会把午间临时日 K 写入 `daily_kline` 数据库。
+
+### 10.10 最终结论
+
+本次修改后，Cassa 对午间采用统一口径：
+
+```text
+午间属于盘中数据状态
+→ 需要拉取并拼接当天最新日 K
+→ 只在内存中使用
+→ 不写入数据库
+→ 所有分析明确把最新 K 视为未完成的临时 K
+```
+
+该方案只修改一个公共判断函数，不增加新的业务分支，也不会让 `business.py` 和 `screen2.py` 各自维护不同的时间逻辑。

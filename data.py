@@ -818,21 +818,16 @@ def merge_realtime_daily_kline_map(db_kline_map, realtime_kline_map, stock_list,
 
 
 def is_a_share_intraday(now=None):
-    """判断当前是否为 A 股盘中；午间不算盘中。"""
+    """判断当前是否处于 A 股当日日 K 尚未完成的时段，午间按盘中处理。"""
     current = now or datetime.now()
     if current.weekday() >= 5:
         return False
 
-    minutes = current.hour * 60 + current.minute
-    morning_open = 9 * 60 + 30
-    morning_close = 11 * 60 + 30
-    afternoon_open = 13 * 60
-    afternoon_close = 15 * 60
+    current_minutes = current.hour * 60 + current.minute
+    market_open = 9 * 60 + 30
+    market_close = 15 * 60
 
-    return (
-        morning_open <= minutes <= morning_close
-        or afternoon_open <= minutes <= afternoon_close
-    )
+    return market_open <= current_minutes <= market_close
 
 
 def get_latest_trade_date_distribution(kline_map, stock_list):
