@@ -635,6 +635,25 @@ class TdxClient:
             block_name=block_name,
         )
 
+    def add_stock_to_sector(self, block_code: str, stock_codes: list[str], show: bool = False) -> dict[str, Any]:
+        """批量添加股票到通达信自定义板块。
+
+        Args:
+            block_code: 自定义板块简称，例如 `SCREEN`。
+            stock_codes: 股票代码列表，带市场后缀，例如 `["000001.SZ", "600519.SH"]`。
+            show: 是否在客户端显示该板块。
+
+        Returns:
+            通达信原始返回结果，包含 `ErrorId` 和 `Error` 等字段。
+        """
+        self.initialize()
+        return self._invoke_quietly(
+            tq.send_user_block,
+            block_code=block_code,
+            stocks=stock_codes,
+            show=show,
+        )
+
     def set_formula_data(
         self,
         tdx_code: str,
@@ -4958,6 +4977,97 @@ def run_stock_pool_sync(args: argparse.Namespace, client: TdxClient) -> None:
     stock_pool_sync_from_tdx(client)
 
 
+def add_screen_result_to_sector(
+    client: TdxClient,
+    file_paths: list[str],
+    sector_code: str = "SCREEN",
+    top_n: int | None = None,
+) -> None:
+    """从screen结果JSON文件读取股票，批量添加到通达信自定义板块。
+
+    Args:
+        client: 已初始化的通达信客户端。
+        file_paths: JSON文件路径列表。
+        sector_code: 目标板块代码，默认 SCREEN。
+        top_n: 每个文件仅添加前N只，None表示全部添加。
+    """
+    print(f"\n[筛选结果入库] 目标板块：{sector_code}\n")
+
+    all_codes: dict[str, str] = {}  # 去重：代码 -> 名称
+
+    # 1. 读取所有JSON文件，合并去重
+    for file_path in file_paths:
+        print(f"  读取：{os.path.basename(file_path)}")
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        selected_stocks = data.get("selected", [])
+        if not selected_stocks:
+            print(f"    无选中股票，跳过")
+            continue
+        
+        # 应用top_n过滤
+        if top_n and top_n > 0:
+            selected_stocks = selected_stocks[:top_n]
+        
+        for stock in selected_stocks:
+            code = stock.get("code", "")
+            name = stock.get("name", "")
+            if code:
+                all_codes[code] = name
+        
+        print(f"    读取 {len(selected_stocks)} 只")
+
+    print(f"\n  共 {len(all_codes)} 只股票（已去重）")
+
+    # 2. 批量添加到通达信板块
+    print("\n  正在添加到通达信板块...")
+    try:
+        code_list = list(all_codes.keys())
+        result = client.add_stock_to_sector(sector_code, code_list, show=False)
+        error_id = result.get("ErrorId", "-1")
+        
+        if error_id == "0":
+            for code, name in all_codes.items():
+                print(f"    ✓ {code} {name}")
+            print(f"\n  添加完成：成功 {len(all_codes)} 只")
+        else:
+            print(f"    ✗ 添加失败，ErrorId: {error_id}, Error: {result.get('Error', '未知错误')}")
+    except Exception as e:
+        print(f"    ✗ 调用接口异常: {e}")
+
+
+def run_add_screen_result(args: argparse.Namespace, client: TdxClient) -> None:
+    """命令行入口：从screen结果JSON批量添加股票到通达信板块。
+
+    Args:
+        args: 命令行参数对象。
+        client: 已创建的通达信客户端。
+    """
+    # 1. 确定文件列表
+    if args.file:
+        # 手动指定单个文件
+        file_paths = [args.file]
+    else:
+        # 默认：当天日期的所有JSON
+        today = datetime.now().strftime("%Y-%m-%d")
+        screen_dir = RESULT_DIR / "screen"
+        file_paths = sorted(screen_dir.glob(f"*{today}*.json"))
+        
+        if not file_paths:
+            print(f"\n  未找到当天（{today}）的screen结果JSON文件")
+            print(f"  目录：{screen_dir}")
+            return
+
+    # 2. 执行添加
+    add_screen_result_to_sector(
+        client,
+        file_paths=file_paths,
+        sector_code=args.sector or "SCREEN",
+        top_n=getattr(args, "top", None),
+    )
+
+
 # ============================================================================
 # 个股趋势分析层
 # 对齐 DSA 的 StockTrendAnalyzer 逻辑，纯 Python 重写，不依赖 pandas。
@@ -6030,6 +6140,15 @@ def parse_args() -> argparse.Namespace:
 
     stock_pool_sync_parser = stock_pool_subparsers.add_parser("sync", help="从通达信 CASSA 自定义板块同步到本地股票池")
     stock_pool_sync_parser.set_defaults(handler=run_stock_pool_sync)
+
+    stock_pool_add_parser = stock_pool_subparsers.add_parser(
+        "add-screen-result",
+        help="从screen结果JSON批量添加股票到通达信自定义板块",
+    )
+    stock_pool_add_parser.add_argument("--file", help="单个JSON文件路径，默认取当天所有JSON")
+    stock_pool_add_parser.add_argument("--sector", default="SCREEN", help="目标自定义板块代码，默认 SCREEN")
+    stock_pool_add_parser.add_argument("--top", type=int, help="每个文件仅添加前N只股票")
+    stock_pool_add_parser.set_defaults(handler=run_add_screen_result)
 
     report_parser = module_parsers.add_parser("report", help="个股趋势分析报告")
     report_parser.add_argument("--codes", help="股票代码，逗号分隔，例如 000001,600519")

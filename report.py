@@ -42,7 +42,7 @@ def build_template_environment() -> Environment:
 def sanitize_filename_part(value: Any) -> str:
     """清理文件名片段中的非法字符，返回适合 Windows 文件名的文本。"""
     text = str(value or "").strip()
-    text = re.sub(r'[<>:\"/\\\\|?*\\x00-\\x1f]', "_", text)
+    text = re.sub(r'[<>:\"/\\|?*\x00-\x1f]', "_", text)
     return text or "unknown"
 
 
