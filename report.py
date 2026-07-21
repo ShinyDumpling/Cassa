@@ -20,6 +20,13 @@ TEMPLATE_MAP = {
     "thises": "thesis.md.j2",
 }
 
+# 报告类型到归档目录的白名单映射。
+# thises 是兼容别名，实际统一归档到 result/thesis/。
+REPORT_DIR_MAP = {
+    "thesis": RESULT_DIR / "thesis",
+    "thises": RESULT_DIR / "thesis",
+}
+
 
 def build_template_environment() -> Environment:
     """创建 Jinja2 模板环境，返回用于渲染 Markdown 的环境对象。"""
@@ -35,7 +42,7 @@ def build_template_environment() -> Environment:
 def sanitize_filename_part(value: Any) -> str:
     """清理文件名片段中的非法字符，返回适合 Windows 文件名的文本。"""
     text = str(value or "").strip()
-    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
+    text = re.sub(r'[<>:\"/\\\\|?*\\x00-\\x1f]', "_", text)
     return text or "unknown"
 
 
@@ -44,8 +51,10 @@ def build_output_paths(
     report_type: str,
     timestamp: datetime,
 ) -> tuple[Path, Path]:
-    """生成一组不覆盖旧文件的 JSON 和 Markdown 输出路径。"""
-    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    """生成按报告类型和生成日期归档、且不覆盖旧文件的输出路径。"""
+    report_root = REPORT_DIR_MAP[report_type]
+    date_dir = report_root / timestamp.strftime("%Y-%m-%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
 
     code = sanitize_filename_part(data.get("code"))
     name = sanitize_filename_part(data.get("name"))
@@ -58,8 +67,8 @@ def build_output_paths(
     candidate_suffixes.extend(f"-{index}" for index in range(2, 1000))
 
     for suffix in candidate_suffixes:
-        data_path = RESULT_DIR / f"{base_name}{suffix}-data.json"
-        report_path = RESULT_DIR / f"{base_name}{suffix}-report.md"
+        data_path = date_dir / f"{base_name}{suffix}-data.json"
+        report_path = date_dir / f"{base_name}{suffix}-report.md"
         if not data_path.exists() and not report_path.exists():
             return data_path, report_path
 
@@ -70,13 +79,14 @@ def generate_report_bundle(
     data: dict[str, Any],
     report_type: str,
 ) -> dict[str, Path]:
-    """保存原始 JSON 和 Markdown 报告，返回两个文件路径。"""
+    """保存原始 JSON 和 Markdown 报告，返回两个实际文件路径。"""
     if not isinstance(data, dict):
         raise TypeError("报告输入必须是解析后的 JSON 对象，即 Python dict。")
 
     normalized_report_type = str(report_type or "").strip().lower()
     template_name = TEMPLATE_MAP.get(normalized_report_type)
-    if not template_name:
+    report_root = REPORT_DIR_MAP.get(normalized_report_type)
+    if not template_name or report_root is None:
         supported_types = ", ".join(sorted(TEMPLATE_MAP))
         raise ValueError(
             f"不支持的报告类型：{report_type}。当前支持：{supported_types}"
@@ -90,10 +100,11 @@ def generate_report_bundle(
     template = template_environment.get_template(template_name)
     markdown_text = template.render(data=data)
 
+    timestamp = datetime.now()
     data_path, report_path = build_output_paths(
         data,
         normalized_report_type,
-        datetime.now(),
+        timestamp,
     )
 
     try:
