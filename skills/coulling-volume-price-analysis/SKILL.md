@@ -93,7 +93,7 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 
 ### K 线引用一致性规则
 
-所有输出模块中的 `data[].kline`、`anomaly_test_confirmation.anomaly.data[].kline`、`anomaly_test_confirmation.test.data[].kline`、`anomaly_test_confirmation.confirmation.data[].kline` 和 `chip.data.kline_evidence[].kline` 必须从输入 `daily_kline` 中按原始对象整行复制，不允许手写、重算、四舍五入、拼接不同日期字段，或把某一天的 `trade_date` 与另一根 K 线的价格/成交量字段混用。
+所有输出模块中的 `data[].kline`、`anomaly_test_confirmation.data[].kline` 和 `chip.data.kline_evidence[].kline` 必须从输入 `daily_kline` 中按原始对象整行复制，不允许手写、重算、四舍五入、拼接不同日期字段，或把某一天的 `trade_date` 与另一根 K 线的价格/成交量字段混用。
 
 如果 `evidence` 或 `result` 中提到某个交易日，则同一条证据里的 `kline.trade_date` 必须等于该交易日，并且 `open_price`、`high_price`、`low_price`、`close_price`、`volume`、`amount`、`volume_ratio` 必须与输入中该 `trade_date` 的原始行完全一致。
 
@@ -144,7 +144,11 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 5. 每个结论都必须有足够的数据支撑，并给出对应的书中理论索引。
 6. 必须读取输入 JSON 中的 `market_context.is_intraday`，并根据盘中 / 盘外状态进行判断。
 7. 必须严格按照同目录下的 `量价关系归因法.md` 执行 `volume_price_relation` 模块，不得自行简化、替换或引入另一套量价关系归因规则。
-8. `volume_price_relation` 模块只能使用 `daily_kline[].volume`，不得使用 `daily_kline[].volume_ratio` 作为该模块的分析依据。
+8. `volume_price_relation` 的成交量字段使用规则：
+   - 当 `market_context.is_intraday == false` 时，使用完整日 K 的 `daily_kline[].volume` 做成交量比较，不使用 `volume_ratio` 重复归因。
+   - 当 `market_context.is_intraday == true` 时，最新 K 线的 `volume` 只能作为盘中累计量原样说明，不得与历史全天 `volume` 直接比较；必须比较最新实时 `volume_ratio` 与前 3～5 根有效 K 线的 `volume_ratio`，判断截至当前的相对成交活跃程度。
+   - 不得重新计算或修改输入中的 `volume_ratio`。
+   - `volume_ratio` 只能说明成交活跃度，不能单独证明买方或卖方变化，也不能单独形成突破、反转、放量或缩量确认。
 9. `volume_price_relation.result` 必须明确输出“看多”或“看空”；证据不足时只能降低结论强度，不能只输出“无法判断”。
 10. 所有自然语言字段中出现的价格必须标注来源。单根 K 线价格写明交易日和开盘价/最高价/最低价/收盘价；区间高低点写明形成日期、价格字段和统计区间；筹码价格写明对应筹码字段；派生价格写明原始价格和推导规则。
 11. 必须输出 `anomaly_test_confirmation` 模块，按时间顺序识别最近异常、后续测试和后续确认或否定。
@@ -159,6 +163,9 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 3. 不得把最后一根 K 当作收盘后定型 K。
 4. 不得输出“已经确认突破”“已经确认跌破”“已经完成反转”“已经确认放量止涨/止跌”等收盘级确认结论。
 5. 正确表达应为“盘中暂时出现”“若收盘仍保持则可确认”“当前仅为盘中迹象”。
+6. 分析最新 K 线成交量时，先原样说明盘中累计 `volume` 及其不可与历史全天量直接比较的限制，再比较最新实时 `volume_ratio` 与前 3～5 根有效 K 线的 `volume_ratio`。
+7. 量比比较必须列出最新值、历史比较值及对应交易日，并说明最新值处于近期全部值之上、近期多数值之上、近期主要区间内、近期多数值之下或近期全部值之下。
+8. 如果有效历史量比少于 2 根，必须说明样本不足，不得据此判断成交活跃度变化。
 
 如果 `market_context.is_intraday == false`：
 
@@ -219,67 +226,54 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
   },
   "anomaly_test_confirmation": {
     "result": "",
-    "anomaly": {
-      "status": "found",
-      "result": "",
-      "data": [
-        {
-          "kline": {
-            "code": "",
-            "trade_date": "",
-            "open_price": 0,
-            "high_price": 0,
-            "low_price": 0,
-            "close_price": 0,
-            "volume": 0,
-            "amount": 0,
-            "volume_ratio": 0
-          },
-          "evidence": ""
-        }
-      ]
-    },
-    "test": {
-      "status": "found",
-      "result": "",
-      "data": [
-        {
-          "kline": {
-            "code": "",
-            "trade_date": "",
-            "open_price": 0,
-            "high_price": 0,
-            "low_price": 0,
-            "close_price": 0,
-            "volume": 0,
-            "amount": 0,
-            "volume_ratio": 0
-          },
-          "evidence": ""
-        }
-      ]
-    },
-    "confirmation": {
-      "status": "pending",
-      "result": "",
-      "data": [
-        {
-          "kline": {
-            "code": "",
-            "trade_date": "",
-            "open_price": 0,
-            "high_price": 0,
-            "low_price": 0,
-            "close_price": 0,
-            "volume": 0,
-            "amount": 0,
-            "volume_ratio": 0
-          },
-          "evidence": ""
-        }
-      ]
-    },
-    "refs": ["", "", ""]
+    "data": [
+      {
+        "role": "异常",
+        "kline": {
+          "code": "",
+          "trade_date": "",
+          "open_price": 0,
+          "high_price": 0,
+          "low_price": 0,
+          "close_price": 0,
+          "volume": 0,
+          "amount": 0,
+          "volume_ratio": 0
+        },
+        "evidence": "异常："
+      },
+      {
+        "role": "测试",
+        "kline": {
+          "code": "",
+          "trade_date": "",
+          "open_price": 0,
+          "high_price": 0,
+          "low_price": 0,
+          "close_price": 0,
+          "volume": 0,
+          "amount": 0,
+          "volume_ratio": 0
+        },
+        "evidence": "测试："
+      },
+      {
+        "role": "确认",
+        "kline": {
+          "code": "",
+          "trade_date": "",
+          "open_price": 0,
+          "high_price": 0,
+          "low_price": 0,
+          "close_price": 0,
+          "volume": 0,
+          "amount": 0,
+          "volume_ratio": 0
+        },
+        "evidence": "确认："
+      }
+    ],
+    "refs": []
   },
   "smart_money": {
     "result": "",
@@ -397,44 +391,33 @@ description: "知识库来自《量价分析：量价分析创始人威科夫的
 - `data`：支撑结论的数据，必须是数组。
 - `refs`：书中理论索引。
 
-`volume_price_relation` 也必须使用普通模块结构，包含 `result`、`data` 和 `refs`。其中 `result` 必须输出看多或看空；`data[].kline` 必须从输入 `daily_kline` 原样复制；其分析依据只能使用价格字段和 `volume`，不能使用 `volume_ratio`。
+`volume_price_relation` 也必须使用普通模块结构，包含 `result`、`data` 和 `refs`。其中 `result` 必须输出看多或看空；`data[].kline` 必须从输入 `daily_kline` 原样复制；其分析依据只能使用价格字段和 `volume`，不能使用 `volume_ratio`（盘中例外，见归因法）。
 
 普通模块 `data` 中的每一项都必须包含：
 
 - `kline`：完整单根日 K 数据（从输入 `daily_kline` 中原样取出，字段和值必须完全一致）。
 - `evidence`：基于该 K 线得到的证据说明。
 
+`anomaly_test_confirmation.data[]` 比普通模块多一个 `role` 字段，其余 `kline` 与 `evidence` 规则完全一致。
+
+`anomaly_test_confirmation` 必须包含：
+
+- `result`：按时间总结最近异常、测试以及确认或否定状态；未发现异常时明确说明未发现。
+- `data`：异常、测试、确认 K 线组成的单一证据数组，必须按 `kline.trade_date` 升序排列；允许为空。
+- `refs`：书中理论索引。
+
+`data[].role` 只能是 `异常`、`测试`、`确认`。
+
+`data[].evidence` 必须分别以 `异常：`、`测试：`、`确认：`开头，并解释该 K 线承担对应角色的原因。
+
+异常 K 线必须早于测试 K 线，测试 K 线必须早于确认 K 线。同一交易日原则上只输出一次；如果同一根 K 线先完成测试并形成确认，使用 `role = "确认"` 并在证据中说明。
+
+如果未发现异常，`data` 必须为空数组，不能强行选择普通 K 线填充。
+
 `chip` 模块结构与其他模块不同，`data` 是对象，包含：
 
 - `data.chip`：直接透传输入中的筹码分布字段。
 - `data.kline_evidence`：数组，用来放筹码判断所引用的 K 线证据，每一项使用统一的 `{kline, evidence}` 结构。
-
-`anomaly_test_confirmation` 必须包含：
-
-- `result`：对最近异常、测试和确认状态的整体总结。
-- `anomaly`：最近异常对象。
-- `test`：异常之后的测试对象。
-- `confirmation`：测试之后的确认对象。
-- `refs`：书中理论索引。
-
-`anomaly.status` 只能是 `found` 或 `not_found`。
-
-`test.status` 只能是 `found`、`not_found` 或 `not_applicable`。
-
-`confirmation.status` 只能是 `confirmed`、`invalidated`、`pending` 或 `not_applicable`。
-
-`anomaly.data`、`test.data` 和 `confirmation.data` 都必须是数组；每一项使用统一的 `{kline, evidence}` 结构。允许数组为空，但不得省略字段。
-
-如果未发现异常：
-
-- `anomaly.status` 必须是 `not_found`；
-- `anomaly.data` 必须是空数组；
-- `test.status` 和 `confirmation.status` 必须是 `not_applicable`；
-- `test.data` 和 `confirmation.data` 必须是空数组。
-
-如果异常由连续多根 K 线共同构成，可以在 `anomaly.data` 中放入多根 K 线；这些 K 线必须日期连续且共同支持同一种异常解释。
-
-测试和确认只能引用异常交易日之后的 K 线，必须遵守时间顺序：异常 → 测试 → 确认。
 
 `chip` 模块注意事项：
 

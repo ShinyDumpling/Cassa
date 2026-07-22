@@ -57,36 +57,11 @@
 
 {{ data.anomaly_test_confirmation.result }}
 
-### 异常
-
-- 状态：{{ data.anomaly_test_confirmation.anomaly.status }}
-- 结论：{{ data.anomaly_test_confirmation.anomaly.result }}
+### K 线证据
 
 | 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-{% for item in data.anomaly_test_confirmation.anomaly.data %}
-| {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
-{% endfor %}
-
-### 测试
-
-- 状态：{{ data.anomaly_test_confirmation.test.status }}
-- 结论：{{ data.anomaly_test_confirmation.test.result }}
-
-| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-{% for item in data.anomaly_test_confirmation.test.data %}
-| {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
-{% endfor %}
-
-### 确认
-
-- 状态：{{ data.anomaly_test_confirmation.confirmation.status }}
-- 结论：{{ data.anomaly_test_confirmation.confirmation.result }}
-
-| 日期 | 开盘 | 最高 | 最低 | 收盘 | 成交量 | 成交额 | 量比 | 证据 |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-{% for item in data.anomaly_test_confirmation.confirmation.data %}
+{% for item in data.anomaly_test_confirmation.data | sort(attribute='kline.trade_date') %}
 | {{ item.kline.trade_date }} | {{ item.kline.open_price }} | {{ item.kline.high_price }} | {{ item.kline.low_price }} | {{ item.kline.close_price }} | {{ item.kline.volume }} | {{ item.kline.amount }} | {{ item.kline.volume_ratio }} | {{ item.evidence }} |
 {% endfor %}
 
