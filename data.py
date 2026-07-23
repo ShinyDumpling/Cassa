@@ -493,6 +493,115 @@ def upsert_daily_kline_rows(rows):
     return len(rows)
 
 
+def update_sector_daily_kline_after_close(
+    count=DAILY_KLINE_UPDATE_DAYS,
+    batch_size=DAILY_KLINE_UPDATE_BATCH_SIZE,
+):
+    """更新全部板块（行业+概念）最近 N 天日 K，写入 daily_kline 表。
+
+    板块代码（如 880301.TI）与个股代码（如 600000.SH）格式不同，
+    主键 (code, trade_date) 天然不冲突，直接复用 daily_kline 表。
+
+    流程：
+        获取全部板块代码列表。
+        按 batch_size 分批调用 get_market_data 拉取日K行情。
+        通过 market_data_to_daily_kline_rows 转换为标准行格式。
+        通过 upsert_daily_kline_rows 写入 daily_kline 表。
+
+    Args:
+        count: 每个板块拉取的最近K线根数，默认取全局常量 DAILY_KLINE_UPDATE_DAYS。
+        batch_size: 每批请求的板块数量，默认取全局常量 DAILY_KLINE_UPDATE_BATCH_SIZE。
+
+    Returns:
+        dict: 包含 sector_count, updated_rows, count, batch_size, elapsed_seconds。
+    """
+    started_at = time.perf_counter()
+
+    print(f"[板块日K] 开始更新板块日K：count={count}, batch_size={batch_size}")
+
+    stage_started_at = time.perf_counter()
+    print("[板块日K] 正在获取板块列表...")
+
+    sector_rows = get_sector_list(list_type=1)
+    sector_list = extract_stock_codes_from_stock_list(sector_rows)
+
+    if not sector_list:
+        print("[板块日K] 失败：未获取到板块列表，结束本次更新")
+        return {
+            "sector_count": 0,
+            "updated_rows": 0,
+            "count": count,
+            "batch_size": batch_size,
+        }
+
+    stage_seconds = time.perf_counter() - stage_started_at
+    print(
+        f"[板块日K] 获取 {len(sector_list)} 个板块，"
+        f"耗时 {stage_seconds:.1f}s"
+    )
+
+    batches = chunk_list(sector_list, batch_size)
+    total_batches = len(batches)
+    total_updated_rows = 0
+    kline_started_at = time.perf_counter()
+
+    print(
+        f"[板块日K] 开始拉取日K，共 {len(sector_list)} 个板块，"
+        f"{total_batches} 批，count={count}"
+    )
+
+    for batch_index, sector_batch in enumerate(batches, 1):
+        batch_started_at = time.perf_counter()
+        first_code = sector_batch[0]
+        last_code = sector_batch[-1]
+
+        print(
+            f"[板块日K] 第 {batch_index}/{total_batches} 批开始："
+            f"{len(sector_batch)} 个，{first_code} ~ {last_code}"
+        )
+
+        try:
+            market_data = get_market_data(
+                stock_list=sector_batch,
+                period="1d",
+                count=count,
+                field_list=["Open", "High", "Low", "Close", "Volume", "Amount"],
+                fill_data=True,
+            )
+            rows = market_data_to_daily_kline_rows(market_data, sector_batch)
+            updated_rows = upsert_daily_kline_rows(rows)
+        except Exception as exc:
+            print(
+                f"[板块日K] 第 {batch_index}/{total_batches} 批失败："
+                f"{first_code} ~ {last_code}，错误：{exc}"
+            )
+            raise
+
+        total_updated_rows += updated_rows
+        batch_seconds = time.perf_counter() - batch_started_at
+        kline_elapsed = time.perf_counter() - kline_started_at
+
+        print(
+            f"[板块日K] 第 {batch_index}/{total_batches} 批完成："
+            f"本批写入 {updated_rows} 行，累计 {total_updated_rows} 行，"
+            f"本批耗时 {batch_seconds:.1f}s，累计耗时 {kline_elapsed:.1f}s"
+        )
+
+    total_seconds = time.perf_counter() - started_at
+    print(
+        f"[板块日K] 全部完成：板块 {len(sector_list)} 个，"
+        f"写入/覆盖 {total_updated_rows} 行，总耗时 {total_seconds:.1f}s"
+    )
+
+    return {
+        "sector_count": len(sector_list),
+        "updated_rows": total_updated_rows,
+        "count": count,
+        "batch_size": batch_size,
+        "elapsed_seconds": round(total_seconds, 1),
+    }
+
+
 def load_daily_kline_rows_from_db(code_list, count=None, end_date=None):
     """只从本地数据库读取日 K，不调用通达信。
 
@@ -732,7 +841,16 @@ def update_daily_kline_after_close(
         f"[日K更新] 阶段 4/4 完成：股票 {len(stock_list)} 只，"
         f"写入/覆盖 {total_updated_rows} 行，耗时 {kline_elapsed:.1f}s"
     )
-    print(f"[日K更新] 全部完成：总耗时 {total_seconds:.1f}s")
+    print(f"[日K更新] 个股日K全部完成：总耗时 {total_seconds:.1f}s")
+
+    # 个股更新完毕后，接着更新板块日K
+    sector_result = update_sector_daily_kline_after_close(
+        count=count,
+        batch_size=batch_size,
+    )
+
+    total_seconds = time.perf_counter() - started_at
+    print(f"[日K更新] 全部完成（个股+板块）：总耗时 {total_seconds:.1f}s")
 
     return {
         "stock_count": len(stock_list),
@@ -741,6 +859,7 @@ def update_daily_kline_after_close(
         "batch_size": batch_size,
         "stock_basic": stock_basic_mode,
         "sectors": sectors_mode,
+        "sector_kline": sector_result,
         "elapsed_seconds": round(total_seconds, 1),
     }
 
